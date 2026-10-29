@@ -298,6 +298,50 @@ def twse_market():
     return rows
 
 
+# ---------------------------------------------------------------- 探測（只讀）
+def _clip(text, n=900):
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def probe_twse():
+    """只讀探測：找出證交所『漲跌家數』的端點與欄位格式，結果寫進紀錄供人工確認。
+    不寫任何市場資料表，不把探測結果當成正式數字。"""
+    data, err = fetch_json(config.TWSE_SWAGGER)
+    if data is None:
+        log("probe:swagger", "failure", detail=f"抓取失敗: {err}")
+    else:
+        paths = data.get("paths") or {}
+        hits = []
+        for path, methods in paths.items():
+            for m in (methods or {}).values():
+                if not isinstance(m, dict):
+                    continue
+                text = f"{m.get('summary', '')} {m.get('description', '')}"
+                if any(k in text for k in ("漲跌", "上漲", "漲停")):
+                    hits.append(f"{path} | {m.get('summary', '')}")
+        log("probe:swagger", "success",
+            detail=_clip(f"共 {len(paths)} 個端點；含『漲跌』字樣的：" + (" ; ".join(hits) if hits else "無")))
+
+    data, err = fetch_json(config.TWSE_MI_INDEX_MS)
+    if data is None:
+        log("probe:MI_INDEX_MS", "failure", detail=f"抓取失敗: {err}")
+        return
+    if data.get("stat") != "OK":
+        log("probe:MI_INDEX_MS", "no_new_data", detail=f"stat={data.get('stat')}")
+        return
+    tables = data.get("tables") or []
+    if not tables:
+        log("probe:MI_INDEX_MS", "failure", detail=_clip(f"沒有 tables 欄位；頂層鍵：{list(data.keys())}"))
+        return
+    outline = [f"{t.get('title')}｜欄位{t.get('fields')}｜{len(t.get('data') or [])}列" for t in tables]
+    log("probe:MI_INDEX_MS", "success", detail=_clip(f"日期{data.get('date')}；表格：" + " ;; ".join(outline)))
+    for t in tables:
+        if "漲跌" in str(t.get("title")):
+            log("probe:breadth_table", "success",
+                detail=_clip(f"{t.get('title')}｜{t.get('fields')}｜{(t.get('data') or [])[:8]}"))
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -385,6 +429,8 @@ def run_job(job, dry_run=False):
         tw_rows = twse_market()
     if job == "tw_close":
         log("tw_breadth", "skipped", detail="台股漲跌家數（廣度）尚未接，不用其他數字冒充")
+    if job == "tw_probe":
+        probe_twse()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 

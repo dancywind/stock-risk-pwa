@@ -39,7 +39,11 @@ TWD_FRED_SERIES = "DEXTAUS"
 TWD_RANGE = (20.0, 45.0)  # 美元兌台幣合理範圍
 
 # 排程工作：每個工作只做自己的事
-JOBS = ("full", "tw_close", "us_breadth")
+# 探測用（只讀、不寫市場資料表）：確認證交所「漲跌家數」的真實端點與欄位格式
+TWSE_SWAGGER = "https://openapi.twse.com.tw/v1/swagger.json"
+TWSE_MI_INDEX_MS = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?type=MS&response=json"
+
+JOBS = ("full", "tw_close", "us_breadth", "tw_probe")
 
 
 def fred_key():
