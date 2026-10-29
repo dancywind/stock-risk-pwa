@@ -238,6 +238,46 @@ def test_tw_close_job_does_not_claim_breadth():
     assert any(x["source"] == "tw_breadth" and x["status"] == "skipped" for x in fetch.LOG)
 
 
+# ---------------------------------------------------------------- 探測
+def test_probe_finds_breadth_endpoint_and_table():
+    reset()
+    swagger = {"paths": {"/x/A": {"get": {"summary": "每日收盤行情-漲跌證券數合計"}},
+                         "/x/B": {"get": {"summary": "其他"}}}}
+    mi = {"stat": "OK", "date": "20261028", "tables": [
+        {"title": "價格指數", "fields": ["a"], "data": [["1"]]},
+        {"title": "漲跌證券數合計", "fields": ["類型", "整體市場", "股票"],
+         "data": [["上漲(漲停)", "500(3)", "400(3)"], ["下跌(跌停)", "300(1)", "250(1)"]]}]}
+    def fake(url, **k):
+        return (swagger, "") if "swagger" in url else (mi, "")
+    with mock.patch.object(fetch, "fetch_json", side_effect=fake):
+        fetch.probe_twse()
+    text = " ".join(x["detail"] for x in fetch.LOG)
+    assert "/x/A" in text and "/x/B" not in text
+    assert any(x["source"] == "probe:breadth_table" and "整體市場" in x["detail"] for x in fetch.LOG)
+
+
+def test_probe_failures_are_logged_not_hidden():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        fetch.probe_twse()
+    assert [x["status"] for x in fetch.LOG].count("failure") == 2
+
+
+def test_probe_never_writes_market_tables():
+    reset()
+    with mock.patch.object(fetch, "probe_twse"), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.run_job("tw_probe", dry_run=False)
+    up.assert_not_called()
+
+
+def test_probe_detail_is_clipped():
+    reset()
+    big = {"stat": "OK", "date": "1", "tables": [{"title": "t" * 5000, "fields": [], "data": []}]}
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (({"paths": {}}, "") if "swagger" in u else (big, ""))):
+        fetch.probe_twse()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
