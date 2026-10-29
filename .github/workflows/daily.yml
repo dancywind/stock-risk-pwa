@@ -11,7 +11,7 @@ on:
         description: "要跑哪個工作"
         default: "full"
         type: choice
-        options: [full, tw_close, us_breadth]
+        options: [full, tw_close, us_breadth, tw_probe]
       dry_run:
         description: "只測試、不寫資料庫"
         default: false
