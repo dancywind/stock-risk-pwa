@@ -130,9 +130,112 @@ def test_dry_run_does_not_write_supabase():
     reset()
     with mock.patch.object(fetch, "sb_request") as req, mock.patch.object(fetch, "sb_ready", return_value=True), \
             mock.patch.object(fetch, "fred_latest", return_value=None), \
+            mock.patch.object(fetch, "twse_market", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("full", dry_run=True)
     req.assert_not_called()
+
+
+# ---------------------------------------------------------------- 證交所 FMTQIK
+FIELDS = ["Date", "Trade Volume", "Trade Value", "Transaction", "TAIEX", "Change"]
+
+
+def twse_payload(*rows, stat="OK"):
+    return {"stat": stat, "fields": FIELDS, "data": [list(r) for r in rows]}
+
+
+def good_row(d, close="44,762.32", change="-461.97", value="656,280,679,689"):
+    return [d, "8,082,548,083", value, "3,876,321", close, change]
+
+
+def test_twse_parses_commas_and_converts_pct():
+    reset()
+    d = TODAY - timedelta(days=1)
+    day = f"{d.year}/{d.month:02d}/{d.day:02d}"
+    with mock.patch.object(fetch, "fetch_json", return_value=(twse_payload(good_row(day)), "")):
+        rows = fetch.twse_market()
+    r = rows[0]
+    assert r["as_of"] == d.isoformat()            # 用資料自己的日期
+    assert r["close"] == 44762.32 and r["turnover"] == 656280679689.0
+    assert abs(r["change_pct"] - (-461.97 / (44762.32 + 461.97) * 100)) < 0.001
+    assert "breadth" not in str(r) and "advancers" not in r  # 不冒充廣度
+
+
+def test_twse_future_date_rejected():
+    reset()
+    f = TODAY + timedelta(days=3)
+    day = f"{f.year}/{f.month:02d}/{f.day:02d}"
+    with mock.patch.object(fetch, "fetch_json", return_value=(twse_payload(good_row(day)), "")):
+        result = fetch.twse_market()
+    assert not result
+    assert any(x["status"] in ("failure", "no_new_data") for x in fetch.LOG)
+
+
+def test_twse_out_of_range_index_rejected():
+    reset()
+    d = TODAY - timedelta(days=1)
+    day = f"{d.year}/{d.month:02d}/{d.day:02d}"
+    bad = good_row(day, close="5.00", change="0.10")
+    with mock.patch.object(fetch, "fetch_json", return_value=(twse_payload(bad), "")):
+        rows = fetch.twse_market()
+    assert not rows
+    assert any(x["status"] == "failure" for x in fetch.LOG)
+
+
+def test_twse_zero_turnover_rejected():
+    reset()
+    d = TODAY - timedelta(days=1)
+    day = f"{d.year}/{d.month:02d}/{d.day:02d}"
+    with mock.patch.object(fetch, "fetch_json", return_value=(twse_payload(good_row(day, value="0")), "")):
+        assert not fetch.twse_market()
+
+
+def test_twse_blocked_logs_failure():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        assert fetch.twse_market() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_twse_unexpected_fields_is_failure_not_guess():
+    reset()
+    weird = {"stat": "OK", "fields": ["A", "B"], "data": [["1", "2"]]}
+    with mock.patch.object(fetch, "fetch_json", return_value=(weird, "")):
+        assert fetch.twse_market() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_twse_empty_month_falls_back_to_previous_month():
+    reset()
+    d = TODAY - timedelta(days=1)
+    day = f"{d.year}/{d.month:02d}/{d.day:02d}"
+    calls = []
+    def fake(url, **k):
+        calls.append(url)
+        if "date=" in url:
+            return twse_payload(good_row(day)), ""
+        return {"stat": "No data"}, ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fake):
+        rows = fetch.twse_market()
+    assert rows and len(calls) == 2 and "date=" in calls[1]
+
+
+def test_tw_close_job_writes_market_stats_with_confirmation():
+    reset()
+    rows = [{"market": "TW", "as_of": D(1), "close": 44000.0, "change_pct": 0.5,
+             "turnover": 1e12, "source": "TWSE FMTQIK"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), \
+            mock.patch.object(fetch, "sb_upsert", return_value=(True, "已確認寫入 1 筆")) as up:
+        fetch.persist(False, [], None, rows)
+    assert up.call_args[0][0] == "market_stats" and up.call_args[0][2] == "market,as_of,source"
+
+
+def test_tw_close_job_does_not_claim_breadth():
+    reset()
+    with mock.patch.object(fetch, "twse_market", return_value=None), \
+            mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
+        fetch.run_job("tw_close", dry_run=True)
+    assert any(x["source"] == "tw_breadth" and x["status"] == "skipped" for x in fetch.LOG)
 
 
 def test_twd_layer_order_fixed():
