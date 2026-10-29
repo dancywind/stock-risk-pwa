@@ -8,6 +8,11 @@ BACKOFF_SECONDS = 5
 FRED_SERIES_URL = "https://api.stlouisfed.org/fred/series/observations"
 EXCHANGERATE_API = "https://open.er-api.com/v6/latest/USD"
 
+# 證交所「每日市場成交資訊」：加權指數收盤、成交金額、成交股數、成交筆數（官方）
+# 不帶 date 參數＝當月；帶 date=YYYYMM01＝指定月份。
+TWSE_FMTQIK = "https://www.twse.com.tw/rwd/en/afterTrading/FMTQIK"
+TAIEX_RANGE = (1000.0, 100000.0)  # 加權指數合理範圍，超出視為壞資料
+
 # 台幣備用鏈，順序固定
 TWD_LAYERS = [
     "yahoo_twd_x",       # 第 1 層：本階段不使用 Yahoo（排程 IP 易被擋），直接略過並記錄

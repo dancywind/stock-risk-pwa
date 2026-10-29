@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""第一階段資料管線（第 1 步：FRED + 台幣備用鏈 + 真實寫入 Supabase）。
+"""第一階段資料管線（第 1～2 步：FRED + 台幣備用鏈 + 證交所加權指數／成交金額 + 真實寫入 Supabase）。
 
 原則：
 - 查不到就記錄查不到，不編數字、不編日期。
@@ -216,6 +216,88 @@ def exchangerate_twd():
     return {"value": v, "as_of": as_of}
 
 
+# ---------------------------------------------------------------- 來源：證交所
+def parse_number(text):
+    """'1,234.56' -> 1234.56；無法解析回傳 None。"""
+    try:
+        return float(str(text).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def twse_date_to_iso(text):
+    """'2026/08/24' -> '2026-08-24'；格式不符回傳 None。"""
+    try:
+        y, m, d = str(text).strip().split("/")
+        return date(int(y), int(m), int(d)).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def _twse_month_rows(url):
+    """抓一個月份的資料。回傳 (rows, 原因)。rows 是已驗證的 market_stats 列。"""
+    data, err = fetch_json(url)
+    if data is None:
+        return None, f"證交所抓取失敗: {err}"
+    if data.get("stat") != "OK":
+        return [], f"證交所回覆 stat={data.get('stat')}（該月份可能尚無資料）"
+    try:
+        fields = data["fields"]
+        idx = {name: fields.index(name) for name in ("Date", "Trade Value", "TAIEX", "Change")}
+        raw_rows = data["data"]
+    except (KeyError, ValueError, TypeError):
+        return None, "證交所回傳欄位與預期不符（Date/Trade Value/TAIEX/Change）"
+
+    rows, rejected = [], 0
+    for r in raw_rows:
+        as_of = twse_date_to_iso(r[idx["Date"]])
+        close, change = parse_number(r[idx["TAIEX"]]), parse_number(r[idx["Change"]])
+        turnover = parse_number(r[idx["Trade Value"]])
+        ok_date, _ = validate_close_date(as_of)
+        if (not ok_date or close is None or change is None or turnover is None
+                or not (config.TAIEX_RANGE[0] <= close <= config.TAIEX_RANGE[1]) or turnover <= 0):
+            rejected += 1
+            continue
+        prev_close = close - change
+        if prev_close <= 0:
+            rejected += 1
+            continue
+        rows.append({
+            "market": "TW", "as_of": as_of, "close": close,
+            "change_pct": round(change / prev_close * 100, 4),  # 由官方漲跌點數換算
+            "turnover": turnover,  # 成交金額，單位：新台幣元
+            "source": "TWSE FMTQIK",
+        })
+    if rejected:
+        log("twse:FMTQIK", "failure", detail=f"{rejected} 列資料驗證不過（日期／數值異常），已拒收")
+    return rows, ""
+
+
+def twse_market():
+    """加權指數收盤與成交金額。當月沒資料（例如月初）就往前一個月找。
+    注意：本來源沒有漲跌家數，廣度不在此處理，也不用其他數字冒充。"""
+    rows, why = _twse_month_rows(config.TWSE_FMTQIK)
+    if rows is None:
+        log("twse:FMTQIK", "failure", detail=why)
+        return None
+    if not rows:
+        today = date.today()
+        py, pm = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+        prev_url = f"{config.TWSE_FMTQIK}?response=json&date={py}{pm:02d}01"
+        rows, why2 = _twse_month_rows(prev_url)
+        if rows is None:
+            log("twse:FMTQIK", "failure", detail=why2)
+            return None
+    if not rows:
+        log("twse:FMTQIK", "no_new_data", detail="當月與上月皆無可用資料")
+        return None
+    latest = max(r["as_of"] for r in rows)
+    age = (date.today() - date.fromisoformat(latest)).days
+    log("twse:FMTQIK", "success", as_of=latest,
+        detail=f"共 {len(rows)} 個交易日；最新收盤日 {latest}（距今 {age} 天）；廣度未取得，不冒充")
+    return rows
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -246,10 +328,11 @@ def twd_fallback_chain():
 
 
 # ---------------------------------------------------------------- 寫入
-def persist(dry_run, macro_rows, twd_row):
+def persist(dry_run, macro_rows, twd_row, tw_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
-                                         f"台幣 {1 if twd_row and not twd_row.get('stale_fallback') else 0} 筆）")
+                                         f"台幣 {1 if twd_row and not twd_row.get('stale_fallback') else 0} 筆、"
+                                         f"台股 {len(tw_rows or [])} 筆）")
         return
     if not sb_ready():
         log("persist", "skipped", detail="未設定 SUPABASE_URL / SUPABASE_SERVICE_KEY，只寫本機檔，未寫正式資料庫")
@@ -260,6 +343,9 @@ def persist(dry_run, macro_rows, twd_row):
     if twd_row and not twd_row.get("stale_fallback"):
         ok, msg = sb_upsert("twd_rates", [twd_row], "layer,source,as_of")
         log("persist:twd_rates", "success" if ok else "failure", detail=msg)
+    if tw_rows:
+        ok, msg = sb_upsert("market_stats", tw_rows, "market,as_of,source")
+        log("persist:market_stats", "success" if ok else "failure", detail=msg)
 
 
 def flush_log(dry_run):
@@ -286,7 +372,7 @@ def sb_upsert_plain(table, rows):
 def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
-    macro_rows, twd_row = [], None
+    macro_rows, twd_row, tw_rows = [], None, None
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -296,13 +382,14 @@ def run_job(job, dry_run=False):
                                    "value": r["value"], "source": "FRED"})
     if job in ("full", "tw_close"):
         twd_row = twd_fallback_chain()
+        tw_rows = twse_market()
     if job == "tw_close":
-        log("tw_market", "skipped", detail="台股收盤資料（證交所 OpenAPI）第二步才接")
+        log("tw_breadth", "skipped", detail="台股漲跌家數（廣度）尚未接，不用其他數字冒充")
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
-    persist(dry_run, macro_rows, twd_row)
-    return {"job": job, "macro": macro_rows, "twd": twd_row}
+    persist(dry_run, macro_rows, twd_row, tw_rows)
+    return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows}
 
 
 def main(argv=None):
