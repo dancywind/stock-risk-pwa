@@ -1,0 +1,2 @@
+# 本階段只用 Python 標準函式庫，不需要額外套件。
+# 若之後要接 yfinance / Supabase Python 客戶端，再另外加在這裡，並固定版本。
