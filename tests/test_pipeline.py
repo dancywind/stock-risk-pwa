@@ -1,5 +1,6 @@
 """用模擬回傳測試：壞資料、舊日期、被擋、寫入不確認、備用鏈。
 不連網、不需要金鑰。pytest 或 python3 直接跑都可以。"""
+import json
 import os
 import sys
 from datetime import date, timedelta
@@ -697,6 +698,65 @@ def test_persist_writes_futures_with_conflict_key():
             mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
         fetch.persist(False, [], None, None, None, None, None, rows)
     assert up.call_args[0][0] == "tw_futures_position" and up.call_args[0][2] == "as_of,contract,investor,source"
+
+
+# ---------------------------------------------------------------- 美股廣度探測（Nasdaq）
+def test_nasdaq_probe_finds_breadth_fields():
+    reset()
+    body = json.dumps({"data": {"marketInfo": {"advancers": 2105, "decliners": "2,833", "unchanged": 154}, "other": 1}, "status": {"rCode": 200}}).encode()
+    seen = []
+    def fake(url, timeout=None, headers=None):
+        seen.append((url, timeout, headers))
+        return 200, "application/json", body, ""
+    with mock.patch.object(fetch, "fetch_raw", side_effect=fake), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_nasdaq()
+    text = " ".join(x["detail"] for x in fetch.LOG)
+    assert "advancers=2105" in text and "decliners=2,833" in text and "unchanged=154" in text
+    assert len(seen) == len(config.NASDAQ_PROBE_URLS)
+    assert all(t == config.PROBE_TIMEOUT for _, t, _ in seen)               # 短逾時
+    assert all("Chrome" in h["User-Agent"] for _, _, h in seen)              # 瀏覽器標頭
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_nasdaq_probe_reports_block_html_and_http_errors():
+    reset()
+    results = iter([(None, "", b"", "timed out"), (403, "text/html", b"<html>Access Denied</html>", "HTTP 403"),
+                    (200, "text/html", b"<html>no json</html>", ""), (500, "application/json", b'{"e": 1}', "HTTP 500")])
+    with mock.patch.object(fetch, "fetch_raw", side_effect=lambda *a, **k: next(results)):
+        fetch.probe_nasdaq()
+    assert [x["status"] for x in fetch.LOG] == ["failure"] * 4
+    assert "逾時" in fetch.LOG[0]["detail"] and "不是 JSON" in fetch.LOG[1]["detail"]
+
+
+def test_nasdaq_probe_no_breadth_fields_says_so():
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", b'{"data": {"marketStatus": "Closed"}}', "")):
+        fetch.probe_nasdaq()
+    assert all("含漲跌家數字樣的欄位：沒有" in x["detail"] for x in fetch.LOG)
+
+
+def test_us_probe_job_only_probes():
+    reset()
+    with mock.patch.object(fetch, "probe_nasdaq") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+            mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.run_job("us_probe", dry_run=False)
+    pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
+    assert "us_probe" in config.JOBS
+
+
+def test_fetch_raw_accepts_custom_headers():
+    captured = {}
+    class FakeResp:
+        status = 200; headers = {"Content-Type": "application/json"}
+        def read(self): return b"{}"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_open(req, timeout=None):
+        captured["ua"] = req.get_header("User-agent"); captured["timeout"] = timeout; return FakeResp()
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=fake_open):
+        fetch.fetch_raw("https://example.test", timeout=7, headers={"User-Agent": "X-Test"})
+    assert captured == {"ua": "X-Test", "timeout": 7}
 
 
 def test_twd_layer_order_fixed():
