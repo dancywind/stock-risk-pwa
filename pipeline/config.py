@@ -86,6 +86,12 @@ NASDAQ_SCREENER_URLS = {
 }
 SCREENER_TIMEOUT = 45
 
+# 持股現價探測（只讀）：證交所每日收盤行情（含資料日期）、櫃買中心上櫃行情、Nasdaq 個股報價
+TWSE_STOCK_DAY_ALL = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
+TPEX_SWAGGER = "https://www.tpex.org.tw/openapi/swagger.json"
+TPEX_DEFAULT_BASE = "https://www.tpex.org.tw/openapi/v1"
+NASDAQ_QUOTE_URL = "https://api.nasdaq.com/api/quote/{symbol}/info?assetclass={assetclass}"
+
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe")
 
 

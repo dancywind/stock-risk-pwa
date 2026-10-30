@@ -922,6 +922,126 @@ def probe_taifex_daily():
     log("probe:taifex_daily_tx", "success", detail=_clip(f"臺股期貨相關列數 {len(tx)}｜前 4 列 {tx[:4]}"))
 
 
+def load_holdings():
+    """用服務金鑰讀你自己的持股清單（只取名稱、代號、種類、帳戶幣別，不讀股數與金額），決定要抓哪些股票的價格。
+    回傳 (清單, 錯誤)。清單每項：{market: TW|US, symbol, name, kind, pos_key}。"""
+    if not sb_ready():
+        return None, "未設定 Supabase，無法讀取持股清單"
+    accts, e1 = sb_request("GET", "private_accounts?select=user_id,account_key,currency&limit=50")
+    pos, e2 = sb_request("GET", "private_positions?select=user_id,account_key,pos_key,symbol,name,kind&limit=1000")
+    if accts is None or pos is None:
+        return None, f"讀取失敗：{e1 or e2}"
+    cur = {(a.get("user_id"), a.get("account_key")): (a.get("currency") or "").upper() for a in accts}
+    seen, out = set(), []
+    for p in pos:
+        c = cur.get((p.get("user_id"), p.get("account_key")), "")
+        market = "TW" if c == "TWD" else "US" if c == "USD" else None
+        if market is None:
+            continue
+        key = (market, p.get("symbol") or p.get("name"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"market": market, "symbol": p.get("symbol"), "name": p.get("name"), "kind": p.get("kind"), "pos_key": p.get("pos_key")})
+    return out, ""
+
+
+def _openapi_base(swagger, default):
+    servers = swagger.get("servers") or []
+    if servers and isinstance(servers[0], dict) and servers[0].get("url"):
+        return servers[0]["url"].rstrip("/")
+    if swagger.get("basePath"):
+        return default.rsplit("/", 1)[0] + swagger["basePath"]
+    return default
+
+
+def probe_prices():
+    """只讀探測：持股現價的三個來源。只記錄結構、資料日期與名稱比對結果，不寫任何資料表。"""
+    hold, herr = load_holdings()
+    if hold is None:
+        log("probe:px_holdings", "failure", detail=_clip(herr))
+        hold = []
+    else:
+        log("probe:px_holdings", "success", detail=f"台股 {sum(1 for h in hold if h['market'] == 'TW')} 檔、美股 {sum(1 for h in hold if h['market'] == 'US')} 檔")
+    tw_names = [h["name"] for h in hold if h["market"] == "TW"]
+
+    # 1) 證交所每日收盤行情（上市）
+    data, err = fetch_json(config.TWSE_STOCK_DAY_ALL)
+    twse_rows = {}
+    if data is None or not isinstance(data, dict):
+        log("probe:px_twse", "failure", detail=_clip(f"抓取失敗: {err}"))
+    else:
+        fields = data.get("fields") or []
+        rows = data.get("data") or []
+        log("probe:px_twse", "success" if data.get("stat") == "OK" else "no_new_data",
+            detail=_clip(f"stat={data.get('stat')}｜日期{data.get('date')}｜欄位{fields}｜共 {len(rows)} 列｜前2列 {rows[:2]}"))
+        if "證券名稱" in fields:
+            ni = fields.index("證券名稱")
+            twse_rows = {str(r[ni]).strip(): r for r in rows if len(r) > ni}
+
+    # 2) 櫃買中心上櫃行情
+    sw, err = fetch_json(config.TPEX_SWAGGER)
+    tpex_rows = {}
+    if sw is None or not isinstance(sw, dict):
+        log("probe:px_tpex_swagger", "failure", detail=_clip(f"抓取失敗: {err}"))
+    else:
+        cands = []
+        for path, methods in (sw.get("paths") or {}).items():
+            for m in (methods or {}).values():
+                if isinstance(m, dict) and "上櫃股票" in f"{m.get('summary', '')} {m.get('description', '')}" and "行情" in f"{m.get('summary', '')}":
+                    cands.append((path, m.get("summary", "")))
+        log("probe:px_tpex_swagger", "success", detail=_clip("含『上櫃股票』與『行情』的端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands[:8]) if cands else "無")))
+        pick = next((c for c in cands if "mainboard_daily_close" in c[0] or "收盤行情" in c[1]), cands[0] if cands else None)
+        if pick:
+            rows, err = fetch_json(_openapi_base(sw, config.TPEX_DEFAULT_BASE) + pick[0])
+            if rows is None or not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+                log("probe:px_tpex", "failure", detail=_clip(f"{pick[0]} 抓取失敗或格式非預期: {err or str(rows)[:150]}"))
+            else:
+                log("probe:px_tpex", "success", detail=_clip(f"{pick[0]}｜共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜第1列 {rows[0]}"))
+                name_key = next((k for k in rows[0] if "Name" in k or "名稱" in k), None)
+                if name_key:
+                    tpex_rows = {str(r.get(name_key)).strip(): r for r in rows}
+
+    # 3) 名稱比對（不做模糊比對）
+    if tw_names:
+        in_twse = [n for n in tw_names if n in twse_rows]
+        in_tpex = [n for n in tw_names if n in tpex_rows and n not in twse_rows]
+        none = [n for n in tw_names if n not in twse_rows and n not in tpex_rows]
+        log("probe:px_tw_match", "success" if not none else "failure",
+            detail=_clip(f"上市對上 {len(in_twse)} 檔、上櫃對上 {len(in_tpex)} 檔（{in_tpex}）、兩邊都對不上 {len(none)} 檔（{none}）"))
+
+    # 4) Nasdaq 個股報價：看有沒有帶時間戳，以及是不是即時價
+    headers = {"User-Agent": config.NASDAQ_UA, "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.9",
+               "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+    for h in [x for x in hold if x["market"] == "US"]:
+        sym = (h["symbol"] or h["pos_key"] or "").upper()
+        first = "etf" if h["kind"] in ("etf", "leveraged_etf") else "stocks"
+        done = False
+        for ac in (first, "stocks" if first == "etf" else "etf"):
+            status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=headers)
+            src = f"probe:px_nasdaq:{sym}"
+            if status is None:
+                log(src, "failure", detail=_clip(f"連線失敗（可能被擋或逾時）: {err}"))
+                done = True
+                break
+            try:
+                j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+            except (ValueError, UnicodeDecodeError):
+                log(src, "failure", detail=_clip(f"HTTP {status}｜不是 JSON：{body[:120].decode('utf-8', errors='replace')!r}"))
+                done = True
+                break
+            d = j.get("data") if isinstance(j, dict) else None
+            if isinstance(d, dict) and isinstance(d.get("primaryData"), dict):
+                pdta = d["primaryData"]
+                keep = {k: pdta.get(k) for k in ("lastSalePrice", "netChange", "percentageChange", "lastTradeTimestamp", "isRealTime", "volume") if k in pdta}
+                sec = d.get("secondaryData")
+                log(src, "success", detail=_clip(f"assetclass={ac}｜marketStatus={d.get('marketStatus')}｜primary={keep}｜secondary={'有' if sec else '無'}｜資料鍵 {list(d.keys())[:12]}"))
+                done = True
+                break
+        if not done:
+            log(f"probe:px_nasdaq:{sym}", "failure", detail="stocks 與 etf 兩種 assetclass 都沒有取得報價資料")
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -1036,7 +1156,7 @@ def run_job(job, dry_run=False):
         probe_extra()
         probe_taifex_daily()
     if job == "us_probe":
-        probe_nasdaq_screener()
+        probe_prices()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
