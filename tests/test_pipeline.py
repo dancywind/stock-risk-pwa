@@ -136,6 +136,7 @@ def test_dry_run_does_not_write_supabase():
             mock.patch.object(fetch, "twse_institutional", return_value=None), \
             mock.patch.object(fetch, "twse_margin", return_value=None), \
             mock.patch.object(fetch, "taifex_futures", return_value=None), \
+            mock.patch.object(fetch, "taifex_basis", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("full", dry_run=True)
     req.assert_not_called()
@@ -334,9 +335,11 @@ def test_tw_close_runs_breadth_and_market():
             mock.patch.object(fetch, "twse_institutional", return_value=None) as i, \
             mock.patch.object(fetch, "twse_margin", return_value=None) as g, \
             mock.patch.object(fetch, "taifex_futures", return_value=None) as fu, \
+            mock.patch.object(fetch, "taifex_basis", return_value=None) as ba, \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("tw_close", dry_run=True)
     fu.assert_called_once()
+    ba.assert_called_once()
     m.assert_called_once()
     b.assert_called_once()
     i.assert_called_once()
@@ -824,6 +827,132 @@ def test_taifex_daily_probe_failures():
     with mock.patch.object(fetch, "fetch_json", return_value=({"paths": {"/x": {"get": {"summary": "其他"}}}}, "")):
         fetch.probe_taifex_daily()
     assert "無" in fetch.LOG[-1]["detail"]
+
+
+# ---------------------------------------------------------------- 台指期基差
+def fut_daily(month, last, session="一般", d=None, contract="TX", settle="46569"):
+    return {"Date": d or ymd(), "Contract": contract, "ContractMonth(Week)": month, "Open": "1", "High": "1", "Low": "1",
+            "Last": last, "Change": "0", "%": "0%", "Volume": "1", "SettlementPrice": settle, "OpenInterest": "1",
+            "BestBid": "1", "BestAsk": "1", "HistoricalHigh": "1", "HistoricalLow": "1", "TradingHalt": "",
+            "TradingSession": session}
+
+
+def tw_idx(close, days_ago=1):
+    return {"as_of": (TODAY - timedelta(days=days_ago)).isoformat(), "close": close}
+
+
+# 真實回傳的格式：TX 近月 202611 一般時段最後成交價 46577、結算價 46569、盤後另一列
+DAILY_ROWS = [fut_daily("202611", "46577"), fut_daily("202611", "47121", session="盤後", settle="NULL"),
+              fut_daily("202612", "46700"), fut_daily("202611/202612", "-123"), fut_daily("202611", "999", contract="MTX"),
+              fut_daily("202703", "46800")]
+
+
+def test_basis_uses_near_month_regular_session_and_same_day_index():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(DAILY_ROWS, "")):
+        r = fetch.taifex_basis([tw_idx(46368.33)])[0]
+    assert r["contract_month"] == "202611" and r["futures_last"] == 46577       # 不用盤後 47121、不用小型、不用價差
+    assert abs(r["basis"] - (46577 - 46368.33)) < 0.01 and abs(r["basis_pct"] - 0.45) < 0.01
+    assert r["settlement_price"] == 46569 and r["index_close"] == 46368.33
+    assert r["as_of"] == (TODAY - timedelta(days=1)).isoformat()
+
+
+def test_basis_date_mismatch_is_not_computed():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(DAILY_ROWS, "")):
+        assert fetch.taifex_basis([tw_idx(46000, days_ago=2)]) is None          # 指數是前一天
+        assert fetch.taifex_basis([]) is None and fetch.taifex_basis(None) is None
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "日期對不上" in fetch.LOG[-1]["detail"]
+
+
+def test_basis_no_regular_last_price_is_no_data():
+    reset()
+    rows = [fut_daily("202611", "-"), fut_daily("202612", "46700")]
+    with mock.patch.object(fetch, "fetch_json", return_value=(rows, "")):
+        assert fetch.taifex_basis([tw_idx(46368.33)]) is None
+    assert fetch.LOG[-1]["status"] == "no_new_data"
+
+
+def test_basis_absurd_or_bad_inputs_rejected():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=([fut_daily("202611", "90000")], "")):
+        assert fetch.taifex_basis([tw_idx(46368.33)]) is None                    # 基差超過 5%
+    assert fetch.LOG[-1]["status"] == "failure"
+    with mock.patch.object(fetch, "fetch_json", return_value=([fut_daily("202511", "46000")], "")):
+        assert fetch.taifex_basis([tw_idx(46000)]) is None                       # 近月早於資料月份
+    with mock.patch.object(fetch, "fetch_json", return_value=([{"x": 1}], "")):
+        assert fetch.taifex_basis([tw_idx(46000)]) is None
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        assert fetch.taifex_basis([tw_idx(46000)]) is None
+    with mock.patch.object(fetch, "fetch_json", return_value=([fut_daily("202611", "46500", d=ymd(-3))], "")):
+        assert fetch.taifex_basis([tw_idx(46000)]) is None                       # 未來日期
+
+
+def test_basis_persist_conflict_key():
+    reset()
+    rows = [{"as_of": D(1), "contract_month": "202611", "futures_last": 1, "index_close": 1, "basis": 0, "source": "x"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
+        fetch.persist(False, [], None, None, None, None, None, None, rows)
+    assert up.call_args[0][0] == "tw_futures_basis" and up.call_args[0][2] == "as_of,contract_month,source"
+
+
+def test_run_job_passes_index_rows_to_basis():
+    reset()
+    idx = [tw_idx(100.0)]
+    with mock.patch.object(fetch, "twse_market", return_value=idx), mock.patch.object(fetch, "twse_breadth", return_value=None), \
+            mock.patch.object(fetch, "twse_institutional", return_value=None), mock.patch.object(fetch, "twse_margin", return_value=None), \
+            mock.patch.object(fetch, "taifex_futures", return_value=None), mock.patch.object(fetch, "twd_fallback_chain", return_value=None), \
+            mock.patch.object(fetch, "taifex_basis", return_value=None) as ba:
+        fetch.run_job("tw_close", dry_run=True)
+    ba.assert_called_once_with(idx)
+
+
+# ---------------------------------------------------------------- 外資期貨：JSON 失敗時改讀 CSV
+CSV_TEXT = ("\ufeff日期,商品名稱,身份別,多方交易口數,多方交易契約金額(千元),空方交易口數,空方交易契約金額(千元),多空交易口數淨額,"
+            "多空交易契約金額淨額(千元),多方未平倉口數,多方未平倉契約金額(千元),空方未平倉口數,空方未平倉契約金額(千元),"
+            "多空未平倉口數淨額,多空未平倉契約金額淨額(千元)\n"
+            "{d},臺股期貨,自營商,1,1,1,1,0,0,5606,1,4095,1,1511,100\n"
+            "{d},臺股期貨,外資及陸資,1,1,1,1,0,0,30000,1,52000,1,-22000,-200\n"
+            "{d},小型臺指期貨,外資及陸資,1,1,1,1,0,0,9,1,1,1,8,1\n")
+
+
+def test_foreign_futures_falls_back_to_csv_when_json_fails():
+    reset()
+    d = (TODAY - timedelta(days=1)).strftime("%Y/%m/%d")             # CSV 的日期可能帶斜線
+    body = CSV_TEXT.replace("{d}", d).encode("utf-8")
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "Expecting value: line 1 column 1 (char 0)")), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/octet-stream", body, "")):
+        rows = fetch.taifex_futures()
+    f = [r for r in rows if r["investor"].startswith("外資")][0]
+    assert f["oi_net"] == -22000 and f["oi_long"] == 30000 and f["oi_short"] == 52000
+    assert {r["investor"] for r in rows} == {"自營商", "外資及陸資"}                  # 不含小型臺指期貨
+    assert f["as_of"] == (TODAY - timedelta(days=1)).isoformat()
+    assert any(x["source"] == "taifex:futures_format" for x in fetch.LOG)
+
+
+def test_csv_fallback_wrong_headers_or_empty_is_failure():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "x")), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/csv", "a,b\n1,2\n".encode(), "")):
+        assert fetch.taifex_futures() is None
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "x")), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"denied", "HTTP 403")):
+        assert fetch.taifex_futures() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_csv_fallback_identity_mismatch_rejected():
+    reset()
+    d = (TODAY - timedelta(days=1)).strftime("%Y%m%d")
+    body = CSV_TEXT.replace("{d}", d).replace("-22000", "-1").encode("utf-8")      # 多空相減不等於淨額
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "x")), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/csv", body, "")):
+        assert fetch.taifex_futures() is None
+
+
+def test_norm_ymd():
+    assert fetch._norm_ymd("2026/10/29") == "20261029" and fetch._norm_ymd("2026-10-29") == "20261029"
+    assert fetch._norm_ymd("20261029") == "20261029" and fetch._norm_ymd("abc") is None and fetch._norm_ymd(None) is None
 
 
 def test_twd_layer_order_fixed():
