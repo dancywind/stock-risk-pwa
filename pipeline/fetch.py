@@ -1137,6 +1137,50 @@ def tpex_prices(hold):
     return out
 
 
+def nasdaq_hist_range(sym, assetclass, close, price_date):
+    """槓桿 ETF 沒有 keyStats，改用 Nasdaq 歷史行情（約一年）算 52 週最高最低。
+    回傳 (低, 高, 說明)；任何一關沒過就回傳 (None, None, 原因)，不硬算：
+    資料筆數與涵蓋天數要夠、最新一筆要跟收盤價同期、且收盤價不能出現分割式的跳動（沒調整的分割會讓區間完全錯誤）。"""
+    today = date.today()
+    url = config.NASDAQ_HIST_URL.format(symbol=sym, assetclass=assetclass, fromdate=(today - timedelta(days=380)).isoformat(), todate=today.isoformat())
+    status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+    if status is None:
+        return None, None, f"歷史行情連線失敗: {err}"
+    try:
+        rows = (((json.loads(body.decode("utf-8-sig").lstrip("\ufeff")) or {}).get("data") or {}).get("tradesTable") or {}).get("rows") or []
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None, None, "歷史行情不是 JSON"
+    pts = []
+    for r in rows:
+        m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", str(r.get("date", "")).strip())
+        c = parse_number(str(r.get("close", "")).replace("$", ""))
+        h = parse_number(str(r.get("high", "")).replace("$", ""))
+        lo = parse_number(str(r.get("low", "")).replace("$", ""))
+        if not m or None in (c, h, lo) or not (0 < lo <= c <= h < config.PRICE_LIMIT):
+            continue
+        try:
+            pts.append((date(int(m.group(3)), int(m.group(1)), int(m.group(2))), c, h, lo))
+        except ValueError:
+            continue
+    if not pts:
+        return None, None, "歷史行情沒有可用的資料列"
+    pts.sort()
+    last_day = pts[-1][0]
+    window = [p for p in pts if p[0] > last_day - timedelta(days=365)]
+    if len(window) < config.RANGE52_MIN_ROWS or (window[-1][0] - window[0][0]).days < config.RANGE52_MIN_COVERAGE_DAYS:
+        return None, None, f"歷史只有 {len(window)} 個交易日、涵蓋 {(window[-1][0] - window[0][0]).days} 天，不足以算 52 週"
+    if (date.fromisoformat(price_date) - last_day).days > 4:
+        return None, None, f"歷史行情最新到 {last_day}，和收盤價日期 {price_date} 差太多"
+    for a, b in zip(window, window[1:]):
+        ratio = b[1] / a[1]
+        if ratio >= config.SPLIT_JUMP_UP or ratio <= config.SPLIT_JUMP_DOWN:
+            return None, None, f"{b[0]} 收盤價單日變動 {ratio:.2f} 倍（{a[1]}→{b[1]}），疑似分割或反向分割沒有調整，區間不採用"
+    hi, lo = max(p[2] for p in window), min(p[3] for p in window)
+    if not (lo * 0.98 <= close <= hi * 1.02):
+        return None, None, f"收盤價 {close} 不在歷史區間 {lo}–{hi} 內，不採用"
+    return lo, hi, f"Nasdaq 歷史行情（{len(window)} 個交易日，已檢查沒有分割跳動）"
+
+
 def nasdaq_prices(hold):
     """持股裡美股的收盤價（Nasdaq 個股報價）。只在 marketStatus=Closed 且 isRealTime=False 時採用，避免拿盤中或盤後價冒充收盤價。"""
     out = []
@@ -1182,8 +1226,15 @@ def nasdaq_prices(hold):
         if high52 is not None and not (low52 * 0.98 <= close <= high52 * 1.02):
             note = f"；收盤價 {close} 不在 52 週區間 {low52}–{high52} 內，區間可能過時，不採用"
             low52 = high52 = None
-        out.append(_price_row("US", sym, h.get("name"), iso, close, change, "Nasdaq 個股報價（已收盤）", high52, low52,
-                              "Nasdaq keyStats（與收盤價同次取得）" if high52 is not None else None))
+        range_src = "Nasdaq keyStats（與收盤價同次取得）" if high52 is not None else None
+        if high52 is None and h.get("kind") in ("etf", "leveraged_etf"):
+            lo_h, hi_h, why_h = nasdaq_hist_range(sym, ac, close, iso)          # 沿用剛剛報價成功的分類（etf 或 stocks）
+            if lo_h is not None:
+                low52, high52, range_src = lo_h, hi_h, why_h
+            else:
+                note += f"；52 週區間查不到：{why_h}"
+            time.sleep(1)
+        out.append(_price_row("US", sym, h.get("name"), iso, close, change, "Nasdaq 個股報價（已收盤）", high52, low52, range_src))
         log(f"nasdaq:price:{sym}", "success", as_of=iso,
             detail=f"收盤價 {close}（資料日 {iso}）；52 週區間 " + (f"{low52}–{high52}" if high52 is not None else "查不到") + note)
         time.sleep(1)
@@ -1619,6 +1670,49 @@ def tw_crash_check(days, dry_run=False, threshold=None):
     return found if ok else None
 
 
+def probe_us_pressure():
+    """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
+    1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
+    status, ctype, body, err = fetch_raw(config.CFTC_TFF_URL, timeout=config.PROBE_TIMEOUT)
+    if status is None:
+        log("probe:cftc_tff", "failure", detail=_clip(f"連線失敗: {err}"))
+    else:
+        try:
+            rows = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                names = sorted({str(r.get("market_and_exchange_names")) for r in rows})
+                dates = sorted({str(r.get("report_date_as_yyyy_mm_dd"))[:10] for r in rows}, reverse=True)
+                log("probe:cftc_tff", "success", detail=_clip(f"HTTP {status}｜{len(rows)} 列｜市場 {names}｜報告日 {dates}｜欄位 {list(rows[0].keys())}"))
+                log("probe:cftc_tff_row", "success", detail=_clip(f"第1列 {rows[0]}"))
+            else:
+                log("probe:cftc_tff", "failure", detail=_clip(f"HTTP {status}｜非預期格式：{str(rows)[:200]}"))
+        except (ValueError, UnicodeDecodeError):
+            log("probe:cftc_tff", "failure", detail=_clip(f"HTTP {status}｜不是 JSON：{body[:120].decode('utf-8', errors='replace')!r}"))
+
+    status, ctype, body, err = fetch_raw(config.FINRA_MARGIN_URL, timeout=config.PROBE_TIMEOUT, headers={"User-Agent": config.NASDAQ_UA, "Accept": "text/html"})
+    if status is None:
+        log("probe:finra_margin", "failure", detail=_clip(f"連線失敗: {err}"))
+    else:
+        text = re.sub(r"<[^>]+>", " ", body.decode("utf-8", errors="replace"))
+        text = re.sub(r"\s+", " ", text)
+        i = text.find("Debit Balances")
+        log("probe:finra_margin", "success" if i >= 0 else "failure",
+            detail=_clip(f"HTTP {status}｜{ctype}｜{len(body)} 位元組｜" + (f"『Debit Balances』附近：{text[i:i + 420]}" if i >= 0 else "頁面文字裡找不到 Debit Balances（可能要執行網頁程式才會出現表格）")))
+
+    ymd = (date.today() - timedelta(days=3)).isoformat()
+    while date.fromisoformat(ymd).weekday() >= 5:
+        ymd = (date.fromisoformat(ymd) - timedelta(days=1)).isoformat()
+    for tag, tmpl in config.CBOE_PC_URLS.items():
+        status, ctype, body, err = fetch_raw(tmpl.format(ymd=ymd), timeout=config.PROBE_TIMEOUT)
+        src = f"probe:cboe_pc:{tag}"
+        if status is None:
+            log(src, "failure", detail=_clip(f"連線失敗: {err}"))
+            continue
+        head = body[:260].decode("utf-8", errors="replace")
+        tail = body[-200:].decode("utf-8", errors="replace") if len(body) > 600 else ""
+        log(src, "success" if status == 200 else "failure", detail=_clip(f"HTTP {status}｜{ctype}｜{len(body)} 位元組｜開頭 {head!r}｜結尾 {tail!r}"))
+
+
 def probe_hist2():
     """只讀探測：Nasdaq 對槓桿 ETF 的歷史行情端點、櫃買中心『上櫃股票每日收盤行情』的完整欄位。"""
     hold, herr = load_holdings()
@@ -1795,7 +1889,7 @@ def run_job(job, dry_run=False):
         probe_extra()
         probe_taifex_daily()
     if job == "us_probe":
-        probe_hist2()
+        probe_us_pressure()
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)

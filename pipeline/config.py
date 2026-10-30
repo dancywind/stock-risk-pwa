@@ -120,6 +120,16 @@ TWD_LAG_DAYS = 2
 CRASH_DROP_PCT = 9.0
 CRASH_RECENT_DAYS = 10            # 回補工作每次重新檢查最近幾個完成的交易日
 CRASH_PREV_MAX_GAP_DAYS = 10      # 前一個交易日距離超過這麼多天，就不比較（避免拿很舊的價格算跌幅）
+# 槓桿 ETF 的 52 週區間：用 Nasdaq 歷史行情算。價格出現這個倍數以上的單日跳動，視為分割或反向分割沒有調整，不採用。
+SPLIT_JUMP_UP = 2.5
+SPLIT_JUMP_DOWN = 0.33
+# 美股資金壓力三項的來源探測（只讀）：CFTC COT、FINRA 融資統計、CBOE Put/Call
+CFTC_TFF_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json?$limit=6&$order=report_date_as_yyyy_mm_dd%20DESC&$q=S%26P%20500"
+FINRA_MARGIN_URL = "https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics"
+CBOE_PC_URLS = {
+    "totalpc_csv": "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv",
+    "daily_json": "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options",
+}
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill")
