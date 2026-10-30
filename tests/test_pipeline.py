@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -137,6 +137,7 @@ def test_dry_run_does_not_write_supabase():
             mock.patch.object(fetch, "twse_margin", return_value=None), \
             mock.patch.object(fetch, "taifex_futures", return_value=None), \
             mock.patch.object(fetch, "taifex_basis", return_value=None), \
+            mock.patch.object(fetch, "cftc_cot", return_value=None), mock.patch.object(fetch, "cboe_putcall", return_value=None), \
             mock.patch.object(fetch, "load_holdings", return_value=(None, "測試")), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("full", dry_run=True)
@@ -337,6 +338,7 @@ def test_tw_close_runs_breadth_and_market():
             mock.patch.object(fetch, "twse_margin", return_value=None) as g, \
             mock.patch.object(fetch, "taifex_futures", return_value=None) as fu, \
             mock.patch.object(fetch, "taifex_basis", return_value=None) as ba, \
+            mock.patch.object(fetch, "cftc_cot", return_value=None), mock.patch.object(fetch, "cboe_putcall", return_value=None), \
             mock.patch.object(fetch, "load_holdings", return_value=(None, "測試")), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("tw_close", dry_run=True)
@@ -905,6 +907,7 @@ def test_run_job_passes_index_rows_to_basis():
             mock.patch.object(fetch, "twse_institutional", return_value=None), mock.patch.object(fetch, "twse_margin", return_value=None), \
             mock.patch.object(fetch, "taifex_futures", return_value=None), mock.patch.object(fetch, "twd_fallback_chain", return_value=None), \
             mock.patch.object(fetch, "load_holdings", return_value=(None, "測試")), \
+            mock.patch.object(fetch, "cftc_cot", return_value=None), mock.patch.object(fetch, "cboe_putcall", return_value=None), \
             mock.patch.object(fetch, "taifex_basis", return_value=None) as ba:
         fetch.run_job("tw_close", dry_run=True)
     ba.assert_called_once_with(idx)
@@ -1170,6 +1173,7 @@ def test_run_job_collects_tpex_and_nasdaq_prices_when_holdings_available():
     with mock.patch.object(fetch, "twse_market", return_value=None), mock.patch.object(fetch, "twse_breadth", return_value=None), \
             mock.patch.object(fetch, "twse_institutional", return_value=None), mock.patch.object(fetch, "twse_margin", return_value=None), \
             mock.patch.object(fetch, "taifex_futures", return_value=None), mock.patch.object(fetch, "taifex_basis", return_value=None), \
+            mock.patch.object(fetch, "cftc_cot", return_value=None), mock.patch.object(fetch, "cboe_putcall", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None), mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), \
             mock.patch.object(fetch, "tpex_prices", return_value=[{"k": 1, "name": "金居"}]) as tp, \
             mock.patch.object(fetch, "twse_prices", return_value=[{"k": 3}]) as tw, mock.patch.object(fetch, "nasdaq_prices", return_value=[{"k": 2}]) as nq:
@@ -1452,7 +1456,7 @@ def test_backfill_write_failure_stops_without_marking_done():
 
 def test_run_job_daily_append_only_when_not_dry_run():
     reset()
-    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, twd_fallback_chain=None)
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
     patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist")]
     for p_ in patches: p_.start()
     try:
@@ -1592,7 +1596,7 @@ def test_breadth_update_dry_run_failures_and_missing_pieces():
 
 def test_run_job_breadth_update_wiring():
     reset()
-    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, twd_fallback_chain=None)
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
     patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist")]
     for p_ in patches: p_.start()
     try:
@@ -1649,7 +1653,7 @@ def test_persist_writes_primary_and_supplement_together_never_stale_fallback():
 
 def test_run_job_adds_supplement_row_to_twd():
     reset()
-    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None)
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None)
     patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x"))]
     for p_ in patches: p_.start()
     try:
@@ -1733,7 +1737,7 @@ def test_backfill_returns_new_days_and_crash_check_wiring():
     reset()
     res, calls, ups, _ = run_backfill(max_days=2)
     assert res["new_days"] == [d.isoformat() for d in weekdays_back(2)]
-    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, twd_fallback_chain=None)
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
     patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
               mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "_recent_complete_days", return_value=["R"])]
     for p_ in patches: p_.start()
@@ -1882,6 +1886,125 @@ def test_probe_us_pressure_failures_and_js_only_finra_page():
     by = {x["source"]: x for x in fetch.LOG}
     assert by["probe:cftc_tff"]["status"] == "failure" and "連線失敗" in by["probe:cftc_tff"]["detail"]
     assert by["probe:finra_margin"]["status"] == "failure" and "找不到 Debit Balances" in by["probe:finra_margin"]["detail"]
+
+
+# ---------------------------------------------------------------- CFTC COT（標普 500 合併合約）
+MKT = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
+
+
+def cot_row(d, oi=2000000, dl=100, ds=300, al=900000, ash=500000, ll=400000, ls=700000, market=MKT):
+    return {"market_and_exchange_names": market, "report_date_as_yyyy_mm_dd": f"{d}T00:00:00.000", "open_interest_all": str(oi),
+            "dealer_positions_long_all": str(dl), "dealer_positions_short_all": str(ds), "asset_mgr_positions_long": str(al),
+            "asset_mgr_positions_short": str(ash), "lev_money_positions_long": str(ll), "lev_money_positions_short": str(ls)}
+
+
+def test_cftc_cot_parses_two_weeks_with_own_report_date():
+    reset()
+    rows = [cot_row(D(10)), cot_row(D(17), ll=380000, ls=650000)]
+    urls = []
+    def fj(url, **k):
+        urls.append(url); return rows, ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        out = fetch.cftc_cot()
+    assert [r["report_date"] for r in out] == [D(10), D(17)]                             # 新到舊，日期是報告日自己的日期
+    assert out[0]["lev_long"] == 400000 and out[0]["lev_short"] == 700000 and out[0]["open_interest"] == 2000000
+    assert out[0]["market"] == "S&P 500 Consolidated"
+    assert "S%26P%20500%20Consolidated" in urls[0] and "gpe5-46if" in urls[0] and "%24limit=2" in urls[0] and "report_date_as_yyyy_mm_dd%20DESC" in urls[0]
+    assert "槓桿基金淨 -300,000" in fetch.LOG[-1]["detail"] and fetch.LOG[-1]["as_of"] == D(10)
+
+
+def test_cftc_cot_rejects_bad_rows_and_wrong_market():
+    reset()
+    rows = [cot_row(D(10), market="E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE"),         # 不是合併合約
+            cot_row(D(17), al=3000000),                                                      # 多方超過未平倉
+            cot_row("2999-01-01"), cot_row(D(24), oi=0), cot_row(D(31), ll=-5)]
+    with mock.patch.object(fetch, "fetch_json", return_value=(rows, "")):
+        assert fetch.cftc_cot() is None
+    assert fetch.LOG[-1]["status"] == "failure" and "沒通過驗證" in fetch.LOG[-1]["detail"]
+    ok_and_bad = [cot_row(D(10)), cot_row(D(17), oi=0)]
+    with mock.patch.object(fetch, "fetch_json", return_value=(ok_and_bad, "")):
+        out = fetch.cftc_cot()
+    assert len(out) == 1 and "1 列未通過驗證" in fetch.LOG[-1]["detail"]
+    for bad in ((None, "HTTP 403"), ([], ""), ({"x": 1}, ""), ([{"x": 1}], "")):
+        reset()
+        with mock.patch.object(fetch, "fetch_json", return_value=bad):
+            assert fetch.cftc_cot() is None
+        assert fetch.LOG[-1]["status"] == "failure"
+
+
+# ---------------------------------------------------------------- CBOE Put/Call
+def cboe_body(total="0.93", extra=True):
+    r = [{"name": "TOTAL PUT/CALL RATIO", "value": total}, {"name": "INDEX PUT/CALL RATIO", "value": "1.06"},
+         {"name": "EXCHANGE TRADED PRODUCTS PUT/CALL RATIO", "value": "1.09"}]
+    if extra:
+        r.append({"name": "EQUITY PUT/CALL RATIO", "value": "0.62"})
+    return json.dumps({"ratios": r, "SUM OF ALL PRODUCTS": [{"name": "VOLUME", "call": 1, "put": 1, "total": 2}]}).encode()
+
+
+def fake_et(y, m, d, hour):
+    from zoneinfo import ZoneInfo
+    return datetime(y, m, d, hour, 0, tzinfo=ZoneInfo("America/New_York"))
+
+
+def test_cboe_putcall_uses_closed_trading_day_with_its_own_date():
+    reset()
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        seen.append(url); return 200, "application/json", cboe_body(), ""
+    with mock.patch.object(fetch, "_now_et", return_value=fake_et(2026, 10, 30, 10)), mock.patch.object(fetch, "fetch_raw", side_effect=raw):
+        out = fetch.cboe_putcall()
+    assert out[0]["as_of"] == "2026-10-29" and "2026-10-29_daily_options" in seen[0]               # 週五早上 → 取週四（不取當天還沒收盤的）
+    assert (out[0]["total_pc"], out[0]["index_pc"], out[0]["etp_pc"], out[0]["equity_pc"]) == (0.93, 1.06, 1.09, 0.62)
+
+
+def test_cboe_putcall_same_day_only_after_five_pm_and_skips_weekends():
+    reset()
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        seen.append(url); return 200, "application/json", cboe_body(), ""
+    with mock.patch.object(fetch, "_now_et", return_value=fake_et(2026, 10, 30, 18)), mock.patch.object(fetch, "fetch_raw", side_effect=raw):
+        assert fetch.cboe_putcall()[0]["as_of"] == "2026-10-30"                                      # 收盤後的當天可用
+    seen.clear()
+    with mock.patch.object(fetch, "_now_et", return_value=fake_et(2026, 11, 2, 9)), mock.patch.object(fetch, "fetch_raw", side_effect=raw):
+        assert fetch.cboe_putcall()[0]["as_of"] == "2026-10-30"                                      # 週一早上 → 取上週五，跳過週末
+    assert all("2026-10-31" not in u and "2026-11-01" not in u for u in seen)
+
+
+def test_cboe_putcall_falls_back_to_earlier_day_and_never_fabricates():
+    reset()
+    def raw(url, timeout=None, headers=None):
+        return (404, "text/html", b"nope", "HTTP 404") if "2026-10-29" in url else (200, "application/json", cboe_body(extra=False), "")
+    with mock.patch.object(fetch, "_now_et", return_value=fake_et(2026, 10, 30, 10)), mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        out = fetch.cboe_putcall()
+    assert out[0]["as_of"] == "2026-10-28" and out[0]["equity_pc"] is None                          # 沒有的欄位留空，不編
+    reset()
+    with mock.patch.object(fetch, "_now_et", return_value=fake_et(2026, 10, 30, 10)), mock.patch.object(fetch, "fetch_raw", return_value=(404, "x", b"", "HTTP 404")), mock.patch.object(fetch.time, "sleep"):
+        assert fetch.cboe_putcall() is None
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "2026-10-29:404" in fetch.LOG[-1]["detail"]
+    for body in (b"not json", cboe_body(total="0"), cboe_body(total="99"), json.dumps({"ratios": []}).encode()):
+        reset()
+        with mock.patch.object(fetch, "_now_et", return_value=fake_et(2026, 10, 30, 10)), mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body, "")), mock.patch.object(fetch.time, "sleep"):
+            assert fetch.cboe_putcall() is None
+
+
+def test_persist_writes_cot_and_putcall_and_job_wires_them():
+    reset()
+    cot = [{"report_date": D(10), "market": "S&P 500 Consolidated"}]
+    pc = [{"as_of": D(1), "total_pc": 0.9}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
+        fetch.persist(False, [], None, None, None, None, None, None, None, None, cot, pc)
+    calls = {c[0][0]: c[0][2] for c in up.call_args_list}
+    assert calls == {"us_cot": "report_date,market", "us_putcall": "as_of"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, twd_fallback_chain=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x"))]
+    for p_ in patches: p_.start()
+    try:
+        with mock.patch.object(fetch, "cftc_cot", return_value=cot) as c1, mock.patch.object(fetch, "cboe_putcall", return_value=pc) as c2:
+            res = fetch.run_job("tw_close", dry_run=True)
+        c1.assert_called_once(); c2.assert_called_once()
+        assert res["us_cot"] == cot and res["us_putcall"] == pc
+    finally:
+        for p_ in patches: p_.stop()
 
 
 def test_twd_layer_order_fixed():
