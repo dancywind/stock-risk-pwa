@@ -738,7 +738,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_nasdaq") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_nasdaq_screener") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -757,6 +757,38 @@ def test_fetch_raw_accepts_custom_headers():
     with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=fake_open):
         fetch.fetch_raw("https://example.test", timeout=7, headers={"User-Agent": "X-Test"})
     assert captured == {"ua": "X-Test", "timeout": 7}
+
+
+def test_screener_probe_counts_and_reports_dates():
+    reset()
+    rows = [{"symbol": "A", "pctchange": "1.50%"}, {"symbol": "B", "pctchange": "-0.20%"}, {"symbol": "C", "pctchange": "UNCH"},
+            {"symbol": "D", "pctchange": "0.00%"}, {"symbol": "E", "pctchange": ""}, {"symbol": "F", "pctchange": "2.0%"}]
+    body = json.dumps({"data": {"asOf": "Last price as of Oct 29, 2026", "rows": rows}, "status": {"rCode": 200}}).encode()
+    seen = []
+    with mock.patch.object(fetch, "fetch_raw", side_effect=lambda url, timeout=None, headers=None: (seen.append(timeout) or (200, "application/json", body, ""))), \
+            mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_nasdaq_screener()
+    assert len(fetch.LOG) == len(config.NASDAQ_SCREENER_URLS) and all(x["status"] == "success" for x in fetch.LOG)
+    d = fetch.LOG[0]["detail"]
+    assert "上漲 2／下跌 1／持平 2／無法解析 1" in d and "asOf=Last price as of Oct 29, 2026" in d and "僅診斷" in d
+    assert all(t == config.SCREENER_TIMEOUT for t in seen)
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_screener_probe_failures_are_reported():
+    reset()
+    results = iter([(None, "", b"", "timed out"), (403, "text/html", b"<html>denied</html>", "HTTP 403"),
+                    (200, "application/json", b'{"data": {"rows": []}}', "")])
+    with mock.patch.object(fetch, "fetch_raw", side_effect=lambda *a, **k: next(results)):
+        fetch.probe_nasdaq_screener()
+    assert [x["status"] for x in fetch.LOG] == ["failure"] * 3
+    assert "逾時" in fetch.LOG[0]["detail"] and "不是 JSON" in fetch.LOG[1]["detail"] and "找不到資料列" in fetch.LOG[2]["detail"]
+
+
+def test_pct_parser():
+    assert fetch._pct_to_float("1.23%") == 1.23 and fetch._pct_to_float("-0.5%") == -0.5
+    assert fetch._pct_to_float("UNCH") == 0.0 and fetch._pct_to_float("") is None and fetch._pct_to_float("abc") is None
 
 
 def test_twd_layer_order_fixed():
