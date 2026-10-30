@@ -22,7 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pipeline import config  # noqa: E402
@@ -1182,6 +1182,129 @@ def nasdaq_prices(hold):
     return out
 
 
+def twse_prices(hold, exclude_names=()):
+    """持股裡「上市」股票的官方收盤價（證交所 OpenAPI）。名稱必須完全相同；同名多筆優先取四位數代號，仍不唯一就不用。
+    exclude_names：已由其他來源（上櫃）取得價格的名稱，不重複查。這個來源沒有漲跌欄位，所以 change 留空。"""
+    names = [h["name"] for h in hold if h["market"] == "TW" and h["name"] not in set(exclude_names)]
+    if not names:
+        return []
+    rows, err = fetch_json(config.TWSE_AVG_URL)
+    if rows is None or not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        log("twse:prices", "failure", detail=_clip(f"抓取失敗或格式非預期: {err or str(rows)[:120]}"))
+        return None
+    if any(k not in rows[0] for k in ("Date", "Code", "Name", "ClosingPrice")):
+        log("twse:prices", "failure", detail=_clip(f"欄位與預期不符: {list(rows[0].keys())[:10]}"))
+        return None
+    wanted = set(names)
+    by_name = {}
+    for r in rows:
+        nm = str(r.get("Name", "")).strip()
+        if nm in wanted:
+            by_name.setdefault(nm, []).append(r)
+    out, not_here, skipped = [], [], []
+    for n in names:
+        cand = by_name.get(n, [])
+        if not cand:
+            not_here.append(n)
+            continue
+        cand = [r for r in cand if re.fullmatch(r"\d{4}", str(r.get("Code", "")).strip())] or cand
+        if len(cand) != 1:
+            skipped.append(f"{n}（同名 {len(cand)} 筆）")
+            continue
+        r = cand[0]
+        iso = roc_to_iso(r.get("Date"))
+        ok, why = validate_close_date(iso)
+        close = parse_number(r.get("ClosingPrice"))
+        if not ok or close is None or not (0 < close < config.PRICE_LIMIT):
+            skipped.append(f"{n}（{why or '收盤價無效 ' + repr(r.get('ClosingPrice'))}）")
+            continue
+        out.append(_price_row("TW", str(r["Code"]).strip(), n, iso, close, None, "TWSE 上市個股日收盤價"))
+    dates = sorted({o["as_of"] for o in out})
+    log("twse:prices", "success" if (out or not skipped) else "failure", as_of=dates[-1] if dates else None,
+        detail=_clip(f"上市對上 {len(out)} 檔；對不上 {len(not_here)} 檔 {not_here}；略過 {skipped}"))
+    return out
+
+
+def _describe_json(obj):
+    """把任意 JSON 的結構描述成一小段文字（只用於探測）。"""
+    if isinstance(obj, dict):
+        parts = []
+        for k, v in list(obj.items())[:14]:
+            if isinstance(v, list):
+                parts.append(f"{k}=[{len(v)}列, 首列 {str(v[0])[:120] if v else '空'}]")
+            elif isinstance(v, dict):
+                parts.append(f"{k}={{{', '.join(list(v.keys())[:8])}}}")
+            else:
+                parts.append(f"{k}={str(v)[:40]}")
+        return "；".join(parts)
+    if isinstance(obj, list):
+        return f"清單 {len(obj)} 列，首列 {str(obj[0])[:200] if obj else '空'}"
+    return type(obj).__name__
+
+
+def probe_history():
+    """只讀探測（下一階段用）：
+    1) Nasdaq 個股報價的 keyStats 有沒有 52 週高低；
+    2) 證交所、櫃買中心『指定日期』的全部個股收盤行情（約一年前），能不能用來回補歷史。"""
+    hold, herr = load_holdings()
+    if hold is None:
+        log("probe:hist_holdings", "failure", detail=_clip(herr))
+        hold = []
+    for h in [x for x in hold if x["market"] == "US"]:
+        sym = (h.get("symbol") or h.get("pos_key") or "").upper().strip()
+        first = "etf" if h.get("kind") in ("etf", "leveraged_etf") else "stocks"
+        for ac in (first, "stocks" if first == "etf" else "etf"):
+            status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+            if status is None:
+                log(f"probe:hist_nasdaq:{sym}", "failure", detail=_clip(f"連線失敗: {err}"))
+                break
+            try:
+                d = (json.loads(body.decode("utf-8-sig").lstrip("\ufeff")) or {}).get("data")
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                log(f"probe:hist_nasdaq:{sym}", "failure", detail="不是 JSON")
+                break
+            if isinstance(d, dict) and d.get("keyStats") is not None:
+                log(f"probe:hist_nasdaq:{sym}", "success", detail=_clip(f"keyStats={d.get('keyStats')}"))
+                break
+        else:
+            log(f"probe:hist_nasdaq:{sym}", "failure", detail="查不到 keyStats")
+        time.sleep(1)
+
+    day = date.today() - timedelta(days=365)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    ymd, slash, roc = day.strftime("%Y%m%d"), day.strftime("%Y/%m/%d").replace("/", "%2F"), f"{day.year - 1911}/{day.month:02d}/{day.day:02d}"
+
+    data, err = fetch_json(config.TWSE_HIST_URL.format(ymd=ymd))
+    if data is None or not isinstance(data, dict):
+        status, ctype, body, err2 = fetch_raw(config.TWSE_HIST_URL.format(ymd=ymd))
+        log("probe:hist_twse", "failure", detail=_clip(f"{ymd} 抓取失敗: {err}｜原始回應 HTTP {status}｜{ctype}｜{len(body)} 位元組｜開頭 {body[:160].decode('utf-8', errors='replace')!r}"))
+    else:
+        tables = data.get("tables") or []
+        outline = [f"{t.get('title')}｜欄位{t.get('fields')}｜{len(t.get('data') or [])}列" for t in tables if t.get("data")]
+        log("probe:hist_twse", "success" if data.get("stat") == "OK" else "no_new_data",
+            detail=_clip(f"查詢日 {ymd}｜stat={data.get('stat')}｜回傳日期 {data.get('date')}｜" + (" ;; ".join(outline) if outline else f"沒有 tables；頂層鍵 {list(data.keys())}")))
+        big = max((t for t in tables if t.get("data")), key=lambda t: len(t["data"]), default=None)
+        if big:
+            log("probe:hist_twse_rows", "success", detail=_clip(f"最大表格 {big.get('title')}｜前 2 列 {big['data'][:2]}"))
+    time.sleep(2)
+
+    for tag, tmpl in config.TPEX_HIST_URLS.items():
+        url = tmpl.format(ymd=ymd, slash=slash, roc=roc)
+        status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT)
+        src = f"probe:hist_tpex:{tag}"
+        if status is None:
+            log(src, "failure", detail=_clip(f"連線失敗: {err}"))
+            continue
+        try:
+            j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        except (ValueError, UnicodeDecodeError):
+            log(src, "failure", detail=_clip(f"HTTP {status}｜{ctype}｜不是 JSON，開頭 {body[:140].decode('utf-8', errors='replace')!r}"))
+            continue
+        log(src, "success" if status == 200 else "failure", detail=_clip(f"查詢日 {ymd}｜HTTP {status}｜{_describe_json(j)}"))
+        time.sleep(2)
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -1298,13 +1421,15 @@ def run_job(job, dry_run=False):
         if hold is None:
             log("prices:holdings", "skipped", detail=_clip(f"{herr}；不抓持股現價"))
         else:
-            price_rows = (tpex_prices(hold) or []) + (nasdaq_prices(hold) or [])
+            tp = tpex_prices(hold) or []
+            tw = twse_prices(hold, {r["name"] for r in tp}) or []
+            price_rows = tp + tw + (nasdaq_prices(hold) or [])
     if job == "tw_probe":
         probe_twse()
         probe_extra()
         probe_taifex_daily()
     if job == "us_probe":
-        probe_prices()
+        probe_history()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 

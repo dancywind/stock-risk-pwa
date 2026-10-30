@@ -96,6 +96,15 @@ NASDAQ_QUOTE_URL = "https://api.nasdaq.com/api/quote/{symbol}/info?assetclass={a
 TPEX_QUOTES_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 TWSE_OPENAPI_SWAGGER = "https://openapi.twse.com.tw/v1/swagger.json"
 TWSE_OPENAPI_BASE = "https://openapi.twse.com.tw/v1"
+# 已用真實回傳驗證：證交所 OpenAPI「上市個股日收盤價及月平均價」，欄位 Date(民國年七碼)/Code/Name/ClosingPrice
+TWSE_AVG_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
+# 歷史資料探測（只讀）：證交所／櫃買中心指定日期的全部個股收盤行情，用來之後算 52 週高低與廣度指標
+TWSE_HIST_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={ymd}&type=ALLBUT0999&response=json"
+TPEX_HIST_URLS = {
+    "web_roc": "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&o=json&d={roc}",
+    "www_dailyQuotes": "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes?date={slash}&id=&response=json",
+    "www_otc": "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={slash}&type=EW&response=json",
+}
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe")
