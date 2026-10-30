@@ -1744,6 +1744,50 @@ def cboe_putcall():
     return None
 
 
+def probe_earnings():
+    """只讀探測：持股財報日的來源。美股用 Nasdaq 個股「下次財報日」；台股看證交所與櫃買中心開放資料有哪些法說會、財報相關端點。
+    只記錄結構與前幾列，不寫任何資料表。"""
+    hold, herr = load_holdings()
+    if hold is None:
+        log("probe:earn_holdings", "failure", detail=_clip(herr))
+        hold = []
+    for h in [x for x in hold if x["market"] == "US" and x.get("kind") == "stock"]:       # ETF 沒有財報
+        sym = (h.get("symbol") or h.get("pos_key") or "").upper().strip()
+        status, ctype, body, err = fetch_raw(config.NASDAQ_EARNINGS_URL.format(symbol=sym), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+        src = f"probe:earn_us:{sym}"
+        if status is None:
+            log(src, "failure", detail=_clip(f"連線失敗: {err}"))
+            continue
+        try:
+            j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        except (ValueError, UnicodeDecodeError):
+            log(src, "failure", detail=_clip(f"HTTP {status}｜不是 JSON：{body[:120].decode('utf-8', errors='replace')!r}"))
+            continue
+        data = j.get("data") if isinstance(j, dict) else None
+        log(src, "success" if data else "failure", detail=_clip(f"HTTP {status}｜data={data}｜status={(j or {}).get('status') if isinstance(j, dict) else None}"))
+        time.sleep(1)
+    for tag, sw_url, base in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE)):
+        sw, err = fetch_json(sw_url)
+        if sw is None or not isinstance(sw, dict):
+            log(f"probe:earn_tw:{tag}", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
+            continue
+        cands = []
+        for path, methods in (sw.get("paths") or {}).items():
+            for m in (methods or {}).values():
+                text = str(m.get("summary", "")) if isinstance(m, dict) else ""
+                if any(k in text for k in config.EARNINGS_KEYWORDS):
+                    cands.append((path, text))
+        log(f"probe:earn_tw:{tag}", "success" if cands else "no_new_data",
+            detail=_clip("含法說會／財報／營收字樣的端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands[:14]) if cands else "無")))
+        pick = next((c for c in cands if "說明會" in c[1] or "法說" in c[1]), None)
+        if pick:
+            rows, err = fetch_json(_openapi_base(sw, base) + pick[0])
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                log(f"probe:earn_tw_rows:{tag}", "success", detail=_clip(f"{pick[0]}｜共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
+            else:
+                log(f"probe:earn_tw_rows:{tag}", "failure", detail=_clip(f"{pick[0]} 抓取失敗或格式非預期: {err or str(rows)[:120]}"))
+
+
 def probe_us_pressure():
     """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
     1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
@@ -1972,7 +2016,7 @@ def run_job(job, dry_run=False):
         probe_extra()
         probe_taifex_daily()
     if job == "us_probe":
-        probe_us_pressure()
+        probe_earnings()
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
