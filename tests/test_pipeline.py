@@ -743,7 +743,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_history") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_hist2") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -1275,6 +1275,251 @@ def test_probe_history_picks_weekday_a_year_back_and_handles_failures():
     d = date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8]))
     assert d.weekday() < 5 and 360 <= (TODAY - d).days <= 368
     assert {x["source"]: x["status"] for x in fetch.LOG}["probe:hist_twse"] == "failure"
+
+
+# ---------------------------------------------------------------- 台股歷史回補與 52 週
+TWSE_FIELDS = ["證券代號", "證券名稱", "成交股數", "成交筆數", "成交金額", "開盤價", "最高價", "最低價", "收盤價", "漲跌(+/-)", "漲跌價差"]
+
+
+def twse_hist_payload(d, rows, stat="OK", date_str=None):
+    return {"stat": stat, "date": date_str or d.strftime("%Y%m%d"),
+            "tables": [{"title": "價格指數", "fields": ["指數"], "data": [["x"]]},
+                       {"title": f"{d.year - 1911}年{d.month}月{d.day}日 每日收盤行情(全部(不含權證、牛熊證、可展延牛熊證))", "fields": TWSE_FIELDS, "data": rows}]}
+
+
+def trow(code, high, low, close):
+    return [code, "名", "1", "1", "1", "1", high, low, close, "", "0"]
+
+
+def test_hist_twse_day_parses_filters_and_validates():
+    d = TODAY - timedelta(days=30)
+    rows = [trow("2330", "1,520.00", "1,490.00", "1,500.00"), trow("0050", "64.8", "64.0", "64.4"), trow("2317", "--", "--", "--"),
+            trow("1101", "30", "31", "30.5")]                                     # 0050 非四碼、2317 無成交、1101 高低顛倒
+    with mock.patch.object(fetch, "fetch_json", return_value=(twse_hist_payload(d, rows), "")):
+        out, st = fetch.hist_twse_day(d)
+    assert st == "ok" and [r["code"] for r in out] == ["2330"]
+    r = out[0]
+    assert (r["close"], r["high"], r["low"], r["market"], r["as_of"]) == (1500.0, 1520.0, 1490.0, "TWSE", d.isoformat())
+
+
+def test_hist_twse_day_holiday_mismatch_and_errors():
+    d = TODAY - timedelta(days=30)
+    with mock.patch.object(fetch, "fetch_json", return_value=({"stat": "很抱歉，沒有符合條件的資料!"}, "")):
+        assert fetch.hist_twse_day(d) == ([], "holiday")
+    with mock.patch.object(fetch, "fetch_json", return_value=(twse_hist_payload(d, [], date_str="20200101"), "")):
+        assert fetch.hist_twse_day(d)[1].startswith("error:日期對不上")
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        assert fetch.hist_twse_day(d)[1].startswith("error:")
+    bad = twse_hist_payload(d, []); bad["tables"][1]["fields"] = ["a"]
+    with mock.patch.object(fetch, "fetch_json", return_value=(bad, "")):
+        assert fetch.hist_twse_day(d)[1].startswith("error:欄位不符")
+    nt = twse_hist_payload(d, []); nt["tables"] = nt["tables"][:1]
+    with mock.patch.object(fetch, "fetch_json", return_value=(nt, "")):
+        assert "找不到" in fetch.hist_twse_day(d)[1]
+
+
+def tpex_hist_payload(d, rows, stat="ok", fields=None, date_str=None):
+    return {"stat": stat, "date": d.strftime("%Y%m%d"),
+            "tables": [{"title": "上櫃股票每日收盤行情(不含定價)", "date": date_str or f"{d.year - 1911}/{d.month:02d}/{d.day:02d}",
+                        "fields": fields or ["代號", "名稱", "收盤", "漲跌", "開盤", "最高", "最低"], "data": rows}]}
+
+
+def test_hist_tpex_day_parses_by_field_names():
+    d = TODAY - timedelta(days=30)
+    rows = [["8358", "金居", "400.00", "-1.5", "401", "405", "398"], ["6488", "環球晶", "743.00", "3", "740", "750", "735"], ["00679B", "ETF", "30", "0", "30", "30", "30"]]
+    with mock.patch.object(fetch, "fetch_json", return_value=(tpex_hist_payload(d, rows), "")):
+        out, st = fetch.hist_tpex_day(d)
+    assert st == "ok" and {r["code"] for r in out} == {"8358", "6488"} and all(r["market"] == "TPEX" for r in out)
+    g = [r for r in out if r["code"] == "8358"][0]
+    assert (g["close"], g["high"], g["low"]) == (400.0, 405.0, 398.0)
+
+
+def test_hist_tpex_day_holiday_mismatch_and_field_errors():
+    d = TODAY - timedelta(days=30)
+    with mock.patch.object(fetch, "fetch_json", return_value=({"stat": "error"}, "")):
+        assert fetch.hist_tpex_day(d) == ([], "holiday")
+    with mock.patch.object(fetch, "fetch_json", return_value=(tpex_hist_payload(d, []), "")):
+        assert fetch.hist_tpex_day(d) == ([], "holiday")                     # 沒有資料列
+    with mock.patch.object(fetch, "fetch_json", return_value=(tpex_hist_payload(d, [["1", "a", "1", "1", "1", "1", "1"]], date_str="100/01/03"), "")):
+        assert "日期對不上" in fetch.hist_tpex_day(d)[1]
+    with mock.patch.object(fetch, "fetch_json", return_value=(tpex_hist_payload(d, [["1", "a"]], fields=["代號", "名稱"]), "")):
+        assert fetch.hist_tpex_day(d)[1].startswith("error:欄位不符")
+    with mock.patch.object(fetch, "fetch_json", return_value=(tpex_hist_payload(d, [["1", "a", "1", "1", "1", "1", "1"]], date_str="bad"), "")):
+        assert "格式不符" in fetch.hist_tpex_day(d)[1]
+
+
+def weekdays_back(n):
+    out, d = [], TODAY
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d -= timedelta(days=1)
+    return out
+
+
+def run_backfill(done_rows=(), twse=None, tpex=None, **kw):
+    calls, ups = [], []
+    def tw(d): calls.append(("TWSE", d)); return (twse or (lambda x: ([{"market": "TWSE", "code": "2330", "as_of": x.isoformat(), "close": 1, "high": 1, "low": 1}], "ok")))(d)
+    def tp(d): calls.append(("TPEX", d)); return (tpex or (lambda x: ([{"market": "TPEX", "code": "8358", "as_of": x.isoformat(), "close": 1, "high": 1, "low": 1}], "ok")))(d)
+    def up(table, rows, key):
+        ups.append((table, rows, key)); return True, "ok"
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(list(done_rows), "")), \
+            mock.patch.object(fetch, "hist_twse_day", side_effect=tw), mock.patch.object(fetch, "hist_tpex_day", side_effect=tp), \
+            mock.patch.object(fetch, "sb_upsert", side_effect=up), mock.patch.object(fetch.time, "sleep") as sl:
+        res = fetch.tw_backfill(**kw)
+    return res, calls, ups, sl
+
+
+def test_backfill_newest_first_limited_and_records_progress():
+    reset()
+    res, calls, ups, sl = run_backfill(max_days=2)
+    wd = weekdays_back(2)
+    assert [c[1] for c in calls] == [wd[0], wd[0], wd[1], wd[1]] and {c[0] for c in calls} == {"TWSE", "TPEX"}
+    assert res["days"] == 2 and sl.call_count == 4
+    hist = [u for u in ups if u[0] == "tw_hist"]; days = [u for u in ups if u[0] == "tw_hist_days"]
+    assert len(hist) == 4 and len(days) == 4 and hist[0][2] == "market,code,as_of" and days[0][2] == "market,as_of"
+    assert days[0][1][0]["status"] == "ok" and days[0][1][0]["rows_count"] == 1
+
+
+def test_backfill_skips_done_dates_per_market():
+    reset()
+    wd = weekdays_back(2)
+    done = [{"market": "TWSE", "as_of": wd[0].isoformat()}, {"market": "TPEX", "as_of": wd[0].isoformat()}, {"market": "TWSE", "as_of": wd[1].isoformat()}]
+    res, calls, ups, _ = run_backfill(done_rows=done, max_days=2)
+    assert [(c[0], c[1]) for c in calls] == [("TPEX", wd[1]), ("TWSE", weekdays_back(3)[2]), ("TPEX", weekdays_back(3)[2])]
+
+
+def test_backfill_holiday_recorded_only_when_old_enough():
+    reset()
+    holiday = lambda x: ([], "holiday")
+    res, calls, ups, _ = run_backfill(twse=holiday, tpex=holiday, max_days=1)
+    days = [u for u in ups if u[0] == "tw_hist_days"]
+    d0 = weekdays_back(1)[0]
+    if (TODAY - d0).days <= 2:
+        assert days == [] and any(x["status"] == "no_new_data" for x in fetch.LOG)       # 太新：不標休市
+    old = TODAY - timedelta(days=20)
+    while old.weekday() >= 5:
+        old -= timedelta(days=1)
+    reset()
+    res, calls, ups, _ = run_backfill(twse=holiday, tpex=holiday, max_days=40, window_days=21)
+    olds = [u[1][0] for u in ups if u[0] == "tw_hist_days" and date.fromisoformat(u[1][0]["as_of"]) <= TODAY - timedelta(days=3)]
+    assert olds and all(o["status"] == "holiday" and o["rows_count"] == 0 for o in olds)
+    assert not any(u[0] == "tw_hist" for u in ups)                                        # 休市沒有行情列可寫
+
+
+def test_backfill_stops_on_error_and_never_hammers():
+    reset()
+    boom = lambda x: (None, "error:抓取失敗 HTTP 403")
+    res, calls, ups, _ = run_backfill(twse=boom, max_days=5)
+    assert len(calls) == 1 and res.get("stopped") and ups == []
+    assert fetch.LOG[-1]["status"] == "failure" and "已停止本次回補" in fetch.LOG[-1]["detail"]
+
+
+def test_backfill_dry_run_and_no_supabase_and_progress_read_failure():
+    reset()
+    res, calls, ups, _ = run_backfill(dry_run=True, max_days=40)
+    assert ups == [] and res["days"] == 1 and len(calls) == 2                             # dry-run 只試一天、不寫入
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        fetch.tw_backfill()
+    assert fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 404")):
+        assert fetch.tw_backfill() is None
+    assert "建立 tw_hist" in fetch.LOG[-1]["detail"]
+
+
+def test_backfill_write_failure_stops_without_marking_done():
+    reset()
+    ups = []
+    def up(table, rows, key):
+        ups.append(table); return (False, "boom") if table == "tw_hist" else (True, "ok")
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], "")), \
+            mock.patch.object(fetch, "hist_twse_day", return_value=([{"market": "TWSE", "code": "2330", "as_of": "x", "close": 1, "high": 1, "low": 1}], "ok")), \
+            mock.patch.object(fetch, "hist_tpex_day", return_value=([], "ok")), mock.patch.object(fetch, "sb_upsert", side_effect=up), mock.patch.object(fetch.time, "sleep"):
+        assert fetch.tw_backfill(max_days=3) is None
+    assert ups == ["tw_hist"]                                                                # 行情沒寫成功就不記進度
+
+
+def test_run_job_daily_append_only_when_not_dry_run():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, twd_fallback_chain=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist")]
+    for p_ in patches: p_.start()
+    try:
+        with mock.patch.object(fetch, "tw_backfill") as bf:
+            fetch.run_job("tw_close", dry_run=True); bf.assert_not_called()
+            fetch.run_job("tw_close", dry_run=False); bf.assert_called_once_with(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7)
+        with mock.patch.object(fetch, "tw_backfill") as bf:
+            fetch.run_job("tw_backfill", dry_run=False); bf.assert_called_once_with(dry_run=False)
+    finally:
+        for p_ in patches: p_.stop()
+
+
+def test_parse_range52_and_nasdaq_keystats():
+    assert fetch.parse_range52("114.50 - 281.62") == (114.5, 281.62) and fetch.parse_range52("$1,114.50 - $2,281.62") == (1114.5, 2281.62)
+    assert fetch.parse_range52("NA") == (None, None) and fetch.parse_range52("300 - 200") == (None, None) and fetch.parse_range52(None) == (None, None)
+    reset()
+    ts = (TODAY - timedelta(days=1)).strftime("%b %d, %Y").replace(" 0", " ")
+    def body(close, stats):
+        d = {"data": {"marketStatus": "Closed", "primaryData": {"lastSalePrice": f"${close}", "netChange": "-1", "lastTradeTimestamp": ts, "isRealTime": False}, "keyStats": stats}}
+        return json.dumps(d).encode()
+    stats = {"fiftyTwoWeekHighLow": {"label": "52 Week Range:", "value": "114.50 - 281.62"}}
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body(139.56, stats), "")), mock.patch.object(fetch.time, "sleep"):
+        r = fetch.nasdaq_prices(US_HOLD)[0]
+    assert r["high_52w"] == 281.62 and r["low_52w"] == 114.5 and "keyStats" in r["range_source"]
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body(500.0, stats), "")), mock.patch.object(fetch.time, "sleep"):
+        r = fetch.nasdaq_prices(US_HOLD)[0]
+    assert r["high_52w"] is None and "不採用" in fetch.LOG[-1]["detail"]                      # 收盤價跑出區間 → 區間不用
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body(26.98, None), "")), mock.patch.object(fetch.time, "sleep"):
+        r = fetch.nasdaq_prices(US_HOLD)[0]
+    assert r["high_52w"] is None and r["range_source"] is None and set(r) >= {"high_52w", "low_52w", "range_source"}      # ETF 沒有 → 空白但欄位齊全
+
+
+def hist_rows_for(code, n, span_days, hi=120.0, lo=80.0):
+    start = TODAY - timedelta(days=span_days)
+    step = span_days / max(n - 1, 1)
+    out = []
+    for i in range(n):
+        d = start + timedelta(days=int(i * step))
+        out.append({"as_of": d.isoformat(), "high": hi if i == 5 else 100.0, "low": lo if i == 7 else 95.0})
+    return out
+
+
+def test_tw_ranges_needs_enough_coverage():
+    reset()
+    pr = [{"market": "TW", "code": "2330", "close": 100.0, "high_52w": None, "low_52w": None, "range_source": None}]
+    with mock.patch.object(fetch, "sb_request", return_value=(hist_rows_for("2330", 240, 360), "")):
+        out = fetch.tw_ranges([dict(pr[0])])
+    assert out[0]["high_52w"] == 120.0 and out[0]["low_52w"] == 80.0 and "240 個交易日" in out[0]["range_source"]
+    reset()
+    with mock.patch.object(fetch, "sb_request", return_value=(hist_rows_for("2330", 60, 90), "")):
+        out = fetch.tw_ranges([dict(pr[0])])
+    assert out[0]["high_52w"] is None and "不足以算 52 週" in fetch.LOG[-1]["detail"]          # 歷史不夠就不算
+    reset()
+    with mock.patch.object(fetch, "sb_request", return_value=(hist_rows_for("2330", 240, 360), "")):
+        out = fetch.tw_ranges([dict(pr[0], close=999.0)])
+    assert out[0]["high_52w"] is None and fetch.LOG[-1]["status"] == "failure"                # 收盤價不在區間 → 不採用
+    with mock.patch.object(fetch, "sb_request", return_value=([], "")):
+        assert fetch.tw_ranges([dict(pr[0])])[0]["high_52w"] is None
+    us = [{"market": "US", "code": "ORCL", "close": 1.0, "high_52w": 2.0}]
+    with mock.patch.object(fetch, "sb_request") as req:
+        assert fetch.tw_ranges(us) == us; req.assert_not_called()                             # 美股不查台股歷史
+
+
+def test_probe_hist2_logs_etf_history_and_tpex_fields():
+    reset()
+    hold = [{"market": "US", "symbol": "MUU", "name": "x", "kind": "leveraged_etf", "pos_key": "MUU"}]
+    nas = json.dumps({"data": {"tradesTable": {"rows": [{"date": "10/29/2026", "close": "$26.98", "high": "$28", "low": "$26"}, {"date": "10/30/2025", "close": "$9", "high": "$9", "low": "$8"}]}}}).encode()
+    tp = json.dumps(tpex_hist_payload(TODAY - timedelta(days=7), [["8358", "金居", "400", "-1", "401", "405", "398"]])).encode()
+    def raw(url, timeout=None, headers=None):
+        return (200, "application/json", nas if "api.nasdaq.com" in url else tp, "")
+    with mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_hist2()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert by["probe:hist2_nasdaq:MUU"]["status"] == "success" and "2 列" in by["probe:hist2_nasdaq:MUU"]["detail"]
+    assert "收盤" in by["probe:hist2_tpex_fields"]["detail"] and "最高" in by["probe:hist2_tpex_fields"]["detail"]
+    up.assert_not_called()
 
 
 def test_twd_layer_order_fixed():
