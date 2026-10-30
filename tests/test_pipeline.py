@@ -132,6 +132,8 @@ def test_dry_run_does_not_write_supabase():
             mock.patch.object(fetch, "fred_latest", return_value=None), \
             mock.patch.object(fetch, "twse_market", return_value=None), \
             mock.patch.object(fetch, "twse_breadth", return_value=None), \
+            mock.patch.object(fetch, "twse_institutional", return_value=None), \
+            mock.patch.object(fetch, "twse_margin", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("full", dry_run=True)
     req.assert_not_called()
@@ -327,10 +329,14 @@ def test_tw_close_runs_breadth_and_market():
     reset()
     with mock.patch.object(fetch, "twse_market", return_value=None) as m, \
             mock.patch.object(fetch, "twse_breadth", return_value=None) as b, \
+            mock.patch.object(fetch, "twse_institutional", return_value=None) as i, \
+            mock.patch.object(fetch, "twse_margin", return_value=None) as g, \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("tw_close", dry_run=True)
     m.assert_called_once()
     b.assert_called_once()
+    i.assert_called_once()
+    g.assert_called_once()
 
 
 # ---------------------------------------------------------------- 探測
@@ -399,6 +405,176 @@ def test_probe_extra_failures_logged():
     with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
         fetch.probe_extra()
     assert [x["status"] for x in fetch.LOG].count("failure") == 3
+
+
+# ---------------------------------------------------------------- 外資買賣超、融資（真實格式）
+def ymd(days_ago=1):
+    return (TODAY - timedelta(days=days_ago)).strftime("%Y%m%d")
+
+
+BFI_FIELDS = ["單位名稱", "買進金額", "賣出金額", "買賣差額"]
+BFI_ROWS = [
+    ["自營商(自行買賣)", "8,707,783,064", "8,891,915,950", "-184,132,886"],
+    ["自營商(避險)", "23,003,271,986", "44,319,158,013", "-21,315,886,027"],
+    ["投信", "20,194,219,519", "13,149,917,223", "7,044,302,296"],
+    ["外資及陸資(不含外資自營商)", "285,346,964,081", "354,162,240,591", "-68,815,276,510"],
+    ["外資自營商", "0", "0", "0"],
+    ["合計", "337,252,238,650", "420,523,231,777", "-83,270,993,127"],
+]
+
+
+def bfi_payload(rows=None, fields=None, date_str=None, stat="OK"):
+    return {"stat": stat, "date": date_str or ymd(), "fields": fields or BFI_FIELDS, "data": rows or BFI_ROWS}
+
+
+def test_institutional_real_format():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(), "")):
+        rows = fetch.twse_institutional()
+    r = rows[0]
+    assert r["foreign_net"] == -68815276510.0       # 外資及陸資 + 外資自營商(0)
+    assert r["foreign_buy"] == 285346964081.0 and r["foreign_sell"] == 354162240591.0
+    assert r["trust_net"] == 7044302296.0
+    assert r["dealer_net"] == -184132886.0 + -21315886027.0   # 兩種自營商相加，不含外資自營商
+    assert r["total_net"] == -83270993127.0
+    assert r["as_of"] == (TODAY - timedelta(days=1)).isoformat()
+
+
+def test_institutional_adds_foreign_dealer():
+    reset()
+    rows = [list(x) for x in BFI_ROWS]
+    rows[4] = ["外資自營商", "300", "100", "200"]
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(rows), "")):
+        r = fetch.twse_institutional()[0]
+    assert r["foreign_net"] == -68815276510.0 + 200
+
+
+def test_institutional_identity_mismatch_rejected():
+    reset()
+    rows = [list(x) for x in BFI_ROWS]
+    rows[3][3] = "-1"          # 買賣差額和 買進-賣出 對不上
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(rows), "")):
+        assert fetch.twse_institutional() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_institutional_missing_foreign_row_failure():
+    reset()
+    rows = [x for x in BFI_ROWS if not x[0].startswith("外資及陸資")]
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(rows), "")):
+        assert fetch.twse_institutional() is None
+
+
+def test_institutional_wrong_fields_failure():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(fields=["a", "b"]), "")):
+        assert fetch.twse_institutional() is None
+
+
+def test_institutional_absurd_amount_rejected():
+    reset()
+    rows = [list(x) for x in BFI_ROWS]
+    rows[3] = ["外資及陸資(不含外資自營商)", "9,000,000,000,000", "1,000", "8,999,999,999,000"]
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(rows), "")):
+        assert fetch.twse_institutional() is None
+
+
+def test_institutional_future_date_blocked_and_not_ok():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(date_str=ymd(-5)), "")):
+        assert fetch.twse_institutional() is None
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        assert fetch.twse_institutional() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+    with mock.patch.object(fetch, "fetch_json", return_value=(bfi_payload(stat="no"), "")):
+        assert fetch.twse_institutional() is None
+    assert fetch.LOG[-1]["status"] == "no_new_data"
+
+
+MARGIN_FIELDS = ["項目", "買進", "賣出", "現金(券)償還", "前日餘額", "今日餘額"]
+MARGIN_ROWS = [
+    ["融資(交易單位)", "321,858", "280,384", "3,623", "9,550,908", "9,588,759"],
+    ["融券(交易單位)", "21,600", "21,127", "3,565", "193,040", "189,002"],
+    ["融資金額(仟元)", "25,149,066", "22,968,994", "568,776", "632,299,552", "633,910,848"],
+]
+
+
+def margin_payload(rows=None, fields=None, date_str=None):
+    return {"stat": "OK", "date": date_str or ymd(),
+            "tables": [{"title": "信用交易統計", "fields": fields or MARGIN_FIELDS, "data": rows or MARGIN_ROWS},
+                       {"title": None, "fields": None, "data": []}]}
+
+
+def test_margin_real_format_converts_thousand_to_yuan():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(margin_payload(), "")):
+        r = fetch.twse_margin()[0]
+    assert r["margin_balance"] == 633910848 * 1000      # 仟元 -> 元
+    assert r["margin_prev_balance"] == 632299552 * 1000
+    assert r["margin_units"] == 9588759 and r["short_units"] == 189002
+    assert r["source"] == "TWSE MI_MARGN"
+
+
+def test_margin_identity_mismatch_rejected():
+    reset()
+    rows = [list(x) for x in MARGIN_ROWS]
+    rows[2][5] = "700,000,000"
+    with mock.patch.object(fetch, "fetch_json", return_value=(margin_payload(rows), "")):
+        assert fetch.twse_margin() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_margin_missing_row_or_table_failure():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(margin_payload(MARGIN_ROWS[:2]), "")):
+        assert fetch.twse_margin() is None
+    with mock.patch.object(fetch, "fetch_json", return_value=(margin_payload(fields=["x", "y"]), "")):
+        assert fetch.twse_margin() is None
+
+
+def test_margin_out_of_range_rejected():
+    reset()
+    rows = [["融資金額(仟元)", "1", "1", "0", "5", "5"]]
+    with mock.patch.object(fetch, "fetch_json", return_value=(margin_payload(rows), "")):
+        assert fetch.twse_margin() is None
+
+
+def test_persist_writes_institutional_and_margin_tables():
+    reset()
+    inst = [{"as_of": D(1), "foreign_net": 1.0, "source": "TWSE BFI82U"}]
+    marg = [{"as_of": D(1), "margin_balance": 1.0, "source": "TWSE MI_MARGN"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), \
+            mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
+        fetch.persist(False, [], None, None, None, inst, marg)
+    tables = [c[0][0] for c in up.call_args_list]
+    assert tables == ["tw_institutional", "tw_margin"]
+    assert all(c[0][2] == "as_of,source" for c in up.call_args_list)
+
+
+def test_taifex_futures_probe_logs_structure_only():
+    reset()
+    swagger = {"servers": [{"url": "https://openapi.taifex.com.tw/v1"}],
+               "paths": {"/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate":
+                         {"get": {"summary": "期貨市場三大法人-區分各期貨契約-依日期"}}}}
+    rows = [{"Date": "20261029", "Item": "臺股期貨", "ItemOfTheInstitutionalTraders": "外資及陸資"},
+            {"Date": "20261029", "Item": "小型臺指期貨", "ItemOfTheInstitutionalTraders": "投信"}]
+    calls = []
+    def fake(url, **k):
+        calls.append(url)
+        if "swagger" in url:
+            return swagger, ""
+        if "BFI82U" in url or "MI_MARGN" in url:
+            return None, "skip"
+        return rows, ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fake), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_extra()
+    assert any("MarketDataOfMajor" in c for c in calls)
+    assert any(x["source"] == "probe:taifex_futures_keys" and "臺股期貨" in x["detail"] for x in fetch.LOG)
+    up.assert_not_called()
+
+
+def test_taifex_swagger_url_has_no_v1_prefix():
+    assert config.TAIFEX_SWAGGER == "https://openapi.taifex.com.tw/swagger.json"
 
 
 def test_twd_layer_order_fixed():
