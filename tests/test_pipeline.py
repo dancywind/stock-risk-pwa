@@ -1348,6 +1348,15 @@ def test_hist_tpex_day_holiday_mismatch_and_field_errors():
         assert "格式不符" in fetch.hist_tpex_day(d)[1]
 
 
+def test_hist_tpex_day_tolerates_spaces_in_field_names():
+    d = TODAY - timedelta(days=30)
+    fields = ["代號", "名稱", "收盤 ", "漲跌", "開盤 ", "最高 ", "最低", "成交股數  ", " 成交金額(元)", " 成交筆數 "]      # 真實回傳的樣子
+    rows = [["8358", "金居", "400.00", "-1.5", "401.00", "405.00", "398.00", "1", "1", "1"]]
+    with mock.patch.object(fetch, "fetch_json", return_value=(tpex_hist_payload(d, rows, fields=fields), "")):
+        out, st = fetch.hist_tpex_day(d)
+    assert st == "ok" and out[0]["close"] == 400.0 and out[0]["high"] == 405.0 and out[0]["low"] == 398.0
+
+
 def weekdays_back(n):
     out, d = [], TODAY
     while len(out) < n:
