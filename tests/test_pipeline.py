@@ -746,7 +746,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_us_pressure") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -2037,6 +2037,40 @@ def test_main_logs_version_first_and_returns_failure_exit_code(tmp_path=None):
             mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()):
         assert fetch.main(["--job", "full"]) == 1                                  # 有失敗 → 結束碼 1（Actions 亮紅燈）
     assert fetch.LOG[0]["source"] == "pipeline:version" and "正式寫入" in fetch.LOG[0]["detail"]
+
+
+# ---------------------------------------------------------------- 財報日來源探測
+def test_probe_earnings_logs_us_dates_and_tw_endpoints_without_writing():
+    reset()
+    hold = [{"market": "US", "symbol": "ORCL", "name": "甲骨文", "kind": "stock", "pos_key": "ORCL"},
+            {"market": "US", "symbol": "MUU", "name": "x", "kind": "leveraged_etf", "pos_key": "MUU"}]
+    nas = json.dumps({"data": {"announcement": "Earnings announcement* for ORCL: Dec 9, 2026", "reportText": "x"}, "status": {"rCode": 200}}).encode()
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap": {"get": {"summary": "上市公司法人說明會"}}, "/x": {"get": {"summary": "其他"}}}}
+    urls = []
+    def fj(url, **k):
+        urls.append(url)
+        if url.endswith("swagger.json"): return sw, ""
+        return [{"公司代號": "2330", "召開法人說明會日期": "1151015"}], ""
+    with mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas, "")) as raw, \
+            mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_earnings()
+    assert raw.call_count == 1 and "ORCL" in raw.call_args[0][0] and "earnings-date" in raw.call_args[0][0]       # ETF 不查財報日
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "Dec 9, 2026" in by["probe:earn_us:ORCL"]["detail"]
+    assert "法人說明會" in by["probe:earn_tw:twse"]["detail"] and "/x" not in by["probe:earn_tw:twse"]["detail"]
+    assert "召開法人說明會日期" in by["probe:earn_tw_rows:twse"]["detail"]
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_earnings_failures_are_reported():
+    reset()
+    hold = [{"market": "US", "symbol": "ORCL", "name": "x", "kind": "stock", "pos_key": "ORCL"}]
+    with mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timed out")), \
+            mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_earnings()
+    sts = {x["source"]: x["status"] for x in fetch.LOG}
+    assert sts["probe:earn_us:ORCL"] == "failure" and sts["probe:earn_tw:twse"] == "failure" and sts["probe:earn_tw:tpex"] == "failure"
 
 
 def test_twd_layer_order_fixed():
