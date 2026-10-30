@@ -741,7 +741,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_nasdaq_screener") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_prices") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -953,6 +953,88 @@ def test_csv_fallback_identity_mismatch_rejected():
 def test_norm_ymd():
     assert fetch._norm_ymd("2026/10/29") == "20261029" and fetch._norm_ymd("2026-10-29") == "20261029"
     assert fetch._norm_ymd("20261029") == "20261029" and fetch._norm_ymd("abc") is None and fetch._norm_ymd(None) is None
+
+
+# ---------------------------------------------------------------- 持股現價探測
+def sb_fake(accts, pos):
+    def f(method, path, body=None, prefer=None):
+        return ((accts if "private_accounts" in path else pos), "")
+    return f
+
+
+def test_load_holdings_maps_currency_to_market_and_dedupes():
+    accts = [{"user_id": "u", "account_key": "台", "currency": "TWD"}, {"user_id": "u", "account_key": "美", "currency": "usd"},
+             {"user_id": "u", "account_key": "其他", "currency": "JPY"}]
+    pos = [{"user_id": "u", "account_key": "台", "pos_key": "台積電", "symbol": None, "name": "台積電", "kind": "stock"},
+           {"user_id": "u", "account_key": "美", "pos_key": "MUU", "symbol": "MUU", "name": "2倍做多MU ETF", "kind": "leveraged_etf"},
+           {"user_id": "u", "account_key": "其他", "pos_key": "X", "symbol": "X", "name": "X", "kind": "stock"},
+           {"user_id": "u", "account_key": "台", "pos_key": "台積電", "symbol": None, "name": "台積電", "kind": "stock"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=sb_fake(accts, pos)):
+        hold, err = fetch.load_holdings()
+    assert err == "" and [(h["market"], h["name"]) for h in hold] == [("TW", "台積電"), ("US", "2倍做多MU ETF")]
+    assert all(set(h) == {"market", "symbol", "name", "kind", "pos_key"} for h in hold)      # 不帶股數與金額
+
+
+def test_load_holdings_without_supabase_or_on_error():
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert fetch.load_holdings()[0] is None
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 401")):
+        hold, err = fetch.load_holdings()
+    assert hold is None and "401" in err
+
+
+def test_probe_prices_reports_all_sources_and_matches_names_exactly():
+    reset()
+    hold = [{"market": "TW", "symbol": None, "name": "台積電", "kind": "stock", "pos_key": "台積電"},
+            {"market": "TW", "symbol": None, "name": "金居", "kind": "stock", "pos_key": "金居"},
+            {"market": "TW", "symbol": None, "name": "不存在股", "kind": "stock", "pos_key": "不存在股"},
+            {"market": "US", "symbol": "MUU", "name": "2倍做多MU ETF", "kind": "leveraged_etf", "pos_key": "MUU"}]
+    twse = {"stat": "OK", "date": "20261029", "fields": ["證券代號", "證券名稱", "收盤價"], "data": [["2330", "台積電", "2,370.00"], ["2317", "鴻海", "200"]]}
+    sw = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/tpex_mainboard_daily_close_quotes": {"get": {"summary": "上櫃股票收盤行情"}}}}
+    tpex = [{"Date": "1151029", "SecuritiesCompanyCode": "8358", "CompanyName": "金居", "Close": "400.00"}]
+    def fj(url, **k):
+        if "STOCK_DAY_ALL" in url: return twse, ""
+        if "swagger" in url: return sw, ""
+        return tpex, ""
+    nas = json.dumps({"data": {"symbol": "MUU", "marketStatus": "Closed", "primaryData": {"lastSalePrice": "$24.60", "netChange": "-1.00", "percentageChange": "-3.9%",
+                      "lastTradeTimestamp": "Oct 29, 2026 4:00 PM ET", "isRealTime": False}, "secondaryData": None}}).encode()
+    with mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "fetch_json", side_effect=fj), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas, "")), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_prices()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "日期20261029" in by["probe:px_twse"]["detail"]
+    assert "CompanyName" in by["probe:px_tpex"]["detail"]
+    m = by["probe:px_tw_match"]
+    assert m["status"] == "failure" and "上市對上 1 檔" in m["detail"] and "上櫃對上 1 檔" in m["detail"] and "不存在股" in m["detail"]
+    n = by["probe:px_nasdaq:MUU"]["detail"]
+    assert "lastTradeTimestamp" in n and "Oct 29, 2026 4:00 PM ET" in n and "isRealTime" in n
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_prices_failures_are_logged():
+    reset()
+    with mock.patch.object(fetch, "load_holdings", return_value=(None, "未設定 Supabase")), \
+            mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timed out")):
+        fetch.probe_prices()
+    sts = {x["source"]: x["status"] for x in fetch.LOG}
+    assert sts["probe:px_holdings"] == "failure" and sts["probe:px_twse"] == "failure" and sts["probe:px_tpex_swagger"] == "failure"
+
+
+def test_probe_prices_nasdaq_tries_other_assetclass_and_reports_non_json():
+    reset()
+    hold = [{"market": "US", "symbol": "ARM", "name": "Arm", "kind": "stock", "pos_key": "ARM"}]
+    ok = json.dumps({"data": {"marketStatus": "Closed", "primaryData": {"lastSalePrice": "$208.50", "lastTradeTimestamp": "Oct 29, 2026 4:00 PM ET", "isRealTime": False}}}).encode()
+    calls = []
+    def raw(url, timeout=None, headers=None):
+        calls.append(url)
+        return (200, "application/json", b'{"data": null, "status": {"rCode": 400}}' if "assetclass=stocks" in url else ok, "")
+    with mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "fetch_json", return_value=(None, "x")), \
+            mock.patch.object(fetch, "fetch_raw", side_effect=raw):
+        fetch.probe_prices()
+    assert len(calls) == 2 and "assetclass=etf" in calls[1]
+    assert [x for x in fetch.LOG if x["source"] == "probe:px_nasdaq:ARM"][0]["status"] == "success"
 
 
 def test_twd_layer_order_fixed():
