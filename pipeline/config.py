@@ -137,10 +137,11 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v25"
+PIPELINE_VERSION = "v26"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入")
+EARNINGS_MAX_AHEAD_DAYS = 200      # 財報日比今天晚超過這麼多天，視為解析錯誤
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill")

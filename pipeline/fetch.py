@@ -1744,6 +1744,62 @@ def cboe_putcall():
     return None
 
 
+def parse_earnings_text(text, today=None):
+    """從 Nasdaq 的 reportText 找下次財報日。文字裡必須剛好有「一個」日期（mm/dd/yyyy 或 Mon dd, yyyy），
+    而且在今天到今天加 200 天之間；否則不採用，不猜。回傳 (日期, 是否預估) 或 None。"""
+    today = today or date.today()
+    t = str(text or "")
+    found = set()
+    for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", t):
+        try:
+            found.add(date(int(m.group(3)), int(m.group(1)), int(m.group(2))))
+        except ValueError:
+            return None
+    for m in re.finditer(r"\b([A-Za-z]{3})[a-z]*\.? (\d{1,2}), (\d{4})\b", t):
+        mo = _US_MONTHS.get(m.group(1).title())
+        if mo:
+            try:
+                found.add(date(int(m.group(3)), mo, int(m.group(2))))
+            except ValueError:
+                return None
+    if len(found) != 1:
+        return None
+    d = next(iter(found))
+    if not (today <= d <= today + timedelta(days=config.EARNINGS_MAX_AHEAD_DAYS)):
+        return None
+    est = bool(re.search(r"estimat|tentative|projected|expected|unconfirmed|not (yet )?confirmed", t, re.I))
+    return d.isoformat(), est
+
+
+def nasdaq_earnings(hold):
+    """美股個股的下次財報日（Nasdaq）。ETF 沒有財報，不查。解析不出唯一日期就不寫入，並把原文記在紀錄裡。"""
+    out = []
+    for h in [x for x in hold if x["market"] == "US" and x.get("kind") == "stock"]:
+        sym = (h.get("symbol") or h.get("pos_key") or "").upper().strip()
+        if not sym:
+            continue
+        status, ctype, body, err = fetch_raw(config.NASDAQ_EARNINGS_URL.format(symbol=sym), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+        src = f"nasdaq:earnings:{sym}"
+        if status is None:
+            log(src, "failure", detail=_clip(f"連線失敗: {err}"))
+            continue
+        try:
+            j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        except (ValueError, UnicodeDecodeError):
+            log(src, "failure", detail=_clip(f"HTTP {status}｜不是 JSON"))
+            continue
+        data = j.get("data") if isinstance(j, dict) else None
+        text = (data or {}).get("reportText") if isinstance(data, dict) else None
+        res = parse_earnings_text(text)
+        if res is None:
+            log(src, "no_new_data", detail=_clip(f"沒有解析出唯一的未來財報日；Nasdaq 原文：{str(text)[:260]!r}"))
+            continue
+        out.append({"symbol": sym, "report_date": res[0], "is_estimate": res[1], "raw_text": str(text)[:300], "source": "Nasdaq earnings-date"})
+        log(src, "success", as_of=res[0], detail=f"下次財報日 {res[0]}（{'預估' if res[1] else '公司公布'}）")
+        time.sleep(1)
+    return out
+
+
 def probe_earnings():
     """只讀探測：持股財報日的來源。美股用 Nasdaq 個股「下次財報日」；台股看證交所與櫃買中心開放資料有哪些法說會、財報相關端點。
     只記錄結構與前幾列，不寫任何資料表。"""
@@ -1910,14 +1966,14 @@ def twd_fallback_chain():
 
 # ---------------------------------------------------------------- 寫入
 def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_rows=None, margin_rows=None,
-            futures_rows=None, basis_rows=None, price_rows=None, cot_rows=None, putcall_rows=None):
+            futures_rows=None, basis_rows=None, price_rows=None, cot_rows=None, putcall_rows=None, earnings_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
                                          f"台幣 {len([r for r in (twd_row if isinstance(twd_row, list) else [twd_row]) if r and not r.get('stale_fallback')])} 筆、"
                                          f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆、"
                                          f"外資 {len(inst_rows or [])} 筆、融資 {len(margin_rows or [])} 筆、"
                                          f"期貨部位 {len(futures_rows or [])} 筆、基差 {len(basis_rows or [])} 筆、持股現價 {len(price_rows or [])} 筆、"
-                                         f"COT {len(cot_rows or [])} 筆、Put/Call {len(putcall_rows or [])} 筆）")
+                                         f"COT {len(cot_rows or [])} 筆、Put/Call {len(putcall_rows or [])} 筆、財報日 {len(earnings_rows or [])} 筆）")
         return
     if not sb_ready():
         log("persist", "skipped", detail="未設定 SUPABASE_URL / SUPABASE_SERVICE_KEY，只寫本機檔，未寫正式資料庫")
@@ -1957,6 +2013,9 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_
     if putcall_rows:
         ok, msg = sb_upsert("us_putcall", putcall_rows, "as_of")
         log("persist:us_putcall", "success" if ok else "failure", detail=msg)
+    if earnings_rows:
+        ok, msg = sb_upsert("us_earnings", earnings_rows, "symbol,report_date")
+        log("persist:us_earnings", "success" if ok else "failure", detail=msg)
 
 
 def flush_log(dry_run):
@@ -1984,7 +2043,7 @@ def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
-    inst_rows = margin_rows = futures_rows = basis_rows = price_rows = cot_rows = putcall_rows = None
+    inst_rows = margin_rows = futures_rows = basis_rows = price_rows = cot_rows = putcall_rows = earnings_rows = None
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -2011,6 +2070,7 @@ def run_job(job, dry_run=False):
             tp = tpex_prices(hold) or []
             tw = twse_prices(hold, {r["name"] for r in tp}) or []
             price_rows = tw_ranges(tp + tw) + (nasdaq_prices(hold) or [])
+            earnings_rows = nasdaq_earnings(hold)
     if job == "tw_probe":
         probe_twse()
         probe_extra()
@@ -2028,10 +2088,10 @@ def run_job(job, dry_run=False):
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
-    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows, basis_rows, price_rows, cot_rows, putcall_rows)
+    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows, basis_rows, price_rows, cot_rows, putcall_rows, earnings_rows)
     return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows,
             "tw_breadth": breadth_rows, "tw_institutional": inst_rows, "tw_margin": margin_rows,
-            "tw_futures": futures_rows, "tw_basis": basis_rows, "prices": price_rows, "us_cot": cot_rows, "us_putcall": putcall_rows}
+            "tw_futures": futures_rows, "tw_basis": basis_rows, "prices": price_rows, "us_cot": cot_rows, "us_putcall": putcall_rows, "us_earnings": earnings_rows}
 
 
 def main(argv=None):
