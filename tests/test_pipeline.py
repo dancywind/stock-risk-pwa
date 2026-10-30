@@ -597,6 +597,28 @@ def test_fetch_json_accepts_utf8_bom():
     assert data == {"b": 1}
 
 
+def test_taifex_futures_failure_logs_raw_diagnostics():
+    reset()
+    swagger = {"servers": [{"url": "https://openapi.taifex.com.tw/v1"}],
+               "paths": {"/X": {"get": {"summary": "期貨市場三大法人-區分各期貨契約-依日期"}}}}
+    def fake(url, **k):
+        if "swagger" in url:
+            return swagger, ""
+        return None, "Expecting value: line 1 column 1 (char 0)"
+    with mock.patch.object(fetch, "fetch_json", side_effect=fake), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", "<html>blocked</html>".encode(), "")):
+        fetch.probe_extra()
+    raw = [x for x in fetch.LOG if x["source"] == "probe:taifex_futures_raw"]
+    assert raw and "text/html" in raw[0]["detail"] and "blocked" in raw[0]["detail"]
+    assert any(x["source"] == "probe:taifex_futures" and x["status"] == "failure" for x in fetch.LOG)
+
+
+def test_fetch_raw_never_raises():
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=OSError("boom")):
+        status, ctype, body, err = fetch.fetch_raw("https://example.test")
+    assert status is None and body == b"" and "boom" in err
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
