@@ -46,11 +46,17 @@ TWSE_SWAGGER = "https://openapi.twse.com.tw/v1/swagger.json"
 TWSE_MI_INDEX_MS = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?type=MS&response=json"
 
 # 第 4 步探測：外資買賣超、融資餘額（證交所）與期交所外資期貨部位。只讀，用來確認真實格式。
-PROBE_URLS = {
-    "BFI82U": "https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&response=json",
-    "MI_MARGN": "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectType=MS&response=json",
-}
-TAIFEX_SWAGGER = "https://openapi.taifex.com.tw/v1/swagger.json"
+# 已用真實回傳驗證過格式：三大法人買賣金額(BFI82U)、信用交易統計(MI_MARGN)
+TWSE_BFI82U = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&response=json"
+TWSE_MI_MARGN = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectType=MS&response=json"
+PROBE_URLS = {"BFI82U": TWSE_BFI82U, "MI_MARGN": TWSE_MI_MARGN}
+# 期交所開放資料說明文件（網址依 data.gov.tw 官方資料集頁面；先前的 /v1/swagger.json 回傳非 JSON）
+TAIFEX_SWAGGER = "https://openapi.taifex.com.tw/swagger.json"
+# 外資買賣超（新台幣元）合理上限；超過視為壞資料
+INST_NET_LIMIT = 2e12
+INST_SIDE_LIMIT = 5e12
+# 融資金額餘額（新台幣元）合理範圍
+MARGIN_BALANCE_RANGE = (1e10, 5e13)
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe")
 

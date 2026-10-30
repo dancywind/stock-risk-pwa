@@ -362,6 +362,130 @@ def twse_breadth():
              "unchanged": unch, "source": config.BREADTH_SOURCE}]
 
 
+def twse_ymd_to_iso(raw):
+    """'20261029' -> '2026-10-29'；格式不符回傳 None。"""
+    raw = str(raw or "")
+    try:
+        return date(int(raw[:4]), int(raw[4:6]), int(raw[6:8])).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def _twse_fetch_day(url, tag):
+    """抓證交所單日資料並驗證 stat 與資料日期。回傳 (資料, 日期) 或 None（已留紀錄）。"""
+    data, err = fetch_json(url)
+    if data is None:
+        log(tag, "failure", detail=f"抓取失敗: {err}")
+        return None
+    if not isinstance(data, dict) or data.get("stat") != "OK":
+        log(tag, "no_new_data", detail=f"證交所回覆 stat={data.get('stat') if isinstance(data, dict) else '非預期格式'}")
+        return None
+    as_of = twse_ymd_to_iso(data.get("date"))
+    ok, why = validate_close_date(as_of)
+    if not ok:
+        log(tag, "failure", as_of=as_of, detail=f"資料日期異常: {why}")
+        return None
+    return data, as_of
+
+
+def twse_institutional():
+    """三大法人買賣金額（現貨）。外資 = 外資及陸資(不含外資自營商) + 外資自營商。單位：新台幣元。
+    買進－賣出 必須等於買賣差額，對不上就拒收。"""
+    got = _twse_fetch_day(config.TWSE_BFI82U, "twse:institutional")
+    if got is None:
+        return None
+    data, as_of = got
+    fields = data.get("fields") or []
+    need = ("單位名稱", "買進金額", "賣出金額", "買賣差額")
+    if any(n not in fields for n in need):
+        log("twse:institutional", "failure", as_of=as_of, detail=f"欄位與預期不符: {fields}")
+        return None
+    ix = {n: fields.index(n) for n in need}
+    table = {}
+    for r in data.get("data") or []:
+        try:
+            label = str(r[ix["單位名稱"]]).strip()
+            table[label] = tuple(parse_number(r[ix[n]]) for n in need[1:])
+        except (IndexError, TypeError):
+            continue
+
+    def find(pred):
+        for label, triple in table.items():
+            if pred(label.replace(" ", "")):
+                return triple
+        return None
+
+    main = find(lambda l: l.startswith("外資及陸資"))
+    if main is None or None in main:
+        log("twse:institutional", "failure", as_of=as_of, detail="找不到『外資及陸資』列或數字無法解析")
+        return None
+    fd = find(lambda l: l == "外資自營商")
+    note = ""
+    if fd is None or None in fd:
+        fd, note = (0.0, 0.0, 0.0), "（外資自營商列缺漏，未計入）"
+    for buy, sell, diff in (main, fd):
+        if abs(diff - (buy - sell)) > 1:
+            log("twse:institutional", "failure", as_of=as_of, detail="買進－賣出 與買賣差額對不上，拒收")
+            return None
+    f_buy, f_sell, f_net = main[0] + fd[0], main[1] + fd[1], main[2] + fd[2]
+    if not (0 <= f_buy <= config.INST_SIDE_LIMIT and 0 <= f_sell <= config.INST_SIDE_LIMIT
+            and abs(f_net) <= config.INST_NET_LIMIT):
+        log("twse:institutional", "failure", as_of=as_of, detail=f"外資金額 {f_buy}/{f_sell} 超出合理範圍，拒收")
+        return None
+
+    trust = find(lambda l: l.startswith("投信"))
+    dealers = [t for lab, t in table.items() if lab.replace(" ", "").startswith("自營商(") and None not in t]
+    total = find(lambda l: l == "合計")
+    row = {
+        "as_of": as_of, "foreign_buy": f_buy, "foreign_sell": f_sell, "foreign_net": f_net,
+        "trust_net": trust[2] if trust and None not in trust else None,
+        "dealer_net": sum(t[2] for t in dealers) if dealers else None,
+        "total_net": total[2] if total and None not in total else None,
+        "source": "TWSE BFI82U",
+    }
+    log("twse:institutional", "success", as_of=as_of, detail=f"外資買賣超 {f_net / 1e8:+.2f} 億元（現貨）{note}")
+    return [row]
+
+
+def twse_margin():
+    """信用交易統計：融資金額餘額（仟元換算成元）。前日餘額＋買進－賣出－償還 必須等於今日餘額。"""
+    got = _twse_fetch_day(config.TWSE_MI_MARGN, "twse:margin")
+    if got is None:
+        return None
+    data, as_of = got
+    need = ("項目", "買進", "賣出", "現金(券)償還", "前日餘額", "今日餘額")
+    table = next((t for t in (data.get("tables") or []) if all(k in (t.get("fields") or []) for k in need)), None)
+    if table is None:
+        log("twse:margin", "failure", as_of=as_of, detail="找不到『信用交易統計』表格或欄位不符")
+        return None
+    fields = table["fields"]
+    ix = {k: fields.index(k) for k in need}
+    rows = {}
+    for r in table.get("data") or []:
+        try:
+            rows[str(r[ix["項目"]]).strip()] = {k: parse_number(r[ix[k]]) for k in need[1:]}
+        except (IndexError, TypeError):
+            continue
+    amt = rows.get("融資金額(仟元)")
+    if not amt or None in amt.values():
+        log("twse:margin", "failure", as_of=as_of, detail="找不到『融資金額(仟元)』列或數字無法解析")
+        return None
+    if abs(amt["前日餘額"] + amt["買進"] - amt["賣出"] - amt["現金(券)償還"] - amt["今日餘額"]) > 1:
+        log("twse:margin", "failure", as_of=as_of, detail="前日餘額＋買進－賣出－償還 與今日餘額對不上，拒收")
+        return None
+    balance, prev = amt["今日餘額"] * 1000, amt["前日餘額"] * 1000
+    lo, hi = config.MARGIN_BALANCE_RANGE
+    if not (lo <= balance <= hi):
+        log("twse:margin", "failure", as_of=as_of, detail=f"融資餘額 {balance} 超出合理範圍，拒收")
+        return None
+    units = (rows.get("融資(交易單位)") or {}).get("今日餘額")
+    short = (rows.get("融券(交易單位)") or {}).get("今日餘額")
+    log("twse:margin", "success", as_of=as_of,
+        detail=f"融資餘額 {balance / 1e8:,.0f} 億元，較前日 {(balance - prev) / 1e8:+.1f} 億元")
+    return [{"as_of": as_of, "margin_balance": balance, "margin_prev_balance": prev,
+             "margin_units": units, "short_units": short, "source": "TWSE MI_MARGN"}]
+
+
 # ---------------------------------------------------------------- 探測（只讀）
 def _clip(text, n=900):
     text = str(text)
@@ -444,6 +568,40 @@ def probe_extra():
     log("probe:taifex_swagger", "success",
         detail=_clip(f"共 {len(paths)} 個端點；含『三大法人／未平倉』：" + (" ; ".join(hits) if hits else "無")))
 
+    # 找「區分各期貨契約-依日期」端點，抓一次，只記錄結構與各欄位出現的值
+    target = None
+    for path, methods in paths.items():
+        for m in (methods or {}).values():
+            if isinstance(m, dict):
+                text = f"{m.get('summary', '')} {m.get('description', '')}"
+                if "區分各期貨契約" in text and "依日期" in text:
+                    target = path
+    if target is None:
+        log("probe:taifex_futures", "no_new_data", detail="swagger 中找不到『區分各期貨契約-依日期』端點")
+        return
+    servers = data.get("servers") or []
+    if servers and isinstance(servers[0], dict) and servers[0].get("url"):
+        base = servers[0]["url"]
+    elif data.get("basePath"):
+        base = "https://openapi.taifex.com.tw" + data["basePath"]
+    else:
+        base = "https://openapi.taifex.com.tw/v1"
+    url = base.rstrip("/") + target
+    rows, err = fetch_json(url)
+    if rows is None:
+        log("probe:taifex_futures", "failure", detail=_clip(f"{url} 抓取失敗: {err}"))
+        return
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        log("probe:taifex_futures", "failure", detail=_clip(f"{url} 回傳非預期格式: {str(rows)[:300]}"))
+        return
+    log("probe:taifex_futures_rows", "success", detail=_clip(f"{url}｜共{len(rows)}列｜前2列{rows[:2]}"))
+    seen = []
+    for key in rows[0]:
+        vals = sorted({str(r.get(key)) for r in rows if isinstance(r, dict)})
+        if 1 < len(vals) <= 15:
+            seen.append(f"{key}={vals}")
+    log("probe:taifex_futures_keys", "success", detail=_clip("；".join(seen) if seen else "沒有取值較少的欄位"))
+
 
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
@@ -475,11 +633,12 @@ def twd_fallback_chain():
 
 
 # ---------------------------------------------------------------- 寫入
-def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None):
+def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_rows=None, margin_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
                                          f"台幣 {1 if twd_row and not twd_row.get('stale_fallback') else 0} 筆、"
-                                         f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆）")
+                                         f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆、"
+                                         f"外資 {len(inst_rows or [])} 筆、融資 {len(margin_rows or [])} 筆）")
         return
     if not sb_ready():
         log("persist", "skipped", detail="未設定 SUPABASE_URL / SUPABASE_SERVICE_KEY，只寫本機檔，未寫正式資料庫")
@@ -496,6 +655,12 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None):
     if breadth_rows:
         ok, msg = sb_upsert("market_stats", breadth_rows, "market,as_of,source")
         log("persist:market_breadth", "success" if ok else "failure", detail=msg)
+    if inst_rows:
+        ok, msg = sb_upsert("tw_institutional", inst_rows, "as_of,source")
+        log("persist:tw_institutional", "success" if ok else "failure", detail=msg)
+    if margin_rows:
+        ok, msg = sb_upsert("tw_margin", margin_rows, "as_of,source")
+        log("persist:tw_margin", "success" if ok else "failure", detail=msg)
 
 
 def flush_log(dry_run):
@@ -523,6 +688,7 @@ def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
+    inst_rows = margin_rows = None
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -534,14 +700,17 @@ def run_job(job, dry_run=False):
         twd_row = twd_fallback_chain()
         tw_rows = twse_market()
         breadth_rows = twse_breadth()
+        inst_rows = twse_institutional()
+        margin_rows = twse_margin()
     if job == "tw_probe":
         probe_twse()
         probe_extra()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
-    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows)
-    return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows, "tw_breadth": breadth_rows}
+    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows)
+    return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows,
+            "tw_breadth": breadth_rows, "tw_institutional": inst_rows, "tw_margin": margin_rows}
 
 
 def main(argv=None):
