@@ -587,6 +587,10 @@ def test_fetch_json_accepts_utf8_bom():
     with mock.patch.object(fetch.urllib.request, "urlopen", return_value=FakeResp(payload)):
         data, err = fetch.fetch_json("https://example.test/x")
     assert err == "" and data == [{"a": "臺股期貨"}]
+    double = b"\xef\xbb\xbf\xef\xbb\xbf" + '[1]'.encode("utf-8")                  # 連續兩個 BOM
+    with mock.patch.object(fetch.urllib.request, "urlopen", return_value=FakeResp(double)):
+        data, err = fetch.fetch_json("https://example.test/z")
+    assert data == [1]
     plain = '{"b": 1}'.encode("utf-8")                                      # 不帶 BOM 也要能讀
     with mock.patch.object(fetch.urllib.request, "urlopen", return_value=FakeResp(plain)):
         data, err = fetch.fetch_json("https://example.test/y")
