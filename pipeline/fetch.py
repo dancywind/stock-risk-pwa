@@ -725,6 +725,53 @@ def probe_nasdaq():
                                            (" ; ".join(f"{p}={v}" for p, v in hits) if hits else "沒有")))
 
 
+def _pct_to_float(text):
+    """'1.23%' -> 1.23；'UNCH' -> 0.0；無法解析 -> None（只用於診斷統計）。"""
+    t = str(text).strip().replace("%", "").replace(",", "")
+    if t.upper() in ("UNCH", "UNCHANGED"):
+        return 0.0
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def probe_nasdaq_screener():
+    """只讀探測：Nasdaq 股票清單下載介面的結構、日期欄位，以及用漲跌幅自算的家數（僅診斷，不是正式數字）。"""
+    headers = {"User-Agent": config.NASDAQ_UA, "Accept": "application/json, text/plain, */*",
+               "Accept-Language": "en-US,en;q=0.9", "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+    for tag, url in config.NASDAQ_SCREENER_URLS.items():
+        source = f"probe:nasdaq_screener:{tag}"
+        status, ctype, body, err = fetch_raw(url, timeout=config.SCREENER_TIMEOUT, headers=headers)
+        if status is None:
+            log(source, "failure", detail=_clip(f"連線失敗（可能被擋或逾時 {config.SCREENER_TIMEOUT} 秒）: {err}"))
+            continue
+        head = f"HTTP {status}｜{ctype}｜{len(body)} 位元組"
+        try:
+            data = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        except (ValueError, UnicodeDecodeError):
+            log(source, "failure", detail=_clip(f"{head}｜不是 JSON，開頭：{body[:200].decode('utf-8', errors='replace')!r}"))
+            continue
+        inner = data.get("data") if isinstance(data, dict) else None
+        rows = None
+        if isinstance(inner, dict):
+            rows = inner.get("rows")
+            if rows is None and isinstance(inner.get("table"), dict):
+                rows = inner["table"].get("rows")
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            log(source, "failure", detail=_clip(f"{head}｜找不到資料列｜頂層鍵 {list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+                                               f"｜data 鍵 {list(inner.keys())[:12] if isinstance(inner, dict) else inner!r}"))
+            continue
+        pcts = [_pct_to_float(r.get("pctchange")) for r in rows]
+        adv, dec = sum(1 for x in pcts if x is not None and x > 0), sum(1 for x in pcts if x is not None and x < 0)
+        unch, bad = sum(1 for x in pcts if x == 0), sum(1 for x in pcts if x is None)
+        dates = _find_keys(data, ("asof", "date", "time"))
+        log(source, "success", detail=_clip(
+            f"{head}｜列數 {len(rows)}｜欄位 {list(rows[0].keys())}｜日期相關欄位："
+            + (" ; ".join(f"{p}={v}" for p, v in dates) if dates else "沒有")
+            + f"｜自算（僅診斷）上漲 {adv}／下跌 {dec}／持平 {unch}／無法解析 {bad}｜第1列 {dict(list(rows[0].items())[:6])}"))
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -834,7 +881,7 @@ def run_job(job, dry_run=False):
         probe_twse()
         probe_extra()
     if job == "us_probe":
-        probe_nasdaq()
+        probe_nasdaq_screener()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 

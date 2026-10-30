@@ -74,6 +74,13 @@ NASDAQ_PROBE_URLS = {
     "ndx_summary": "https://api.nasdaq.com/api/quote/NDX/summary?assetclass=index",
 }
 PROBE_TIMEOUT = 20
+# 第二輪：Nasdaq 網站的「股票清單下載」介面，每檔股票帶當日漲跌幅，可自行統計家數（先只探測）
+NASDAQ_SCREENER_URLS = {
+    "nasdaq": "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25&offset=0&exchange=nasdaq&download=true",
+    "nyse": "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25&offset=0&exchange=nyse&download=true",
+    "amex": "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25&offset=0&exchange=amex&download=true",
+}
+SCREENER_TIMEOUT = 45
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe")
 
