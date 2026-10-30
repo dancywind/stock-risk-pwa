@@ -772,6 +772,55 @@ def probe_nasdaq_screener():
             + f"｜自算（僅診斷）上漲 {adv}／下跌 {dec}／持平 {unch}／無法解析 {bad}｜第1列 {dict(list(rows[0].items())[:6])}"))
 
 
+def _taifex_base(swagger):
+    """期交所說明文件裡的伺服器網址；沒有就用已驗證過的預設。"""
+    servers = swagger.get("servers") or []
+    if servers and isinstance(servers[0], dict) and servers[0].get("url"):
+        return servers[0]["url"].rstrip("/")
+    if swagger.get("basePath"):
+        return "https://openapi.taifex.com.tw" + swagger["basePath"]
+    return "https://openapi.taifex.com.tw/v1"
+
+
+def probe_taifex_daily():
+    """只讀探測：期交所「期貨每日交易行情」的端點與欄位，以及臺股期貨各月份的列長什麼樣。
+    只記錄結構與前幾列，不寫任何資料表。"""
+    sw, err = fetch_json(config.TAIFEX_SWAGGER)
+    if sw is None:
+        log("probe:taifex_daily_swagger", "failure", detail=f"抓取失敗: {err}")
+        return
+    paths = sw.get("paths") or {}
+    cands = []
+    for path, methods in paths.items():
+        for m in (methods or {}).values():
+            if isinstance(m, dict):
+                text = f"{m.get('summary', '')} {m.get('description', '')}"
+                if "期貨" in text and "行情" in text and "選擇權" not in text:
+                    cands.append((path, m.get("summary", "")))
+    log("probe:taifex_daily_swagger", "success",
+        detail=_clip("含『期貨』與『行情』的端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands[:8]) if cands else "無")))
+    if not cands:
+        return
+    pick = next((c for c in cands if "每日" in c[1]), cands[0])
+    url = _taifex_base(sw) + pick[0]
+    rows, err = fetch_json(url)
+    if rows is None:
+        log("probe:taifex_daily_rows", "failure", detail=_clip(f"{url} 抓取失敗: {err}"))
+        return
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        log("probe:taifex_daily_rows", "failure", detail=_clip(f"{url} 回傳非預期格式: {str(rows)[:200]}"))
+        return
+    log("probe:taifex_daily_rows", "success", detail=_clip(f"{url}｜共 {len(rows)} 列｜欄位 {list(rows[0].keys())}"))
+    seen = []
+    for key in rows[0]:
+        vals = sorted({str(r.get(key)) for r in rows if isinstance(r, dict)})
+        if 1 < len(vals) <= 12:
+            seen.append(f"{key}={vals}")
+    log("probe:taifex_daily_values", "success", detail=_clip("；".join(seen) if seen else "沒有取值較少的欄位"))
+    tx = [r for r in rows if isinstance(r, dict) and any(str(v) == config.TAIFEX_CONTRACT or str(v) == "TX" for v in r.values())]
+    log("probe:taifex_daily_tx", "success", detail=_clip(f"臺股期貨相關列數 {len(tx)}｜前 4 列 {tx[:4]}"))
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -880,6 +929,7 @@ def run_job(job, dry_run=False):
     if job == "tw_probe":
         probe_twse()
         probe_extra()
+        probe_taifex_daily()
     if job == "us_probe":
         probe_nasdaq_screener()
     if job == "us_breadth":
