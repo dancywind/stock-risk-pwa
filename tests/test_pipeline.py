@@ -2007,6 +2007,18 @@ def test_persist_writes_cot_and_putcall_and_job_wires_them():
         for p_ in patches: p_.stop()
 
 
+def test_fred_macro_includes_quarterly_margin_series_with_sane_range():
+    label, lo, hi = config.FRED_MACRO["BOGZ1FL663067003Q"]
+    assert "Z.1" in label and "季資料" in label and lo < 622199 < hi              # Fed 公布的 2026 Q1 數字（百萬美元）要落在合理範圍內
+    reset()
+    obs = {"observations": [{"date": "2026-04-01", "value": "."}, {"date": "2026-01-01", "value": "622199"}]}
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=(obs, "")):
+        r = fetch.fred_latest("BOGZ1FL663067003Q", lo, hi)
+    assert r["value"] == 622199.0 and r["as_of"] == "2026-01-01"                    # 季資料：用該筆自己的日期，最新一季還沒公布就取上一季
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": "2026-01-01", "value": "6221"}]}, "")):
+        assert fetch.fred_latest("BOGZ1FL663067003Q", lo, hi) is None               # 單位弄錯（少三個零）→ 拒收
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
