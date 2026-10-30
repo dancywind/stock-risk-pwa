@@ -360,7 +360,8 @@ def test_probe_failures_are_logged_not_hidden():
 
 def test_probe_never_writes_market_tables():
     reset()
-    with mock.patch.object(fetch, "probe_twse"), mock.patch.object(fetch, "sb_upsert") as up:
+    with mock.patch.object(fetch, "probe_twse"), mock.patch.object(fetch, "probe_extra"), \
+            mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("tw_probe", dry_run=False)
     up.assert_not_called()
 
@@ -371,6 +372,33 @@ def test_probe_detail_is_clipped():
     with mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (({"paths": {}}, "") if "swagger" in u else (big, ""))):
         fetch.probe_twse()
     assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_extra_logs_structure_and_never_writes():
+    reset()
+    bfi = {"stat": "OK", "date": "20261029", "title": "三大法人", "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+           "data": [["外資及陸資(不含外資自營商)", "1,000", "1,200", "-200"]]}
+    margn = {"stat": "OK", "date": "20261029", "tables": [{"title": "信用交易統計", "fields": ["項目", "今日餘額"], "data": [["融資(交易單位)", "1"]]}]}
+    swagger = {"paths": {"/p1": {"get": {"summary": "三大法人-區分各期貨契約"}}, "/p2": {"get": {"summary": "其他"}}}}
+    def fake(url, **k):
+        if "BFI82U" in url:
+            return bfi, ""
+        if "MI_MARGN" in url:
+            return margn, ""
+        return swagger, ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fake), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_extra()
+    text = " ".join(x["detail"] for x in fetch.LOG)
+    assert "外資及陸資" in text and "融資" in text and "/p1" in text and "/p2" not in text
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_extra_failures_logged():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        fetch.probe_extra()
+    assert [x["status"] for x in fetch.LOG].count("failure") == 3
 
 
 def test_twd_layer_order_fixed():
