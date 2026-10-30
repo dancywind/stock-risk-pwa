@@ -1611,6 +1611,143 @@ def test_workflow_has_nightly_backfill_and_serial_concurrency():
     assert "concurrency:" in y and "cancel-in-progress: false" in y and "timeout-minutes: 30" in y
 
 
+# ---------------------------------------------------------------- 台幣：FRED 落後時另存較新的即期參考價
+def fred_row(days_ago):
+    return {"as_of": (TODAY - timedelta(days=days_ago)).isoformat(), "value": 31.4, "kind": "official_close", "source": "FRED DEXTAUS", "layer": 3, "is_close_history": True}
+
+
+def test_twd_supplement_only_when_fred_lags():
+    reset()
+    spot = {"value": 31.9, "as_of": TODAY.isoformat()}
+    with mock.patch.object(fetch, "exchangerate_twd", return_value=spot) as ex:
+        assert fetch.twd_supplement(fred_row(1)) is None and ex.call_count == 0              # 只落後 1 天：不需要
+        r = fetch.twd_supplement(fred_row(7))
+    assert r == {"as_of": TODAY.isoformat(), "value": 31.9, "kind": "spot_aggregator", "source": "ExchangeRate-API", "layer": 5, "is_close_history": False}
+    assert "落後 7 天" in fetch.LOG[-1]["detail"] and "不是官方收盤價" in fetch.LOG[-1]["detail"]
+
+
+def test_twd_supplement_ignores_fallbacks_and_failures():
+    with mock.patch.object(fetch, "exchangerate_twd", return_value=None):
+        assert fetch.twd_supplement(fred_row(7)) is None                                     # 備用來源也失敗：不編
+    for bad in (None, {"stale_fallback": True, "as_of": D(9), "layer": 3}, dict(fred_row(9), layer=5)):
+        with mock.patch.object(fetch, "exchangerate_twd") as ex:
+            assert fetch.twd_supplement(bad) is None and ex.call_count == 0
+
+
+def test_persist_writes_primary_and_supplement_together_never_stale_fallback():
+    reset()
+    prim, sup = fred_row(7), {"as_of": D(0), "value": 31.9, "kind": "spot_aggregator", "source": "ExchangeRate-API", "layer": 5, "is_close_history": False}
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
+        fetch.persist(False, [], [prim, sup])
+        assert up.call_args[0][0] == "twd_rates" and up.call_args[0][1] == [prim, sup]
+        up.reset_mock()
+        fetch.persist(False, [], {"stale_fallback": True, "as_of": D(9), "value": 1})
+        up.assert_not_called()                                                                 # 沿用舊值不重新寫入
+        fetch.persist(False, [], prim)
+        assert up.call_args[0][1] == [prim]                                                    # 單列寫法仍可用
+
+
+def test_run_job_adds_supplement_row_to_twd():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x"))]
+    for p_ in patches: p_.start()
+    try:
+        with mock.patch.object(fetch, "twd_fallback_chain", return_value=fred_row(7)), mock.patch.object(fetch, "exchangerate_twd", return_value={"value": 31.9, "as_of": D(0)}):
+            res = fetch.run_job("tw_close", dry_run=True)
+    finally:
+        for p_ in patches: p_.stop()
+    assert isinstance(res["twd"], list) and [r["layer"] for r in res["twd"]] == [3, 5]
+
+
+# ---------------------------------------------------------------- 台股大跌檢視（第一步：自動加入，待確認）
+def crash_env(by_day, hist_days=None, names=None):
+    """by_day: {日期: [(市場, 代號, 收盤)]}；回傳 patch 用的 sb_request。"""
+    days = sorted(by_day)
+    hist_days = hist_days or {d: ["TWSE", "TPEX"] for d in days}
+    def req(method, path, body=None, prefer=None):
+        if path.startswith("tw_hist_days"):
+            return [{"market": m, "as_of": d} for d, ms in hist_days.items() for m in ms], ""
+        if path.startswith("tw_hist?"):
+            d = path.split("as_of=eq.")[1].split("&")[0]
+            off = int(path.split("offset=")[1]) if "offset=" in path else 0
+            rows = [{"market": m, "code": c, "close": cl} for m, c, cl in by_day.get(d, [])]
+            return rows[off:off + 1000], ""
+        raise AssertionError(path)
+    return req
+
+
+def test_crash_check_flags_nine_percent_drops_only():
+    reset()
+    d0, d1 = D(3), D(2)
+    by_day = {d0: [("TWSE", "2330", 100.0), ("TWSE", "1101", 50.0), ("TPEX", "8358", 400.0), ("TWSE", "2317", 100.0)],
+              d1: [("TWSE", "2330", 90.9), ("TWSE", "1101", 46.0), ("TPEX", "8358", 360.0), ("TWSE", "2317", 100.0)]}
+    names = [{"Code": "2330", "Name": "台積電"}, {"Code": "1101", "Name": "台泥"}]
+    tp = [{"SecuritiesCompanyCode": "8358", "CompanyName": "金居"}]
+    ups = []
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=crash_env(by_day)), \
+            mock.patch.object(fetch, "fetch_json", side_effect=lambda url, **k: ((names if "twse" in url else tp), "")), \
+            mock.patch.object(fetch, "sb_upsert", side_effect=lambda t, r, k: ups.append((t, r, k)) or (True, "ok")):
+        found = fetch.tw_crash_check([d1])
+    got = {f["code"]: f for f in found}
+    assert set(got) == {"2330", "8358"}                       # 2330 跌 9.1%、8358 跌 10% 入選；1101 只跌 8%、2317 沒跌，不入選
+    assert got["2330"]["drop_pct"] == -9.1 and got["8358"]["drop_pct"] == -10.0 and got["8358"]["name"] == "金居"
+    assert ups[0][0] == "crash_candidates" and ups[0][2] == "as_of,market,code"
+
+
+def test_crash_check_boundaries_prev_gap_dry_run_and_errors():
+    reset()
+    a, b = D(30), D(2)
+    by_day = {a: [("TWSE", "2330", 100.0)], b: [("TWSE", "2330", 50.0)]}
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=crash_env(by_day)), mock.patch.object(fetch, "sb_upsert") as up:
+        assert fetch.tw_crash_check([b]) == []
+        assert any(x["status"] == "no_new_data" and "不比較" in x["detail"] for x in fetch.LOG)       # 前一個交易日隔太久 → 不比較
+        up.assert_not_called()
+    reset()
+    by_day = {D(3): [("TWSE", "2330", 100.0), ("TWSE", "1101", 100.0)], D(2): [("TWSE", "2330", 91.01), ("TWSE", "1101", 91.0)]}   # -8.99% 不入選、-9.0% 入選
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=crash_env(by_day)), \
+            mock.patch.object(fetch, "fetch_json", return_value=([], "")), mock.patch.object(fetch, "sb_upsert") as up:
+        found = fetch.tw_crash_check([D(2)], dry_run=True)
+    assert [f["code"] for f in found] == ["1101"] and found[0]["name"] == "" and up.call_count == 0
+    assert "原因待確認" in found[0]["note"] and "除權息" in found[0]["note"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert fetch.tw_crash_check([D(2)]) is None and fetch.LOG[-1]["status"] == "skipped"
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 404")):
+        assert fetch.tw_crash_check([D(2)]) is None and fetch.LOG[-1]["status"] == "failure"
+
+
+def test_crash_check_skips_days_not_complete_and_paginates():
+    reset()
+    big = [("TWSE", f"{1000 + i}", 100.0) for i in range(1500)]
+    by_day = {D(3): big, D(2): [(m, c, 80.0 if i < 3 else 100.0) for i, (m, c, _) in enumerate(big)]}
+    hd = {D(3): ["TWSE", "TPEX"], D(2): ["TWSE", "TPEX"], D(1): ["TWSE"]}
+    ups = []
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=crash_env(by_day, hist_days=hd)), \
+            mock.patch.object(fetch, "fetch_json", return_value=([], "")), mock.patch.object(fetch, "sb_upsert", side_effect=lambda t, r, k: ups.append(r) or (True, "ok")):
+        found = fetch.tw_crash_check([D(2), D(1)])                    # D(1) 只有上市完成 → 略過
+    assert len(found) == 3 and {f["as_of"] for f in found} == {D(2)}   # 1500 列要翻頁才讀得完
+
+
+def test_backfill_returns_new_days_and_crash_check_wiring():
+    reset()
+    res, calls, ups, _ = run_backfill(max_days=2)
+    assert res["new_days"] == [d.isoformat() for d in weekdays_back(2)]
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, twd_fallback_chain=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+              mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "_recent_complete_days", return_value=["R"])]
+    for p_ in patches: p_.start()
+    try:
+        with mock.patch.object(fetch, "tw_backfill", return_value={"new_days": ["N1"]}), mock.patch.object(fetch, "tw_crash_check") as cc:
+            fetch.run_job("tw_close", dry_run=False)
+            assert cc.call_args[0][0] == ["N1", "R"] and cc.call_args.kwargs == {}
+            fetch.run_job("tw_close", dry_run=True); assert cc.call_count == 1                 # dry-run 不檢查
+            fetch.run_job("tw_backfill", dry_run=True)
+            assert cc.call_args[0][0] == ["N1", "R"] and cc.call_args.kwargs == {"dry_run": True}
+    finally:
+        for p_ in patches: p_.stop()
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
