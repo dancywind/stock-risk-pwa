@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import tempfile
 from datetime import date, datetime, timedelta
 from unittest import mock
 
@@ -2017,6 +2018,25 @@ def test_fred_macro_includes_quarterly_margin_series_with_sane_range():
     assert r["value"] == 622199.0 and r["as_of"] == "2026-01-01"                    # 季資料：用該筆自己的日期，最新一季還沒公布就取上一季
     with with_key(), mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": "2026-01-01", "value": "6221"}]}, "")):
         assert fetch.fred_latest("BOGZ1FL663067003Q", lo, hi) is None               # 單位弄錯（少三個零）→ 拒收
+
+
+def test_main_logs_version_first_and_returns_failure_exit_code(tmp_path=None):
+    reset()
+    with mock.patch.object(fetch, "run_job", return_value={}) as rj, mock.patch.object(fetch, "flush_log", return_value=True), \
+            mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()):
+        code = fetch.main(["--job", "tw_probe", "--dry-run"])
+    assert code == 0 and rj.call_args[0][0] == "tw_probe"
+    first = fetch.LOG[0]
+    assert first["source"] == "pipeline:version" and first["status"] == "success" and first["job"] == "tw_probe"
+    assert config.PIPELINE_VERSION in first["detail"] and "dry-run" in first["detail"]
+    assert config.PIPELINE_VERSION.startswith("v") and config.PIPELINE_VERSION[1:].isdigit()
+    reset()
+    def boom(job, dry_run=False):
+        fetch.log("x", "failure", detail="boom"); return {}
+    with mock.patch.object(fetch, "run_job", side_effect=boom), mock.patch.object(fetch, "flush_log", return_value=True), \
+            mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()):
+        assert fetch.main(["--job", "full"]) == 1                                  # 有失敗 → 結束碼 1（Actions 亮紅燈）
+    assert fetch.LOG[0]["source"] == "pipeline:version" and "正式寫入" in fetch.LOG[0]["detail"]
 
 
 def test_twd_layer_order_fixed():
