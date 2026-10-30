@@ -743,7 +743,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_prices") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_history") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -1171,10 +1171,12 @@ def test_run_job_collects_tpex_and_nasdaq_prices_when_holdings_available():
             mock.patch.object(fetch, "twse_institutional", return_value=None), mock.patch.object(fetch, "twse_margin", return_value=None), \
             mock.patch.object(fetch, "taifex_futures", return_value=None), mock.patch.object(fetch, "taifex_basis", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None), mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), \
-            mock.patch.object(fetch, "tpex_prices", return_value=[{"k": 1}]) as tp, mock.patch.object(fetch, "nasdaq_prices", return_value=[{"k": 2}]) as nq:
+            mock.patch.object(fetch, "tpex_prices", return_value=[{"k": 1, "name": "金居"}]) as tp, \
+            mock.patch.object(fetch, "twse_prices", return_value=[{"k": 3}]) as tw, mock.patch.object(fetch, "nasdaq_prices", return_value=[{"k": 2}]) as nq:
         res = fetch.run_job("tw_close", dry_run=True)
     tp.assert_called_once_with(hold); nq.assert_called_once_with(hold)
-    assert res["prices"] == [{"k": 1}, {"k": 2}]
+    tw.assert_called_once_with(hold, {"金居"})                           # 上櫃已有的名稱不重複查上市
+    assert res["prices"] == [{"k": 1, "name": "金居"}, {"k": 3}, {"k": 2}]
 
 
 def test_probe_twse_failure_logs_raw_response_and_openapi_candidates():
@@ -1195,6 +1197,84 @@ def test_probe_twse_failure_logs_raw_response_and_openapi_candidates():
     assert "原始回應 HTTP 200" in by["probe:px_twse"] and "text/html" in by["probe:px_twse"]
     assert "STOCK_DAY_AVG_ALL" in by["probe:px_twse_openapi"] and "MI_INDEX" not in by["probe:px_twse_openapi"]
     assert "Date" in by["probe:px_twse_oa:STOCK_DAY_AVG_ALL"] and "ClosePrice" in by["probe:px_twse_oa:STOCK_DAY_AVG_ALL"]
+
+
+# ---------------------------------------------------------------- 上市個股收盤價（證交所 OpenAPI，格式已驗證）
+def avg_row(code, name, close="2370.00", d=None):
+    return {"Date": d or roc(), "Code": code, "Name": name, "ClosingPrice": close, "MonthlyAveragePrice": "1"}
+
+
+def test_twse_prices_exact_name_date_and_no_change_field():
+    reset()
+    rows = [avg_row("2330", "台積電", "2370.00"), avg_row("2454", "聯發科", "3855.00"), avg_row("00400A", "主動國泰動能高息", "14.36")]
+    hold = [{"market": "TW", "symbol": None, "name": "台積電", "kind": "stock", "pos_key": "台積電"},
+            {"market": "TW", "symbol": None, "name": "聯發科", "kind": "stock", "pos_key": "聯發科"},
+            {"market": "TW", "symbol": None, "name": "金居", "kind": "stock", "pos_key": "金居"}]
+    with mock.patch.object(fetch, "fetch_json", return_value=(rows, "")):
+        out = fetch.twse_prices(hold, exclude_names={"金居"})
+    by = {o["name"]: o for o in out}
+    assert set(by) == {"台積電", "聯發科"} and by["台積電"]["close"] == 2370.0 and by["台積電"]["code"] == "2330"
+    assert by["台積電"]["change"] is None and by["台積電"]["change_pct"] is None            # 這個來源沒有漲跌欄位，不編
+    assert by["台積電"]["as_of"] == (TODAY - timedelta(days=1)).isoformat()
+    assert "對不上 0 檔" in fetch.LOG[-1]["detail"]                                          # 金居已排除，不算對不上
+
+
+def test_twse_prices_ambiguous_invalid_and_failures():
+    reset()
+    hold = [{"market": "TW", "symbol": None, "name": n, "kind": "stock", "pos_key": n} for n in ("甲", "乙", "丙", "丁")]
+    rows = [avg_row("1111", "甲"), avg_row("2222", "甲"), avg_row("3333", "乙", "--"), avg_row("4444", "丙", d=roc(-3)), avg_row("5555", "戊")]
+    with mock.patch.object(fetch, "fetch_json", return_value=(rows, "")):
+        out = fetch.twse_prices(hold)
+    assert out == []
+    d = fetch.LOG[-1]["detail"]
+    assert "同名 2 筆" in d and "收盤價無效" in d and "對不上 1 檔" in d and fetch.LOG[-1]["status"] == "failure"
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        assert fetch.twse_prices(hold) is None
+    with mock.patch.object(fetch, "fetch_json", return_value=([{"x": 1}], "")):
+        assert fetch.twse_prices(hold) is None
+    assert fetch.twse_prices([{"market": "US", "name": "x", "symbol": "X", "kind": "stock", "pos_key": "X"}]) == []
+
+
+# ---------------------------------------------------------------- 歷史資料探測
+def test_probe_history_logs_keystats_and_both_exchanges():
+    reset()
+    hold = [{"market": "US", "symbol": "ORCL", "name": "甲骨文", "kind": "stock", "pos_key": "ORCL"}]
+    nas = json.dumps({"data": {"keyStats": {"FiftTwoWeekHighLow": {"label": "52 Week High/Low", "value": "$345.72/$118.65"}}}}).encode()
+    twse = {"stat": "OK", "date": "20251030", "tables": [{"title": "每日收盤行情", "fields": ["證券代號", "收盤價"], "data": [["2330", "1,500.00"], ["2317", "200.00"]]}, {"title": "小表", "fields": [], "data": []}]}
+    raws = []
+    def raw(url, timeout=None, headers=None):
+        raws.append(url)
+        if "api.nasdaq.com" in url: return 200, "application/json", nas, ""
+        if "dailyQuotes" in url: return 200, "application/json", json.dumps({"tables": [{"title": "x", "data": [["8358", "400"]]}]}).encode(), ""
+        if "stk_quote_result" in url: return 200, "text/html", b"<html>nope</html>", ""
+        return None, "", b"", "timed out"
+    with mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "fetch_json", return_value=(twse, "")), \
+            mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_history()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "52 Week High/Low" in by["probe:hist_nasdaq:ORCL"]["detail"] and "$345.72/$118.65" in by["probe:hist_nasdaq:ORCL"]["detail"]
+    assert "每日收盤行情" in by["probe:hist_twse"]["detail"] and "小表" not in by["probe:hist_twse"]["detail"]      # 空表格不列出
+    assert "前 2 列" in by["probe:hist_twse_rows"]["detail"] and "2330" in by["probe:hist_twse_rows"]["detail"]
+    assert by["probe:hist_tpex:www_dailyQuotes"]["status"] == "success"
+    assert by["probe:hist_tpex:web_roc"]["status"] == "failure" and "不是 JSON" in by["probe:hist_tpex:web_roc"]["detail"]
+    assert by["probe:hist_tpex:www_otc"]["status"] == "failure" and "連線失敗" in by["probe:hist_tpex:www_otc"]["detail"]
+    assert any("stk_quote_result" in u and "d=" in u for u in raws) and any("dailyQuotes" in u and "date=" in u for u in raws)   # 櫃買的查詢都帶日期
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_history_picks_weekday_a_year_back_and_handles_failures():
+    reset()
+    urls = []
+    def fj(url, **k):
+        urls.append(url); return None, "x"
+    with mock.patch.object(fetch, "load_holdings", return_value=(None, "未設定")), mock.patch.object(fetch, "fetch_json", side_effect=fj), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/csv", b"a,b", "")), mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_history()
+    ymd = urls[0].split("date=")[1][:8]
+    d = date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8]))
+    assert d.weekday() < 5 and 360 <= (TODAY - d).days <= 368
+    assert {x["source"]: x["status"] for x in fetch.LOG}["probe:hist_twse"] == "failure"
 
 
 def test_twd_layer_order_fixed():
