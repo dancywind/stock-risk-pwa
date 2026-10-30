@@ -134,6 +134,7 @@ def test_dry_run_does_not_write_supabase():
             mock.patch.object(fetch, "twse_breadth", return_value=None), \
             mock.patch.object(fetch, "twse_institutional", return_value=None), \
             mock.patch.object(fetch, "twse_margin", return_value=None), \
+            mock.patch.object(fetch, "taifex_futures", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("full", dry_run=True)
     req.assert_not_called()
@@ -331,8 +332,10 @@ def test_tw_close_runs_breadth_and_market():
             mock.patch.object(fetch, "twse_breadth", return_value=None) as b, \
             mock.patch.object(fetch, "twse_institutional", return_value=None) as i, \
             mock.patch.object(fetch, "twse_margin", return_value=None) as g, \
+            mock.patch.object(fetch, "taifex_futures", return_value=None) as fu, \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("tw_close", dry_run=True)
+    fu.assert_called_once()
     m.assert_called_once()
     b.assert_called_once()
     i.assert_called_once()
@@ -617,6 +620,83 @@ def test_fetch_raw_never_raises():
     with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=OSError("boom")):
         status, ctype, body, err = fetch.fetch_raw("https://example.test")
     assert status is None and body == b"" and "boom" in err
+
+
+# ---------------------------------------------------------------- 期交所外資期貨部位
+def fut_row(item, lng, sht, net, code="臺股期貨", d=None):
+    return {"Date": d or ymd(), "ContractCode": code, "Item": item,
+            "OpenInterest(Long)": str(lng), "OpenInterest(Short)": str(sht), "OpenInterest(Net)": str(net),
+            "ContractValueofOpenInterest(Net)(Thousands)": "1000"}
+
+
+# 自營商那列取自真實回傳（5606-4095=1511）；外資列數字為測試用，身份別以「外資」開頭辨識
+FUT_ROWS = [fut_row("自營商", 5606, 4095, 1511), fut_row("投信", 100, 50, 50),
+            fut_row("外資及陸資", 30000, 52000, -22000),
+            fut_row("外資及陸資", 1, 2, -1, code="小型臺指期貨")]
+
+
+def test_futures_picks_contract_and_all_investors():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(FUT_ROWS, "")):
+        rows = fetch.taifex_futures()
+    assert {r["investor"] for r in rows} == {"自營商", "投信", "外資及陸資"}   # 不含小型臺指期貨
+    f = [r for r in rows if r["investor"].startswith("外資")][0]
+    assert f["oi_net"] == -22000 and f["oi_long"] == 30000 and f["contract"] == "臺股期貨"
+    assert f["as_of"] == (TODAY - timedelta(days=1)).isoformat()
+
+
+def test_futures_identity_mismatch_row_rejected():
+    reset()
+    bad = [fut_row("外資及陸資", 30000, 52000, -1)]          # 多空相減不等於淨額
+    with mock.patch.object(fetch, "fetch_json", return_value=(bad, "")):
+        assert fetch.taifex_futures() is None
+    assert any(x["status"] == "failure" for x in fetch.LOG)
+
+
+def test_futures_no_foreign_row_is_failure_and_lists_investors():
+    reset()
+    rows = [fut_row("自營商", 5, 4, 1), fut_row("投信", 2, 1, 1)]
+    with mock.patch.object(fetch, "fetch_json", return_value=(rows, "")):
+        assert fetch.taifex_futures() is None
+    assert "自營商" in fetch.LOG[-1]["detail"]
+
+
+def test_futures_uses_latest_date_only():
+    reset()
+    old = fut_row("外資及陸資", 1, 2, -1, d=ymd(5))
+    new = fut_row("外資及陸資", 30000, 52000, -22000, d=ymd(1))
+    with mock.patch.object(fetch, "fetch_json", return_value=([old, new], "")):
+        rows = fetch.taifex_futures()
+    assert len(rows) == 1 and rows[0]["oi_net"] == -22000
+
+
+def test_futures_future_date_and_bad_shapes():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=([fut_row("外資及陸資", 2, 1, 1, d=ymd(-4))], "")):
+        assert fetch.taifex_futures() is None
+    with mock.patch.object(fetch, "fetch_json", return_value=({"not": "list"}, "")):
+        assert fetch.taifex_futures() is None
+    with mock.patch.object(fetch, "fetch_json", return_value=([{"x": 1}], "")):
+        assert fetch.taifex_futures() is None
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        assert fetch.taifex_futures() is None
+
+
+def test_futures_absurd_net_rejected():
+    reset()
+    bad = [fut_row("外資及陸資", 900000, 100, 899900)]
+    with mock.patch.object(fetch, "fetch_json", return_value=(bad, "")):
+        assert fetch.taifex_futures() is None
+
+
+def test_persist_writes_futures_with_conflict_key():
+    reset()
+    rows = [{"as_of": D(1), "contract": "臺股期貨", "investor": "外資及陸資", "oi_long": 1, "oi_short": 1,
+             "oi_net": 0, "source": "TAIFEX 三大法人-區分各期貨契約"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), \
+            mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
+        fetch.persist(False, [], None, None, None, None, None, rows)
+    assert up.call_args[0][0] == "tw_futures_position" and up.call_args[0][2] == "as_of,contract,investor,source"
 
 
 def test_twd_layer_order_fixed():
