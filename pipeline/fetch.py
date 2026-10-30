@@ -91,7 +91,7 @@ def fetch_json(url, headers=None, timeout=None):
         try:
             req = urllib.request.Request(url, headers=headers or {"User-Agent": "risk-pwa/1.0"})
             with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
-                return json.loads(resp.read().decode("utf-8")), ""
+                return json.loads(resp.read().decode("utf-8-sig")), ""  # utf-8-sig：期交所回傳開頭帶 BOM
         except Exception as e:  # noqa: BLE001
             last_err = _scrub(e)
             if attempt < config.RETRIES:
