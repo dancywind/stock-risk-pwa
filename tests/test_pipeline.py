@@ -1176,7 +1176,7 @@ def test_run_job_collects_tpex_and_nasdaq_prices_when_holdings_available():
             mock.patch.object(fetch, "taifex_futures", return_value=None), mock.patch.object(fetch, "taifex_basis", return_value=None), \
             mock.patch.object(fetch, "cftc_cot", return_value=None), mock.patch.object(fetch, "cboe_putcall", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None), mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), \
-            mock.patch.object(fetch, "tpex_prices", return_value=[{"k": 1, "name": "金居"}]) as tp, \
+            mock.patch.object(fetch, "nasdaq_earnings", return_value=[]), mock.patch.object(fetch, "tpex_prices", return_value=[{"k": 1, "name": "金居"}]) as tp, \
             mock.patch.object(fetch, "twse_prices", return_value=[{"k": 3}]) as tw, mock.patch.object(fetch, "nasdaq_prices", return_value=[{"k": 2}]) as nq:
         res = fetch.run_job("tw_close", dry_run=True)
     tp.assert_called_once_with(hold); nq.assert_called_once_with(hold)
@@ -2071,6 +2071,78 @@ def test_probe_earnings_failures_are_reported():
         fetch.probe_earnings()
     sts = {x["source"]: x["status"] for x in fetch.LOG}
     assert sts["probe:earn_us:ORCL"] == "failure" and sts["probe:earn_tw:twse"] == "failure" and sts["probe:earn_tw:tpex"] == "failure"
+
+
+# ---------------------------------------------------------------- 美股財報日（Nasdaq）
+T0 = date(2026, 10, 30)
+
+
+def test_parse_earnings_text_requires_exactly_one_plausible_future_date():
+    f = lambda s: fetch.parse_earnings_text(s, T0)
+    assert f("Oracle Corporation Common Stock is estimated to report earnings on 12/09/2026.") == ("2026-12-09", True)
+    assert f("Arm Holdings plc is expected to announce on Dec 9, 2026 after the close") == ("2026-12-09", True)
+    assert f("Earnings announcement for ORCL: Feb 3, 2027, confirmed by the company") == ("2027-02-03", False)
+    assert f("The company has not yet confirmed. Estimated date 11/18/2026") == ("2026-11-18", True)
+    assert f("Report on 12/09/2026 (12/09/2026)") == ("2026-12-09", False)                    # 同一天重複出現算同一個日期
+    assert f("Oracle reports 12/09/2026 and previously 09/10/2026") is None                    # 兩個不同日期：不猜
+    assert f("Reported on 10/01/2026") is None                                                 # 過去的日期
+    assert f("Next earnings 12/09/2027") is None                                               # 太遠，疑似解析錯誤
+    assert f("Earnings 13/45/2026") is None and f("no date here") is None and f("") is None and f(None) is None
+    assert f("on 10/30/2026") == ("2026-10-30", False)                                         # 今天算
+
+
+def earn_body(text):
+    return json.dumps({"data": {"reportText": text}, "status": {"rCode": 200}}).encode()
+
+
+def test_nasdaq_earnings_skips_etfs_and_never_writes_unparsed_dates():
+    reset()
+    ahead = (date.today() + timedelta(days=40))
+    txt = f"Oracle Corporation Common Stock is estimated to report earnings on {ahead.month:02d}/{ahead.day:02d}/{ahead.year}."
+    hold = [{"market": "US", "symbol": "ORCL", "name": "x", "kind": "stock", "pos_key": "ORCL"},
+            {"market": "US", "symbol": "ARM", "name": "x", "kind": "stock", "pos_key": "ARM"},
+            {"market": "US", "symbol": "MUU", "name": "x", "kind": "leveraged_etf", "pos_key": "MUU"},
+            {"market": "TW", "symbol": None, "name": "台積電", "kind": "stock", "pos_key": "台積電"}]
+    urls = []
+    def raw(url, timeout=None, headers=None):
+        urls.append(url)
+        return 200, "application/json", earn_body(txt if "/ORCL/" in url else "No earnings date is available."), ""
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        out = fetch.nasdaq_earnings(hold)
+    assert len(urls) == 2 and not any("MUU" in u for u in urls)                                  # ETF 與台股不查
+    assert len(out) == 1 and out[0]["symbol"] == "ORCL" and out[0]["is_estimate"] is True and out[0]["report_date"] == ahead.isoformat()
+    assert "estimated" in out[0]["raw_text"]
+    miss = [x for x in fetch.LOG if x["source"] == "nasdaq:earnings:ARM"][0]
+    assert miss["status"] == "no_new_data" and "No earnings date is available" in miss["detail"]   # 沒解析出來要把原文留下來
+
+
+def test_nasdaq_earnings_failures_are_logged_not_fabricated():
+    reset()
+    hold = [{"market": "US", "symbol": "ORCL", "name": "x", "kind": "stock", "pos_key": "ORCL"}]
+    for ret in ((None, "", b"", "timed out"), (200, "text/html", b"<html>", "")):
+        reset()
+        with mock.patch.object(fetch, "fetch_raw", return_value=ret), mock.patch.object(fetch.time, "sleep"):
+            assert fetch.nasdaq_earnings(hold) == []
+        assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_persist_writes_earnings_and_job_wires_them():
+    reset()
+    rows = [{"symbol": "ORCL", "report_date": D(-30), "is_estimate": True, "raw_text": "x", "source": "s"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
+        fetch.persist(False, [], None, None, None, None, None, None, None, None, None, None, rows)
+    assert up.call_args[0][0] == "us_earnings" and up.call_args[0][2] == "symbol,report_date"
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=([{"market": "US"}], "")),
+              mock.patch.object(fetch, "tpex_prices", return_value=[]), mock.patch.object(fetch, "twse_prices", return_value=[]), mock.patch.object(fetch, "nasdaq_prices", return_value=[]), mock.patch.object(fetch, "tw_ranges", side_effect=lambda x: x)]
+    for p_ in patches: p_.start()
+    try:
+        with mock.patch.object(fetch, "nasdaq_earnings", return_value=rows) as ne:
+            res = fetch.run_job("tw_close", dry_run=True)
+        ne.assert_called_once()
+        assert res["us_earnings"] == rows
+    finally:
+        for p_ in patches: p_.stop()
 
 
 def test_twd_layer_order_fixed():
