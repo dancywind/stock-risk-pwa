@@ -577,6 +577,22 @@ def test_taifex_swagger_url_has_no_v1_prefix():
     assert config.TAIFEX_SWAGGER == "https://openapi.taifex.com.tw/swagger.json"
 
 
+def test_fetch_json_accepts_utf8_bom():
+    class FakeResp:
+        def __init__(self, raw): self.raw = raw
+        def read(self): return self.raw
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    payload = b"\xef\xbb\xbf" + '[{"a": "臺股期貨"}]'.encode("utf-8")   # 帶 BOM 的 JSON
+    with mock.patch.object(fetch.urllib.request, "urlopen", return_value=FakeResp(payload)):
+        data, err = fetch.fetch_json("https://example.test/x")
+    assert err == "" and data == [{"a": "臺股期貨"}]
+    plain = '{"b": 1}'.encode("utf-8")                                      # 不帶 BOM 也要能讀
+    with mock.patch.object(fetch.urllib.request, "urlopen", return_value=FakeResp(plain)):
+        data, err = fetch.fetch_json("https://example.test/y")
+    assert data == {"b": 1}
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
