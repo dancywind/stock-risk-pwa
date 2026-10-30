@@ -406,6 +406,45 @@ def probe_twse():
                 detail=_clip(f"{t.get('title')}｜{t.get('fields')}｜{(t.get('data') or [])[:8]}"))
 
 
+def probe_extra():
+    """只讀探測：外資買賣超(BFI82U)、融資餘額(MI_MARGN)、期交所外資期貨部位的真實格式。
+    只把「結構與前幾列範例」寫進紀錄，不寫任何市場資料表。"""
+    for name, url in config.PROBE_URLS.items():
+        data, err = fetch_json(url)
+        if data is None:
+            log(f"probe:{name}", "failure", detail=f"抓取失敗: {err}")
+            continue
+        if not isinstance(data, dict):
+            log(f"probe:{name}", "failure", detail=_clip(f"非預期格式: {type(data).__name__}"))
+            continue
+        if data.get("stat") != "OK":
+            log(f"probe:{name}", "no_new_data", detail=f"stat={data.get('stat')}")
+            continue
+        tables = data.get("tables")
+        if tables:
+            for i, t in enumerate(tables):
+                log(f"probe:{name}:t{i}", "success",
+                    detail=_clip(f"日期{data.get('date')}｜{t.get('title')}｜欄位{t.get('fields')}｜{(t.get('data') or [])[:6]}"))
+        else:
+            log(f"probe:{name}", "success",
+                detail=_clip(f"日期{data.get('date')}｜{data.get('title')}｜欄位{data.get('fields')}｜{(data.get('data') or [])[:7]}｜頂層鍵{list(data.keys())}"))
+
+    data, err = fetch_json(config.TAIFEX_SWAGGER)
+    if data is None:
+        log("probe:taifex_swagger", "failure", detail=f"抓取失敗: {err}")
+        return
+    paths = data.get("paths") or {}
+    hits = []
+    for path, methods in paths.items():
+        for m in (methods or {}).values():
+            if isinstance(m, dict):
+                text = f"{m.get('summary', '')} {m.get('description', '')}"
+                if "三大法人" in text or "未平倉" in text:
+                    hits.append(f"{path} | {m.get('summary', '')}")
+    log("probe:taifex_swagger", "success",
+        detail=_clip(f"共 {len(paths)} 個端點；含『三大法人／未平倉』：" + (" ; ".join(hits) if hits else "無")))
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -497,6 +536,7 @@ def run_job(job, dry_run=False):
         breadth_rows = twse_breadth()
     if job == "tw_probe":
         probe_twse()
+        probe_extra()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 

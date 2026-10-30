@@ -45,6 +45,13 @@ TWD_RANGE = (20.0, 45.0)  # 美元兌台幣合理範圍
 TWSE_SWAGGER = "https://openapi.twse.com.tw/v1/swagger.json"
 TWSE_MI_INDEX_MS = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?type=MS&response=json"
 
+# 第 4 步探測：外資買賣超、融資餘額（證交所）與期交所外資期貨部位。只讀，用來確認真實格式。
+PROBE_URLS = {
+    "BFI82U": "https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&response=json",
+    "MI_MARGN": "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectType=MS&response=json",
+}
+TAIFEX_SWAGGER = "https://openapi.taifex.com.tw/v1/swagger.json"
+
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe")
 
 
