@@ -1091,10 +1091,11 @@ def roc_to_iso(text):
         return None
 
 
-def _price_row(market, code, name, as_of, close, change, source):
+def _price_row(market, code, name, as_of, close, change, source, high52=None, low52=None, range_source=None):
     prev = close - change if change is not None else None
     return {"market": market, "code": code, "name": name, "as_of": as_of, "close": close, "change": change,
-            "change_pct": round(change / prev * 100, 4) if prev else None, "source": source}
+            "change_pct": round(change / prev * 100, 4) if prev else None, "source": source,
+            "high_52w": high52, "low_52w": low52, "range_source": range_source}
 
 
 def tpex_prices(hold):
@@ -1176,8 +1177,15 @@ def nasdaq_prices(hold):
             log(f"nasdaq:price:{sym}", "failure", as_of=iso, detail=_clip(why or f"收盤價無效 {pd_.get('lastSalePrice')!r}"))
             continue
         change = parse_number(str(pd_.get("netChange", "")).replace("$", ""))
-        out.append(_price_row("US", sym, h.get("name"), iso, close, change, "Nasdaq 個股報價（已收盤）"))
-        log(f"nasdaq:price:{sym}", "success", as_of=iso, detail=f"收盤價 {close}（資料日 {iso}）")
+        low52, high52 = parse_range52((got.get("keyStats") or {}).get("fiftyTwoWeekHighLow", {}).get("value") if isinstance(got.get("keyStats"), dict) else None)
+        note = ""
+        if high52 is not None and not (low52 * 0.98 <= close <= high52 * 1.02):
+            note = f"；收盤價 {close} 不在 52 週區間 {low52}–{high52} 內，區間可能過時，不採用"
+            low52 = high52 = None
+        out.append(_price_row("US", sym, h.get("name"), iso, close, change, "Nasdaq 個股報價（已收盤）", high52, low52,
+                              "Nasdaq keyStats（與收盤價同次取得）" if high52 is not None else None))
+        log(f"nasdaq:price:{sym}", "success", as_of=iso,
+            detail=f"收盤價 {close}（資料日 {iso}）；52 週區間 " + (f"{low52}–{high52}" if high52 is not None else "查不到") + note)
         time.sleep(1)
     return out
 
@@ -1305,6 +1313,207 @@ def probe_history():
         time.sleep(2)
 
 
+def parse_range52(text):
+    """'114.50 - 281.62' -> (低, 高)；格式不符或低於高不成立 -> (None, None)。"""
+    m = re.fullmatch(r"\s*\$?([\d,]+(?:\.\d+)?)\s*-\s*\$?([\d,]+(?:\.\d+)?)\s*", str(text or ""))
+    if not m:
+        return None, None
+    lo, hi = float(m.group(1).replace(",", "")), float(m.group(2).replace(",", ""))
+    return (lo, hi) if 0 < lo <= hi < config.PRICE_LIMIT else (None, None)
+
+
+def _hist_rows(as_of, items):
+    """items: [(code, close, high, low)]。只收一般股票（四位數且不以 0 開頭）；數字不合理的列略過。"""
+    rows, bad = [], 0
+    for code, close, high, low in items:
+        if not re.fullmatch(r"[1-9]\d{3}", str(code).strip()):      # 一般股票：1xxx～9xxx；0 開頭（0050 等）是 ETF，不納入
+            continue
+        if None in (close, high, low) or not (0 < low <= close <= high < config.PRICE_LIMIT):
+            bad += 1
+            continue
+        rows.append({"code": str(code).strip(), "as_of": as_of, "close": close, "high": high, "low": low})
+    return rows, bad
+
+
+def hist_twse_day(d):
+    """證交所（上市）指定日期全部個股行情。回傳 (列, 狀態)；狀態 ok / holiday（休市或無資料）/ error:原因。"""
+    ymd = d.strftime("%Y%m%d")
+    data, err = fetch_json(config.TWSE_HIST_URL.format(ymd=ymd))
+    if data is None or not isinstance(data, dict):
+        return None, f"error:抓取失敗 {err}"
+    if data.get("stat") != "OK":
+        return [], "holiday"
+    if str(data.get("date")) != ymd:
+        return None, f"error:日期對不上（要 {ymd}，回傳 {data.get('date')}）"
+    table = next((t for t in (data.get("tables") or []) if "每日收盤行情" in str(t.get("title"))), None)
+    if table is None:
+        return None, "error:找不到每日收盤行情表"
+    f = table.get("fields") or []
+    need = ("證券代號", "最高價", "最低價", "收盤價")
+    if any(n not in f for n in need):
+        return None, f"error:欄位不符 {f[:8]}"
+    ix = {n: f.index(n) for n in need}
+    items = []
+    for r in table.get("data") or []:
+        try:
+            items.append((r[ix["證券代號"]], parse_number(r[ix["收盤價"]]), parse_number(r[ix["最高價"]]), parse_number(r[ix["最低價"]])))
+        except IndexError:
+            continue
+    rows, _bad = _hist_rows(d.isoformat(), items)
+    for r in rows:
+        r["market"] = "TWSE"
+    return rows, "ok"
+
+
+def hist_tpex_day(d):
+    """櫃買中心（上櫃）指定日期全部個股行情。欄位以名稱辨識，對不上就失敗，不猜。"""
+    slash = d.strftime("%Y/%m/%d").replace("/", "%2F")
+    data, err = fetch_json(config.TPEX_DAY_URL.format(slash=slash))
+    if data is None or not isinstance(data, dict):
+        return None, f"error:抓取失敗 {err}"
+    if str(data.get("stat", "")).lower() != "ok":
+        return [], "holiday"
+    table = next((t for t in (data.get("tables") or []) if "代號" in (t.get("fields") or []) and "名稱" in (t.get("fields") or [])), None)
+    if table is None or not table.get("data"):
+        return [], "holiday"
+    td = str(table.get("date", "")).strip()
+    try:
+        y, m, dd = td.split("/")
+        tdate = date(int(y) + 1911, int(m), int(dd))
+    except ValueError:
+        return None, f"error:表格日期格式不符 {td!r}"
+    if tdate != d:
+        return None, f"error:日期對不上（要 {d}，回傳 {tdate}）"
+    f = table["fields"]
+    def pick(*names):
+        return next((f.index(n) for n in names if n in f), None)
+    ic, ih, il, ik = pick("代號"), pick("最高", "最高價"), pick("最低", "最低價"), pick("收盤", "收盤價")
+    if None in (ic, ih, il, ik):
+        return None, f"error:欄位不符 {f[:10]}"
+    items = []
+    for r in table["data"]:
+        try:
+            items.append((r[ic], parse_number(r[ik]), parse_number(r[ih]), parse_number(r[il])))
+        except IndexError:
+            continue
+    rows, _bad = _hist_rows(d.isoformat(), items)
+    for r in rows:
+        r["market"] = "TPEX"
+    return rows, "ok"
+
+
+def _chunks(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def tw_backfill(dry_run=False, max_days=None, window_days=None):
+    """回補台股歷史行情（每個交易日兩次請求，間隔 HIST_SLEEP 秒）。已完成的日期記在 tw_hist_days，不重複抓。
+    休市判斷：只有 2 天以前的日期才會被標成休市，避免當天資料還沒公布就被誤標。"""
+    max_days = max_days or config.HIST_BATCH_DAYS
+    window_days = window_days or config.HIST_WINDOW_DAYS
+    if dry_run:
+        max_days = min(max_days, 1)
+    if not sb_ready():
+        log("tw_backfill", "skipped", detail="未設定 Supabase，無法記錄進度，不回補")
+        return {"days": 0, "rows": 0}
+    today = date.today()
+    start = today - timedelta(days=window_days)
+    done_rows, err = sb_request("GET", f"tw_hist_days?select=market,as_of&as_of=gte.{start.isoformat()}&limit=5000")
+    if done_rows is None:
+        log("tw_backfill", "failure", detail=_clip(f"讀取回補進度失敗：{err}（請先建立 tw_hist、tw_hist_days 資料表）"))
+        return None
+    done = {(r["market"], r["as_of"]) for r in done_rows}
+    total_rows = days = 0
+    d = today
+    while d >= start and days < max_days:
+        if d.weekday() < 5:
+            todo = [(m, fn) for m, fn in (("TWSE", hist_twse_day), ("TPEX", hist_tpex_day)) if (m, d.isoformat()) not in done]
+            if todo:
+                for m, fn in todo:
+                    rows, status = fn(d)
+                    time.sleep(config.HIST_SLEEP)
+                    if status.startswith("error:"):
+                        log(f"hist:{m}", "failure", as_of=d.isoformat(), detail=_clip(status[6:] + "；已停止本次回補，不繼續打請求"))
+                        return {"days": days, "rows": total_rows, "stopped": True}
+                    recent = (today - d).days <= 2
+                    if status == "holiday" and recent:
+                        log(f"hist:{m}", "no_new_data", as_of=d.isoformat(), detail="近 2 天內沒有資料（可能尚未公布），不標成休市")
+                        continue
+                    if dry_run:
+                        log(f"hist:{m}", "skipped", as_of=d.isoformat(), detail=f"--dry-run：{status}，{len(rows)} 檔，不寫入")
+                        continue
+                    ok = True
+                    for chunk in _chunks(rows, 1000):
+                        ok, msg = sb_upsert("tw_hist", chunk, "market,code,as_of")
+                        if not ok:
+                            log(f"hist:{m}", "failure", as_of=d.isoformat(), detail=_clip(f"寫入失敗：{msg}"))
+                            return None
+                    ok, msg = sb_upsert("tw_hist_days", [{"market": m, "as_of": d.isoformat(), "status": status, "rows_count": len(rows)}], "market,as_of")
+                    if not ok:
+                        log(f"hist:{m}", "failure", as_of=d.isoformat(), detail=_clip(f"進度寫入失敗：{msg}"))
+                        return None
+                    total_rows += len(rows)
+                days += 1
+        d -= timedelta(days=1)
+    log("tw_backfill", "success", detail=f"本次處理 {days} 個日期、寫入 {total_rows} 筆；回補範圍從 {start} 到今天，尚未完成的日期下次繼續")
+    return {"days": days, "rows": total_rows}
+
+
+def tw_ranges(price_rows, as_of_today=None):
+    """用自己回補的歷史，替台股持股算 52 週高低。歷史涵蓋不足就不算（高低維持空白，畫面顯示查不到）。"""
+    today = as_of_today or date.today()
+    for r in price_rows:
+        if r.get("market") != "TW" or r.get("high_52w") is not None:
+            continue
+        since = (today - timedelta(days=365)).isoformat()
+        hist, err = sb_request("GET", f"tw_hist?select=as_of,high,low&code=eq.{r['code']}&as_of=gte.{since}&order=as_of.asc&limit=1000")
+        if not hist:
+            continue
+        span = (date.fromisoformat(hist[-1]["as_of"]) - date.fromisoformat(hist[0]["as_of"])).days
+        if len(hist) < config.RANGE52_MIN_ROWS or span < config.RANGE52_MIN_COVERAGE_DAYS:
+            log(f"tw_range52:{r['code']}", "no_new_data", detail=f"歷史只有 {len(hist)} 個交易日、涵蓋 {span} 天，不足以算 52 週高低")
+            continue
+        hi, lo = max(float(x["high"]) for x in hist), min(float(x["low"]) for x in hist)
+        if not (lo * 0.98 <= float(r["close"]) <= hi * 1.02):
+            log(f"tw_range52:{r['code']}", "failure", detail=f"收盤價 {r['close']} 不在歷史區間 {lo}–{hi} 內，不採用")
+            continue
+        r["high_52w"], r["low_52w"], r["range_source"] = hi, lo, f"自建歷史（{len(hist)} 個交易日）"
+        log(f"tw_range52:{r['code']}", "success", as_of=hist[-1]["as_of"], detail=f"52 週區間 {lo}–{hi}（{len(hist)} 個交易日）")
+    return price_rows
+
+
+def probe_hist2():
+    """只讀探測：Nasdaq 對槓桿 ETF 的歷史行情端點、櫃買中心『上櫃股票每日收盤行情』的完整欄位。"""
+    hold, herr = load_holdings()
+    etfs = [h for h in (hold or []) if h["market"] == "US" and h.get("kind") in ("etf", "leveraged_etf")]
+    today = date.today()
+    for h in etfs[:1]:
+        sym = (h.get("symbol") or h.get("pos_key") or "").upper()
+        url = config.NASDAQ_HIST_URL.format(symbol=sym, assetclass="etf", fromdate=(today - timedelta(days=400)).isoformat(), todate=today.isoformat())
+        status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+        if status is None:
+            log(f"probe:hist2_nasdaq:{sym}", "failure", detail=_clip(f"連線失敗: {err}"))
+        else:
+            try:
+                j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+                rows = (((j or {}).get("data") or {}).get("tradesTable") or {}).get("rows") or []
+                log(f"probe:hist2_nasdaq:{sym}", "success" if rows else "failure",
+                    detail=_clip(f"HTTP {status}｜{len(rows)} 列｜首列 {rows[0] if rows else None}｜末列 {rows[-1] if rows else None}｜{_describe_json(j)[:200]}"))
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                log(f"probe:hist2_nasdaq:{sym}", "failure", detail=_clip(f"HTTP {status}｜不是 JSON：{body[:120].decode('utf-8', errors='replace')!r}"))
+    day = today - timedelta(days=7)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    status, ctype, body, err = fetch_raw(config.TPEX_DAY_URL.format(slash=day.strftime("%Y/%m/%d").replace("/", "%2F")), timeout=config.PROBE_TIMEOUT)
+    try:
+        j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        t = next((t for t in (j.get("tables") or []) if t.get("data")), {})
+        log("probe:hist2_tpex_fields", "success" if t else "failure", detail=_clip(f"{day}｜date={t.get('date')}｜欄位 {t.get('fields')}｜首列 {(t.get('data') or [None])[0]}"))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        log("probe:hist2_tpex_fields", "failure", detail=_clip(f"HTTP {status}｜{err}｜不是 JSON"))
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -1423,13 +1632,17 @@ def run_job(job, dry_run=False):
         else:
             tp = tpex_prices(hold) or []
             tw = twse_prices(hold, {r["name"] for r in tp}) or []
-            price_rows = tp + tw + (nasdaq_prices(hold) or [])
+            price_rows = tw_ranges(tp + tw) + (nasdaq_prices(hold) or [])
     if job == "tw_probe":
         probe_twse()
         probe_extra()
         probe_taifex_daily()
     if job == "us_probe":
-        probe_history()
+        probe_hist2()
+    if job == "tw_backfill":
+        tw_backfill(dry_run=dry_run)
+    if job in ("full", "tw_close") and not dry_run:
+        tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7)
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 

@@ -105,9 +105,18 @@ TPEX_HIST_URLS = {
     "www_dailyQuotes": "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes?date={slash}&id=&response=json",
     "www_otc": "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={slash}&type=EW&response=json",
 }
+# 台股歷史回補：每個交易日向證交所（上市）、櫃買中心（上櫃）各查一次全部個股行情，存最高、最低、收盤
+TPEX_DAY_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={slash}&type=EW&response=json"
+HIST_SLEEP = 3.0                  # 每次請求之間等幾秒，避免被交易所限流
+HIST_BATCH_DAYS = 40              # 每次回補最多處理幾個交易日
+HIST_WINDOW_DAYS = 400            # 回補到幾天前
+HIST_DAILY_DAYS = 3               # 每日排程順手補最近幾個平日
+RANGE52_MIN_COVERAGE_DAYS = 330   # 歷史涵蓋不到這麼多天，就不算 52 週高低
+RANGE52_MIN_ROWS = 200
+NASDAQ_HIST_URL = "https://api.nasdaq.com/api/quote/{symbol}/historical?assetclass={assetclass}&fromdate={fromdate}&limit=400&todate={todate}"
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
-JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe")
+JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill")
 
 
 def fred_key():
