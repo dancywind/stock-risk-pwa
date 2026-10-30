@@ -131,6 +131,7 @@ def test_dry_run_does_not_write_supabase():
     with mock.patch.object(fetch, "sb_request") as req, mock.patch.object(fetch, "sb_ready", return_value=True), \
             mock.patch.object(fetch, "fred_latest", return_value=None), \
             mock.patch.object(fetch, "twse_market", return_value=None), \
+            mock.patch.object(fetch, "twse_breadth", return_value=None), \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("full", dry_run=True)
     req.assert_not_called()
@@ -230,12 +231,106 @@ def test_tw_close_job_writes_market_stats_with_confirmation():
     assert up.call_args[0][0] == "market_stats" and up.call_args[0][2] == "market,as_of,source"
 
 
-def test_tw_close_job_does_not_claim_breadth():
+# ---------------------------------------------------------------- 台股廣度
+BREADTH_TABLE = {"title": "漲跌證券數合計", "fields": ["類型", "整體市場", "股票"],
+                 "data": [["上漲(漲停)", "3,381(16)", "232(7)"], ["下跌(跌停)", "11,943(85)", "737(3)"],
+                          ["持平", "753", "108"], ["未成交", "21,104", "6"], ["無比價", "2,823", "4"]]}
+
+
+def breadth_payload(table=BREADTH_TABLE, date_str=None, stat="OK"):
+    d = date_str or (TODAY - timedelta(days=1)).strftime("%Y%m%d")
+    return {"stat": stat, "date": d, "tables": [{"title": "價格指數", "fields": ["a"], "data": []}, table]}
+
+
+def test_parse_count():
+    assert fetch.parse_count("3,381(16)") == (3381, 16)
+    assert fetch.parse_count("753") == (753, None)
+    assert fetch.parse_count("abc") == (None, None)
+    assert fetch.parse_count("") == (None, None)
+
+
+def test_breadth_uses_stock_column_not_whole_market():
     reset()
-    with mock.patch.object(fetch, "twse_market", return_value=None), \
+    with mock.patch.object(fetch, "fetch_json", return_value=(breadth_payload(), "")):
+        rows = fetch.twse_breadth()
+    r = rows[0]
+    assert (r["advancers"], r["decliners"], r["unchanged"]) == (232, 737, 108)  # 股票欄，不是 3381/11943
+    assert r["as_of"] == (TODAY - timedelta(days=1)).isoformat()
+    assert "close" not in r and "turnover" not in r  # 不冒充指數資料
+    assert r["source"] == config.BREADTH_SOURCE
+
+
+def test_breadth_missing_table_is_failure():
+    reset()
+    payload = {"stat": "OK", "date": (TODAY - timedelta(days=1)).strftime("%Y%m%d"), "tables": []}
+    with mock.patch.object(fetch, "fetch_json", return_value=(payload, "")):
+        assert fetch.twse_breadth() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_breadth_missing_stock_column_is_failure():
+    reset()
+    bad = {"title": "漲跌證券數合計", "fields": ["類型", "整體市場"], "data": [["上漲(漲停)", "1(1)"]]}
+    with mock.patch.object(fetch, "fetch_json", return_value=(breadth_payload(bad), "")):
+        assert fetch.twse_breadth() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_breadth_missing_row_is_failure():
+    reset()
+    bad = dict(BREADTH_TABLE, data=[["上漲(漲停)", "3,381(16)", "232(7)"], ["持平", "753", "108"]])
+    with mock.patch.object(fetch, "fetch_json", return_value=(breadth_payload(bad), "")):
+        assert fetch.twse_breadth() is None
+
+
+def test_breadth_absurd_total_rejected():
+    reset()
+    bad = dict(BREADTH_TABLE, data=[["上漲(漲停)", "1,0(0)", "1"], ["下跌(跌停)", "2", "1"], ["持平", "3", "1"]])
+    with mock.patch.object(fetch, "fetch_json", return_value=(breadth_payload(bad), "")):
+        assert fetch.twse_breadth() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_breadth_future_date_rejected():
+    reset()
+    future = (TODAY + timedelta(days=4)).strftime("%Y%m%d")
+    with mock.patch.object(fetch, "fetch_json", return_value=(breadth_payload(date_str=future), "")):
+        assert fetch.twse_breadth() is None
+
+
+def test_breadth_bad_date_format_rejected():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(breadth_payload(date_str="oops"), "")):
+        assert fetch.twse_breadth() is None
+
+
+def test_breadth_not_ok_and_blocked():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(breadth_payload(stat="很抱歉"), "")):
+        assert fetch.twse_breadth() is None
+    assert fetch.LOG[-1]["status"] == "no_new_data"
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+        assert fetch.twse_breadth() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_persist_writes_breadth_as_separate_upsert():
+    reset()
+    b = [{"market": "TW", "as_of": D(1), "advancers": 1, "decliners": 1, "unchanged": 1, "source": config.BREADTH_SOURCE}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), \
+            mock.patch.object(fetch, "sb_upsert", return_value=(True, "ok")) as up:
+        fetch.persist(False, [], None, None, b)
+    assert up.call_args[0][0] == "market_stats" and up.call_args[0][1] == b
+
+
+def test_tw_close_runs_breadth_and_market():
+    reset()
+    with mock.patch.object(fetch, "twse_market", return_value=None) as m, \
+            mock.patch.object(fetch, "twse_breadth", return_value=None) as b, \
             mock.patch.object(fetch, "twd_fallback_chain", return_value=None):
         fetch.run_job("tw_close", dry_run=True)
-    assert any(x["source"] == "tw_breadth" and x["status"] == "skipped" for x in fetch.LOG)
+    m.assert_called_once()
+    b.assert_called_once()
 
 
 # ---------------------------------------------------------------- 探測
