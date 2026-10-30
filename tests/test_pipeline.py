@@ -1531,6 +1531,86 @@ def test_probe_hist2_logs_etf_history_and_tpex_fields():
     up.assert_not_called()
 
 
+# ---------------------------------------------------------------- 台股廣度指標（呼叫資料庫函式）
+def days_rows(spec):
+    """spec: {日期: [市場...]}"""
+    return [{"market": m, "as_of": d} for d, ms in spec.items() for m in ms]
+
+
+def run_breadth(days, have=(), rpc_ok=True, **kw):
+    rpcs = []
+    def req(method, path, body=None, prefer=None):
+        if path.startswith("tw_hist_days"): return days, ""
+        if path.startswith("tw_breadth_ma"): return [{"as_of": h} for h in have], ""
+        if path.startswith("rpc/compute_tw_breadth"):
+            rpcs.append(body["d"]); return (1, "") if rpc_ok else (None, "HTTP 404")
+        raise AssertionError(path)
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req):
+        res = fetch.tw_breadth_update(**kw)
+    return res, rpcs
+
+
+def test_breadth_update_latest_only_while_history_short():
+    reset()
+    d = [(TODAY - timedelta(days=i)).isoformat() for i in range(0, 100)]
+    spec = {x: ["TWSE", "TPEX"] for x in d}
+    spec[d[0]] = ["TWSE"]                                                 # 最新一天只有上市完成 → 不算
+    res, rpcs = run_breadth(days_rows(spec))
+    assert rpcs == [d[1]] and res == 1                                    # 涵蓋不到 330 天：只算最新完成日
+
+
+def test_breadth_update_backfills_missing_recent_days_when_history_full():
+    reset()
+    d = [(TODAY - timedelta(days=i)).isoformat() for i in range(1, 400, 3)]
+    spec = {x: ["TWSE", "TPEX"] for x in d}
+    have = [d[2]]
+    res, rpcs = run_breadth(days_rows(spec), have=have, max_days=4)
+    assert rpcs[0] == d[0] and d[2] not in rpcs and len(rpcs) == 5        # 最新 + 4 個缺的，已算過的跳過
+    assert all((TODAY - date.fromisoformat(x)).days <= 60 for x in rpcs)  # 只補最近 60 天
+
+
+def test_breadth_update_dry_run_failures_and_missing_pieces():
+    reset()
+    spec = {TODAY.isoformat(): ["TWSE", "TPEX"]}
+    res, rpcs = run_breadth(days_rows(spec), dry_run=True)
+    assert rpcs == [] and fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    res, rpcs = run_breadth(days_rows(spec), rpc_ok=False)
+    assert res is None and fetch.LOG[-1]["status"] == "failure" and "new_tables_breadth.sql" in fetch.LOG[-1]["detail"]
+    reset()
+    res, rpcs = run_breadth(days_rows({TODAY.isoformat(): ["TWSE"]}))
+    assert res is None and rpcs == [] and fetch.LOG[-1]["status"] == "no_new_data"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert fetch.tw_breadth_update() is None
+    assert fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 404")):
+        assert fetch.tw_breadth_update() is None
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
+def test_run_job_breadth_update_wiring():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, twd_fallback_chain=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist")]
+    for p_ in patches: p_.start()
+    try:
+        with mock.patch.object(fetch, "tw_backfill"), mock.patch.object(fetch, "tw_breadth_update") as bu:
+            fetch.run_job("tw_close", dry_run=True); bu.assert_not_called()
+            fetch.run_job("tw_close", dry_run=False); bu.assert_called_once_with(dry_run=False, max_days=10)
+        with mock.patch.object(fetch, "tw_backfill"), mock.patch.object(fetch, "tw_breadth_update") as bu:
+            fetch.run_job("tw_backfill", dry_run=True); bu.assert_called_once_with(dry_run=True, max_days=40)
+    finally:
+        for p_ in patches: p_.stop()
+
+
+def test_workflow_has_nightly_backfill_and_serial_concurrency():
+    y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
+    assert '- cron: "0 20 * * *"' in y and '"0 20 * * *")  echo "job=tw_backfill"' in y
+    assert "concurrency:" in y and "cancel-in-progress: false" in y and "timeout-minutes: 30" in y
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
