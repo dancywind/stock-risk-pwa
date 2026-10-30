@@ -89,7 +89,7 @@ def fetch_json(url, headers=None, timeout=None):
     last_err = ""
     for attempt in range(1, config.RETRIES + 1):
         try:
-            req = urllib.request.Request(url, headers=headers or {"User-Agent": "risk-pwa/1.0"})
+            req = urllib.request.Request(url, headers=headers or {"User-Agent": "risk-pwa/1.0", "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
                 return json.loads(resp.read().decode("utf-8-sig").lstrip("\ufeff")), ""  # 期交所回傳開頭帶 BOM（連續多個也處理）
         except Exception as e:  # noqa: BLE001
@@ -97,6 +97,20 @@ def fetch_json(url, headers=None, timeout=None):
             if attempt < config.RETRIES:
                 time.sleep(config.BACKOFF_SECONDS * attempt)
     return None, last_err
+
+
+def fetch_raw(url, timeout=None):
+    """診斷用：不解析 JSON，只回傳 (HTTP 狀態, Content-Type, 原始位元組, 錯誤)。"""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
+            return resp.status, resp.headers.get("Content-Type", ""), resp.read(), ""
+    except urllib.error.HTTPError as e:
+        ctype = e.headers.get("Content-Type", "") if e.headers else ""
+        return e.code, ctype, e.read()[:2000], f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return None, "", b"", _scrub(e)
 
 
 # ---------------------------------------------------------------- Supabase
@@ -590,6 +604,10 @@ def probe_extra():
     rows, err = fetch_json(url)
     if rows is None:
         log("probe:taifex_futures", "failure", detail=_clip(f"{url} 抓取失敗: {err}"))
+        status, ctype, body, err2 = fetch_raw(url)
+        text = body[:300].decode("utf-8", errors="replace")
+        log("probe:taifex_futures_raw", "success",
+            detail=_clip(f"HTTP {status}｜Content-Type {ctype}｜總長度 {len(body)} 位元組｜開頭 {text!r}｜{err2}"))
         return
     if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
         log("probe:taifex_futures", "failure", detail=_clip(f"{url} 回傳非預期格式: {str(rows)[:300]}"))
