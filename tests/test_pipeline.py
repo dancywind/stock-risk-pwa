@@ -370,7 +370,7 @@ def test_probe_failures_are_logged_not_hidden():
 
 def test_probe_never_writes_market_tables():
     reset()
-    with mock.patch.object(fetch, "probe_twse"), mock.patch.object(fetch, "probe_extra"), \
+    with mock.patch.object(fetch, "probe_twse"), mock.patch.object(fetch, "probe_extra"), mock.patch.object(fetch, "probe_taifex_daily"), \
             mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("tw_probe", dry_run=False)
     up.assert_not_called()
@@ -789,6 +789,41 @@ def test_screener_probe_failures_are_reported():
 def test_pct_parser():
     assert fetch._pct_to_float("1.23%") == 1.23 and fetch._pct_to_float("-0.5%") == -0.5
     assert fetch._pct_to_float("UNCH") == 0.0 and fetch._pct_to_float("") is None and fetch._pct_to_float("abc") is None
+
+
+def test_taifex_daily_probe_logs_structure_and_tx_rows():
+    reset()
+    swagger = {"servers": [{"url": "https://openapi.taifex.com.tw/v1"}],
+               "paths": {"/DailyMarketReportFut": {"get": {"summary": "期貨每日交易行情"}},
+                         "/DailyMarketReportOpt": {"get": {"summary": "選擇權每日交易行情"}}}}
+    rows = [{"Date": "20261029", "Contract": "臺股期貨", "ContractMonth(Week)": "202611", "Last": "45000", "SettlementPrice": "45010", "TradingSession": "一般"},
+            {"Date": "20261029", "Contract": "臺股期貨", "ContractMonth(Week)": "202612", "Last": "45100", "SettlementPrice": "45090", "TradingSession": "一般"},
+            {"Date": "20261029", "Contract": "小型臺指期貨", "ContractMonth(Week)": "202611", "Last": "45001", "SettlementPrice": "45011", "TradingSession": "盤後"}]
+    calls = []
+    def fake(url, **k):
+        calls.append(url)
+        return (swagger, "") if "swagger" in url else (rows, "")
+    with mock.patch.object(fetch, "fetch_json", side_effect=fake), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_taifex_daily()
+    assert any(c.endswith("/DailyMarketReportFut") for c in calls) and not any(c.endswith("/DailyMarketReportOpt") for c in calls)
+    by = {x["source"]: x["detail"] for x in fetch.LOG}
+    assert "DailyMarketReportFut" in by["probe:taifex_daily_swagger"] and "DailyMarketReportOpt" not in by["probe:taifex_daily_swagger"]
+    assert "ContractMonth(Week)" in by["probe:taifex_daily_rows"] and "共 3 列" in by["probe:taifex_daily_rows"]
+    assert "TradingSession=" in by["probe:taifex_daily_values"] and "盤後" in by["probe:taifex_daily_values"]
+    assert "臺股期貨相關列數 2" in by["probe:taifex_daily_tx"]
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_taifex_daily_probe_failures():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "boom")):
+        fetch.probe_taifex_daily()
+    assert fetch.LOG[-1]["status"] == "failure"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=({"paths": {"/x": {"get": {"summary": "其他"}}}}, "")):
+        fetch.probe_taifex_daily()
+    assert "無" in fetch.LOG[-1]["detail"]
 
 
 def test_twd_layer_order_fixed():
