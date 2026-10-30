@@ -57,7 +57,11 @@ TAIFEX_SWAGGER = "https://openapi.taifex.com.tw/swagger.json"
 TAIFEX_FUTURES_URL = ("https://openapi.taifex.com.tw/v1/"
                       "MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate")
 TAIFEX_CONTRACT = "臺股期貨"      # 只取大台指（TX）；小型、微型台指目前不計
-TAIFEX_NET_LIMIT = 200000         # 單一身份別淨未平倉口數合理上限，超過視為壞資料
+TAIFEX_NET_LIMIT = 200000
+# 期交所「期貨每日交易行情」：網址與欄位名稱已用真實回傳驗證（Contract 是代碼 TX，交易時段分「一般」「盤後」）
+TAIFEX_DAILY_URL = "https://openapi.taifex.com.tw/v1/DailyMarketReportFut"
+TAIFEX_DAILY_CONTRACT = "TX"
+BASIS_LIMIT_PCT = 5.0             # 基差佔指數超過這個百分比視為壞資料         # 單一身份別淨未平倉口數合理上限，超過視為壞資料
 # 外資買賣超（新台幣元）合理上限；超過視為壞資料
 INST_NET_LIMIT = 2e12
 INST_SIDE_LIMIT = 5e12
