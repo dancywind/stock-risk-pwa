@@ -965,11 +965,12 @@ def probe_prices():
         log("probe:px_holdings", "success", detail=f"台股 {sum(1 for h in hold if h['market'] == 'TW')} 檔、美股 {sum(1 for h in hold if h['market'] == 'US')} 檔")
     tw_names = [h["name"] for h in hold if h["market"] == "TW"]
 
-    # 1) 證交所每日收盤行情（上市）
+    # 1) 證交所上市：先試 rwd 版本；失敗就記原始回應，再看 OpenAPI 有哪些「收盤」端點
     data, err = fetch_json(config.TWSE_STOCK_DAY_ALL)
     twse_rows = {}
     if data is None or not isinstance(data, dict):
-        log("probe:px_twse", "failure", detail=_clip(f"抓取失敗: {err}"))
+        status, ctype, body, err2 = fetch_raw(config.TWSE_STOCK_DAY_ALL)
+        log("probe:px_twse", "failure", detail=_clip(f"rwd 版抓取失敗: {err}｜原始回應 HTTP {status}｜{ctype}｜{len(body)} 位元組｜開頭 {body[:160].decode('utf-8', errors='replace')!r}"))
     else:
         fields = data.get("fields") or []
         rows = data.get("data") or []
@@ -978,6 +979,27 @@ def probe_prices():
         if "證券名稱" in fields:
             ni = fields.index("證券名稱")
             twse_rows = {str(r[ni]).strip(): r for r in rows if len(r) > ni}
+    sw1, err = fetch_json(config.TWSE_OPENAPI_SWAGGER)
+    if sw1 is None or not isinstance(sw1, dict):
+        log("probe:px_twse_openapi", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
+    else:
+        cands1 = []
+        for path, methods in (sw1.get("paths") or {}).items():
+            for m in (methods or {}).values():
+                text = f"{m.get('summary', '')}" if isinstance(m, dict) else ""
+                if "收盤" in text and "指數" not in text and "大盤" not in text and ("個股" in text or "每日" in text or "股票" in text):
+                    cands1.append((path, text))
+        log("probe:px_twse_openapi", "success", detail=_clip("含『收盤』的個股端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands1[:10]) if cands1 else "無")))
+        for path, text in cands1[:3]:
+            rows1, err = fetch_json(config.TWSE_OPENAPI_BASE + path)
+            tag = path.strip("/").split("/")[-1][:30]
+            if rows1 is None or not isinstance(rows1, list) or not rows1 or not isinstance(rows1[0], dict):
+                log(f"probe:px_twse_oa:{tag}", "failure", detail=_clip(f"抓取失敗或格式非預期: {err or str(rows1)[:150]}"))
+                continue
+            nk = next((k for k in rows1[0] if "Name" in k or "名稱" in k), None)
+            if nk and not twse_rows:
+                twse_rows = {str(r.get(nk)).strip(): r for r in rows1}
+            log(f"probe:px_twse_oa:{tag}", "success", detail=_clip(f"共 {len(rows1)} 列｜欄位 {list(rows1[0].keys())}｜第1列 {rows1[0]}"))
 
     # 2) 櫃買中心上櫃行情
     sw, err = fetch_json(config.TPEX_SWAGGER)
@@ -1042,6 +1064,124 @@ def probe_prices():
             log(f"probe:px_nasdaq:{sym}", "failure", detail="stocks 與 etf 兩種 assetclass 都沒有取得報價資料")
 
 
+_US_MONTHS = {m: i + 1 for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+NASDAQ_HEADERS = {"User-Agent": config.NASDAQ_UA, "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.9",
+                  "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+
+
+def parse_us_date(text):
+    """'Oct 29, 2026'（後面可帶時間）-> '2026-10-29'；格式不符回傳 None。"""
+    m = re.match(r"\s*([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{1,2}),\s*(\d{4})", str(text or ""))
+    if not m or m.group(1).title() not in _US_MONTHS:
+        return None
+    try:
+        return date(int(m.group(3)), _US_MONTHS[m.group(1).title()], int(m.group(2))).isoformat()
+    except ValueError:
+        return None
+
+
+def roc_to_iso(text):
+    """民國年七碼 '1151029' -> '2026-10-29'；格式不符回傳 None。"""
+    t = str(text or "").strip()
+    if not re.fullmatch(r"\d{7}", t):
+        return None
+    try:
+        return date(int(t[:3]) + 1911, int(t[3:5]), int(t[5:7])).isoformat()
+    except ValueError:
+        return None
+
+
+def _price_row(market, code, name, as_of, close, change, source):
+    prev = close - change if change is not None else None
+    return {"market": market, "code": code, "name": name, "as_of": as_of, "close": close, "change": change,
+            "change_pct": round(change / prev * 100, 4) if prev else None, "source": source}
+
+
+def tpex_prices(hold):
+    """持股裡「上櫃」股票的官方收盤價（櫃買中心）。名稱必須完全相同；同名多筆優先取四位數代號，仍不唯一就不用。"""
+    names = [h["name"] for h in hold if h["market"] == "TW"]
+    if not names:
+        return []
+    rows, err = fetch_json(config.TPEX_QUOTES_URL)
+    if rows is None or not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        log("tpex:prices", "failure", detail=_clip(f"抓取失敗或格式非預期: {err or str(rows)[:120]}"))
+        return None
+    if any(k not in rows[0] for k in ("Date", "SecuritiesCompanyCode", "CompanyName", "Close", "Change")):
+        log("tpex:prices", "failure", detail=_clip(f"欄位與預期不符: {list(rows[0].keys())[:10]}"))
+        return None
+    by_name = {}
+    for r in rows:
+        by_name.setdefault(str(r.get("CompanyName", "")).strip(), []).append(r)
+    out, not_here, skipped = [], [], []
+    for n in names:
+        cand = by_name.get(n, [])
+        if not cand:
+            not_here.append(n)
+            continue
+        cand = [r for r in cand if re.fullmatch(r"\d{4}", str(r.get("SecuritiesCompanyCode", "")).strip())] or cand
+        if len(cand) != 1:
+            skipped.append(f"{n}（同名 {len(cand)} 筆）")
+            continue
+        r = cand[0]
+        iso = roc_to_iso(r.get("Date"))
+        ok, why = validate_close_date(iso)
+        close = parse_number(r.get("Close"))
+        if not ok or close is None or not (0 < close < config.PRICE_LIMIT):
+            skipped.append(f"{n}（{why or '收盤價無效 ' + repr(r.get('Close'))}）")
+            continue
+        out.append(_price_row("TW", str(r["SecuritiesCompanyCode"]).strip(), n, iso, close, parse_number(r.get("Change")), "TPEX 上櫃股票行情"))
+    dates = sorted({o["as_of"] for o in out})
+    log("tpex:prices", "success" if (out or not skipped) else "failure", as_of=dates[-1] if dates else None,
+        detail=_clip(f"上櫃對上 {len(out)} 檔；不在上櫃清單 {len(not_here)} 檔（上市股票，由證交所來源處理）；略過 {skipped}"))
+    return out
+
+
+def nasdaq_prices(hold):
+    """持股裡美股的收盤價（Nasdaq 個股報價）。只在 marketStatus=Closed 且 isRealTime=False 時採用，避免拿盤中或盤後價冒充收盤價。"""
+    out = []
+    for h in [x for x in hold if x["market"] == "US"]:
+        sym = (h.get("symbol") or h.get("pos_key") or "").upper().strip()
+        if not sym:
+            continue
+        first = "etf" if h.get("kind") in ("etf", "leveraged_etf") else "stocks"
+        got = None
+        for ac in (first, "stocks" if first == "etf" else "etf"):
+            status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+            if status is None:
+                log(f"nasdaq:price:{sym}", "failure", detail=_clip(f"連線失敗: {err}"))
+                break
+            try:
+                j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+            except (ValueError, UnicodeDecodeError):
+                log(f"nasdaq:price:{sym}", "failure", detail=f"HTTP {status}，回傳不是 JSON")
+                break
+            d = j.get("data") if isinstance(j, dict) else None
+            if isinstance(d, dict) and isinstance(d.get("primaryData"), dict):
+                got = d
+                break
+        else:
+            log(f"nasdaq:price:{sym}", "failure", detail="stocks 與 etf 兩種分類都查不到報價")
+            continue
+        if got is None:
+            continue
+        pd_ = got["primaryData"]
+        ms = str(got.get("marketStatus"))
+        if ms != "Closed" or pd_.get("isRealTime") is True:
+            log(f"nasdaq:price:{sym}", "skipped", detail=f"marketStatus={ms}、isRealTime={pd_.get('isRealTime')}，不是已收盤的價格，不使用")
+            continue
+        iso = parse_us_date(pd_.get("lastTradeTimestamp"))
+        ok, why = validate_close_date(iso)
+        close = parse_number(str(pd_.get("lastSalePrice", "")).replace("$", ""))
+        if not ok or close is None or not (0 < close < config.PRICE_LIMIT):
+            log(f"nasdaq:price:{sym}", "failure", as_of=iso, detail=_clip(why or f"收盤價無效 {pd_.get('lastSalePrice')!r}"))
+            continue
+        change = parse_number(str(pd_.get("netChange", "")).replace("$", ""))
+        out.append(_price_row("US", sym, h.get("name"), iso, close, change, "Nasdaq 個股報價（已收盤）"))
+        log(f"nasdaq:price:{sym}", "success", as_of=iso, detail=f"收盤價 {close}（資料日 {iso}）")
+        time.sleep(1)
+    return out
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -1073,13 +1213,13 @@ def twd_fallback_chain():
 
 # ---------------------------------------------------------------- 寫入
 def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_rows=None, margin_rows=None,
-            futures_rows=None, basis_rows=None):
+            futures_rows=None, basis_rows=None, price_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
                                          f"台幣 {1 if twd_row and not twd_row.get('stale_fallback') else 0} 筆、"
                                          f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆、"
                                          f"外資 {len(inst_rows or [])} 筆、融資 {len(margin_rows or [])} 筆、"
-                                         f"期貨部位 {len(futures_rows or [])} 筆、基差 {len(basis_rows or [])} 筆）")
+                                         f"期貨部位 {len(futures_rows or [])} 筆、基差 {len(basis_rows or [])} 筆、持股現價 {len(price_rows or [])} 筆）")
         return
     if not sb_ready():
         log("persist", "skipped", detail="未設定 SUPABASE_URL / SUPABASE_SERVICE_KEY，只寫本機檔，未寫正式資料庫")
@@ -1108,6 +1248,9 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_
     if basis_rows:
         ok, msg = sb_upsert("tw_futures_basis", basis_rows, "as_of,contract_month,source")
         log("persist:tw_futures_basis", "success" if ok else "failure", detail=msg)
+    if price_rows:
+        ok, msg = sb_upsert("stock_prices", price_rows, "market,code,as_of,source")
+        log("persist:stock_prices", "success" if ok else "failure", detail=msg)
 
 
 def flush_log(dry_run):
@@ -1135,7 +1278,7 @@ def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
-    inst_rows = margin_rows = futures_rows = basis_rows = None
+    inst_rows = margin_rows = futures_rows = basis_rows = price_rows = None
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -1151,6 +1294,11 @@ def run_job(job, dry_run=False):
         margin_rows = twse_margin()
         futures_rows = taifex_futures()
         basis_rows = taifex_basis(tw_rows)
+        hold, herr = load_holdings()
+        if hold is None:
+            log("prices:holdings", "skipped", detail=_clip(f"{herr}；不抓持股現價"))
+        else:
+            price_rows = (tpex_prices(hold) or []) + (nasdaq_prices(hold) or [])
     if job == "tw_probe":
         probe_twse()
         probe_extra()
@@ -1160,10 +1308,10 @@ def run_job(job, dry_run=False):
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
-    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows, basis_rows)
+    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows, basis_rows, price_rows)
     return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows,
             "tw_breadth": breadth_rows, "tw_institutional": inst_rows, "tw_margin": margin_rows,
-            "tw_futures": futures_rows, "tw_basis": basis_rows}
+            "tw_futures": futures_rows, "tw_basis": basis_rows, "prices": price_rows}
 
 
 def main(argv=None):

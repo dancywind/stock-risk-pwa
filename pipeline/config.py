@@ -92,6 +92,12 @@ TPEX_SWAGGER = "https://www.tpex.org.tw/openapi/swagger.json"
 TPEX_DEFAULT_BASE = "https://www.tpex.org.tw/openapi/v1"
 NASDAQ_QUOTE_URL = "https://api.nasdaq.com/api/quote/{symbol}/info?assetclass={assetclass}"
 
+# 已用真實回傳驗證：櫃買中心上櫃股票行情（Date 是民國年七碼，例如 1151029）
+TPEX_QUOTES_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+TWSE_OPENAPI_SWAGGER = "https://openapi.twse.com.tw/v1/swagger.json"
+TWSE_OPENAPI_BASE = "https://openapi.twse.com.tw/v1"
+PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
+
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe")
 
 
