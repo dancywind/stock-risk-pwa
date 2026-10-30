@@ -108,7 +108,7 @@ TPEX_HIST_URLS = {
 # 台股歷史回補：每個交易日向證交所（上市）、櫃買中心（上櫃）各查一次全部個股行情，存最高、最低、收盤
 TPEX_DAY_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={slash}&type=EW&response=json"
 HIST_SLEEP = 3.0                  # 每次請求之間等幾秒，避免被交易所限流
-HIST_BATCH_DAYS = 40              # 每次回補最多處理幾個交易日
+HIST_BATCH_DAYS = 70              # 每次回補最多處理幾個交易日（約 15 到 20 分鐘，低於工作的 30 分鐘上限）
 HIST_WINDOW_DAYS = 400            # 回補到幾天前
 HIST_DAILY_DAYS = 3               # 每日排程順手補最近幾個平日
 RANGE52_MIN_COVERAGE_DAYS = 330   # 歷史涵蓋不到這麼多天，就不算 52 週高低

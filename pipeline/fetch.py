@@ -1373,7 +1373,9 @@ def hist_tpex_day(d):
         return None, f"error:抓取失敗 {err}"
     if str(data.get("stat", "")).lower() != "ok":
         return [], "holiday"
-    table = next((t for t in (data.get("tables") or []) if "代號" in (t.get("fields") or []) and "名稱" in (t.get("fields") or [])), None)
+    def _fields(t):
+        return [str(x).strip() for x in (t.get("fields") or [])]       # 櫃買中心的欄位名稱常帶前後空白，比對前先去掉
+    table = next((t for t in (data.get("tables") or []) if "代號" in _fields(t) and "名稱" in _fields(t)), None)
     if table is None or not table.get("data"):
         return [], "holiday"
     td = str(table.get("date", "")).strip()
@@ -1384,7 +1386,7 @@ def hist_tpex_day(d):
         return None, f"error:表格日期格式不符 {td!r}"
     if tdate != d:
         return None, f"error:日期對不上（要 {d}，回傳 {tdate}）"
-    f = table["fields"]
+    f = _fields(table)
     def pick(*names):
         return next((f.index(n) for n in names if n in f), None)
     ic, ih, il, ik = pick("代號"), pick("最高", "最高價"), pick("最低", "最低價"), pick("收盤", "收盤價")
