@@ -1996,6 +1996,9 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="照常抓資料，但不寫 Supabase")
     args = parser.parse_args(argv)
 
+    global CURRENT_JOB
+    CURRENT_JOB = args.job
+    log("pipeline:version", "success", detail=f"程式版本 {config.PIPELINE_VERSION}｜工作 {args.job}｜{'dry-run' if args.dry_run else '正式寫入'}")
     result = run_job(args.job, dry_run=args.dry_run)
     log_ok = flush_log(args.dry_run)
 

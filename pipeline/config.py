@@ -136,6 +136,8 @@ CBOE_PC_URLS = {
 CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
+# 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
+PIPELINE_VERSION = "v24"
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill")
