@@ -99,9 +99,9 @@ def fetch_json(url, headers=None, timeout=None):
     return None, last_err
 
 
-def fetch_raw(url, timeout=None):
+def fetch_raw(url, timeout=None, headers=None):
     """診斷用：不解析 JSON，只回傳 (HTTP 狀態, Content-Type, 原始位元組, 錯誤)。"""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"}
+    headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"}
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
@@ -680,6 +680,51 @@ def probe_extra():
     log("probe:taifex_futures_keys", "success", detail=_clip("；".join(seen) if seen else "沒有取值較少的欄位"))
 
 
+def _find_keys(obj, needles, path="", out=None, depth=0):
+    """在 JSON 裡找鍵名含關鍵字的欄位（例如 advanc / declin），回傳 [(路徑, 值)]。"""
+    out = [] if out is None else out
+    if depth > 6 or len(out) >= 12:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            here = f"{path}.{k}" if path else str(k)
+            if any(n in str(k).lower() for n in needles) and not isinstance(v, (dict, list)):
+                out.append((here, v))
+            _find_keys(v, needles, here, out, depth + 1)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:5]):
+            _find_keys(v, needles, f"{path}[{i}]", out, depth + 1)
+    return out
+
+
+def probe_nasdaq():
+    """只讀探測：Nasdaq 官方網站的公開介面有沒有漲跌家數。只記錄結構，不寫任何資料表。
+    用瀏覽器標頭、短逾時、不重試（雲端機器常被這類網站擋，快速失敗比卡住好）。"""
+    headers = {"User-Agent": config.NASDAQ_UA, "Accept": "application/json, text/plain, */*",
+               "Accept-Language": "en-US,en;q=0.9", "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+    for tag, url in config.NASDAQ_PROBE_URLS.items():
+        source = f"probe:nasdaq:{tag}"
+        status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=headers)
+        if status is None:
+            log(source, "failure", detail=_clip(f"連線失敗（可能被擋或逾時 {config.PROBE_TIMEOUT} 秒）: {err}"))
+            continue
+        head = f"HTTP {status}｜{ctype}｜{len(body)} 位元組"
+        try:
+            data = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        except (ValueError, UnicodeDecodeError):
+            log(source, "failure", detail=_clip(f"{head}｜不是 JSON，開頭：{body[:200].decode('utf-8', errors='replace')!r}"))
+            continue
+        if status != 200:
+            log(source, "failure", detail=_clip(f"{head}｜{str(data)[:200]}"))
+            continue
+        hits = _find_keys(data, ("advanc", "declin", "unchang"))
+        keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+        inner = data.get("data") if isinstance(data, dict) else None
+        inner_keys = list(inner.keys())[:15] if isinstance(inner, dict) else (type(inner).__name__ if inner is not None else "無 data")
+        log(source, "success", detail=_clip(f"{head}｜頂層鍵 {keys}｜data 鍵 {inner_keys}｜含漲跌家數字樣的欄位：" +
+                                           (" ; ".join(f"{p}={v}" for p, v in hits) if hits else "沒有")))
+
+
 # ---------------------------------------------------------------- 台幣備用鏈
 def twd_fallback_chain():
     """照順序試，第一個成功即停。回傳要寫入 twd_rates 的列（或 None / 沿用舊值）。"""
@@ -788,6 +833,8 @@ def run_job(job, dry_run=False):
     if job == "tw_probe":
         probe_twse()
         probe_extra()
+    if job == "us_probe":
+        probe_nasdaq()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 

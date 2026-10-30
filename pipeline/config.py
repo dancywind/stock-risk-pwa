@@ -64,7 +64,18 @@ INST_SIDE_LIMIT = 5e12
 # 融資金額餘額（新台幣元）合理範圍
 MARGIN_BALANCE_RANGE = (1e10, 5e13)
 
-JOBS = ("full", "tw_close", "us_breadth", "tw_probe")
+# 美股廣度探測（只讀）：Nasdaq 官方網站使用的公開介面，沒有保證穩定；每次只打少數幾個請求。
+NASDAQ_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/124.0.0.0 Safari/537.36")
+NASDAQ_PROBE_URLS = {
+    "market_info": "https://api.nasdaq.com/api/market-info",
+    "comp_summary": "https://api.nasdaq.com/api/quote/COMP/summary?assetclass=index",
+    "comp_info": "https://api.nasdaq.com/api/quote/COMP/info?assetclass=index",
+    "ndx_summary": "https://api.nasdaq.com/api/quote/NDX/summary?assetclass=index",
+}
+PROBE_TIMEOUT = 20
+
+JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe")
 
 
 def fred_key():
