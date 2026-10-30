@@ -17,6 +17,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -294,8 +295,71 @@ def twse_market():
     latest = max(r["as_of"] for r in rows)
     age = (date.today() - date.fromisoformat(latest)).days
     log("twse:FMTQIK", "success", as_of=latest,
-        detail=f"共 {len(rows)} 個交易日；最新收盤日 {latest}（距今 {age} 天）；廣度未取得，不冒充")
+        detail=f"共 {len(rows)} 個交易日；最新收盤日 {latest}（距今 {age} 天）")
     return rows
+
+
+def parse_count(text):
+    """'3,381(16)' -> (3381, 16)；'753' -> (753, None)；無法解析 -> (None, None)。"""
+    m = re.fullmatch(r"\s*([\d,]+)\s*(?:\(\s*([\d,]+)\s*\))?\s*", str(text))
+    if not m:
+        return None, None
+    n = int(m.group(1).replace(",", ""))
+    extra = int(m.group(2).replace(",", "")) if m.group(2) else None
+    return n, extra
+
+
+def twse_breadth():
+    """台股市場廣度（漲跌家數），取證交所『漲跌證券數合計』的「股票」欄（不含權證、ETF 等）。
+    日期用證交所回傳的資料日期；格式或數字不合理一律拒收，不冒充。"""
+    data, err = fetch_json(config.TWSE_MI_INDEX_MS)
+    if data is None:
+        log("twse:breadth", "failure", detail=f"抓取失敗: {err}")
+        return None
+    if data.get("stat") != "OK":
+        log("twse:breadth", "no_new_data", detail=f"證交所回覆 stat={data.get('stat')}")
+        return None
+
+    raw = str(data.get("date", ""))
+    try:
+        as_of = date(int(raw[:4]), int(raw[4:6]), int(raw[6:8])).isoformat()
+    except (ValueError, TypeError):
+        log("twse:breadth", "failure", detail=f"資料日期格式不符: {raw!r}")
+        return None
+    ok, why = validate_close_date(as_of)
+    if not ok:
+        log("twse:breadth", "failure", as_of=as_of, detail=why)
+        return None
+
+    table = next((t for t in (data.get("tables") or []) if "漲跌證券數合計" in str(t.get("title"))), None)
+    if table is None:
+        log("twse:breadth", "failure", as_of=as_of, detail="找不到『漲跌證券數合計』表格")
+        return None
+    fields = table.get("fields") or []
+    if "類型" not in fields or "股票" not in fields:
+        log("twse:breadth", "failure", as_of=as_of, detail=f"欄位與預期不符: {fields}")
+        return None
+    i_label, i_stock = fields.index("類型"), fields.index("股票")
+
+    got = {}
+    for r in table.get("data") or []:
+        label = str(r[i_label])
+        for prefix, name in (("上漲", "advancers"), ("下跌", "decliners"), ("持平", "unchanged")):
+            if label.startswith(prefix):
+                got[name] = parse_count(r[i_stock])
+    if any(got.get(k, (None, None))[0] is None for k in ("advancers", "decliners", "unchanged")):
+        log("twse:breadth", "failure", as_of=as_of, detail="上漲／下跌／持平其中一項缺漏或無法解析")
+        return None
+
+    adv, dec, unch = got["advancers"][0], got["decliners"][0], got["unchanged"][0]
+    lo, hi = config.BREADTH_TOTAL_RANGE
+    if not (lo <= adv + dec + unch <= hi):
+        log("twse:breadth", "failure", as_of=as_of, detail=f"家數合計 {adv + dec + unch} 超出合理範圍，拒收")
+        return None
+    log("twse:breadth", "success", as_of=as_of,
+        detail=f"股票欄：上漲{adv}(漲停{got['advancers'][1]}) 下跌{dec}(跌停{got['decliners'][1]}) 持平{unch}")
+    return [{"market": "TW", "as_of": as_of, "advancers": adv, "decliners": dec,
+             "unchanged": unch, "source": config.BREADTH_SOURCE}]
 
 
 # ---------------------------------------------------------------- 探測（只讀）
@@ -372,11 +436,11 @@ def twd_fallback_chain():
 
 
 # ---------------------------------------------------------------- 寫入
-def persist(dry_run, macro_rows, twd_row, tw_rows=None):
+def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
                                          f"台幣 {1 if twd_row and not twd_row.get('stale_fallback') else 0} 筆、"
-                                         f"台股 {len(tw_rows or [])} 筆）")
+                                         f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆）")
         return
     if not sb_ready():
         log("persist", "skipped", detail="未設定 SUPABASE_URL / SUPABASE_SERVICE_KEY，只寫本機檔，未寫正式資料庫")
@@ -390,6 +454,9 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None):
     if tw_rows:
         ok, msg = sb_upsert("market_stats", tw_rows, "market,as_of,source")
         log("persist:market_stats", "success" if ok else "failure", detail=msg)
+    if breadth_rows:
+        ok, msg = sb_upsert("market_stats", breadth_rows, "market,as_of,source")
+        log("persist:market_breadth", "success" if ok else "failure", detail=msg)
 
 
 def flush_log(dry_run):
@@ -416,7 +483,7 @@ def sb_upsert_plain(table, rows):
 def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
-    macro_rows, twd_row, tw_rows = [], None, None
+    macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -427,15 +494,14 @@ def run_job(job, dry_run=False):
     if job in ("full", "tw_close"):
         twd_row = twd_fallback_chain()
         tw_rows = twse_market()
-    if job == "tw_close":
-        log("tw_breadth", "skipped", detail="台股漲跌家數（廣度）尚未接，不用其他數字冒充")
+        breadth_rows = twse_breadth()
     if job == "tw_probe":
         probe_twse()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
-    persist(dry_run, macro_rows, twd_row, tw_rows)
-    return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows}
+    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows)
+    return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows, "tw_breadth": breadth_rows}
 
 
 def main(argv=None):

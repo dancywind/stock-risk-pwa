@@ -12,6 +12,8 @@ EXCHANGERATE_API = "https://open.er-api.com/v6/latest/USD"
 # 不帶 date 參數＝當月；帶 date=YYYYMM01＝指定月份。
 TWSE_FMTQIK = "https://www.twse.com.tw/rwd/en/afterTrading/FMTQIK"
 TAIEX_RANGE = (1000.0, 100000.0)  # 加權指數合理範圍，超出視為壞資料
+BREADTH_TOTAL_RANGE = (300, 5000)  # 股票欄「上漲+下跌+持平」合計的合理範圍，超出視為壞資料
+BREADTH_SOURCE = "TWSE MI_INDEX 股票"
 
 # 台幣備用鏈，順序固定
 TWD_LAYERS = [
