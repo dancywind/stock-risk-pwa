@@ -21,6 +21,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
@@ -1670,6 +1671,79 @@ def tw_crash_check(days, dry_run=False, threshold=None):
     return found if ok else None
 
 
+def cftc_cot():
+    """CFTC COT（Traders in Financial Futures，期貨 only）標普 500 合併合約（標準、E-mini、微型）最近兩週。
+    三類交易人（交易商、資產管理機構、槓桿基金）的多空口數；報告日是週二，週五才公布，所以資料日一定落後。"""
+    q = urllib.parse.urlencode({"$limit": 2, "$order": "report_date_as_yyyy_mm_dd DESC", "market_and_exchange_names": config.CFTC_MARKET},
+                               quote_via=urllib.parse.quote)
+    rows, err = fetch_json(config.CFTC_TFF_BASE + "?" + q)
+    if rows is None or not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        log("cftc:cot", "failure", detail=_clip(f"抓取失敗或格式非預期: {err or str(rows)[:120]}"))
+        return None
+    keys = {"open_interest": "open_interest_all", "dealer_long": "dealer_positions_long_all", "dealer_short": "dealer_positions_short_all",
+            "asset_mgr_long": "asset_mgr_positions_long", "asset_mgr_short": "asset_mgr_positions_short",
+            "lev_long": "lev_money_positions_long", "lev_short": "lev_money_positions_short"}
+    out, bad = [], 0
+    for r in rows:
+        if r.get("market_and_exchange_names") != config.CFTC_MARKET:
+            bad += 1
+            continue
+        d = str(r.get("report_date_as_yyyy_mm_dd", ""))[:10]
+        ok, why = validate_close_date(d if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) else None)
+        vals = {k: parse_number(r.get(src)) for k, src in keys.items()}
+        if (not ok or None in vals.values() or vals["open_interest"] <= 0 or any(v < 0 for v in vals.values())
+                or any(vals[k] > vals["open_interest"] for k in ("dealer_long", "dealer_short", "asset_mgr_long", "asset_mgr_short", "lev_long", "lev_short"))):
+            bad += 1
+            continue
+        out.append(dict(vals, report_date=d, market="S&P 500 Consolidated", source="CFTC TFF 期貨 only（publicreporting.cftc.gov）"))
+    if not out:
+        log("cftc:cot", "failure", detail=f"{len(rows)} 列都沒通過驗證（市場名稱、日期、口數）")
+        return None
+    out.sort(key=lambda r: r["report_date"], reverse=True)
+    n = lambda r, k: r[k + "_long"] - r[k + "_short"]
+    log("cftc:cot", "success", as_of=out[0]["report_date"],
+        detail=f"報告日 {out[0]['report_date']}：槓桿基金淨 {n(out[0], 'lev'):+,.0f}、資產管理機構淨 {n(out[0], 'asset_mgr'):+,.0f}、交易商淨 {n(out[0], 'dealer'):+,.0f}（口）" + (f"；{bad} 列未通過驗證" if bad else ""))
+    return out
+
+
+def _now_et():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York"))
+
+
+def cboe_putcall():
+    """CBOE 每日市場統計的 Put/Call 比率。只收『已收盤並結算』的交易日：美東日期早於今天，或今天但已過 17:00。
+    由新到舊試最多 5 個平日，第一個有資料的就用，日期用它自己的交易日。"""
+    now = _now_et()
+    cands, d = [], now.date()
+    while len(cands) < 5 and (now.date() - d).days < 10:
+        if d.weekday() < 5 and (d < now.date() or now.hour >= 17):
+            cands.append(d)
+        d -= timedelta(days=1)
+    tried = []
+    for d in cands:
+        status, ctype, body, err = fetch_raw(config.CBOE_DAILY_URL.format(ymd=d.isoformat()), timeout=config.PROBE_TIMEOUT)
+        tried.append(f"{d}:{status}")
+        if status != 200:
+            time.sleep(1)
+            continue
+        try:
+            j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        ratios = {str(x.get("name", "")).strip().upper(): parse_number(x.get("value")) for x in (j.get("ratios") or []) if isinstance(x, dict)} if isinstance(j, dict) else {}
+        total = ratios.get("TOTAL PUT/CALL RATIO")
+        if total is None or not (0 < total < 20):
+            continue
+        pick = lambda name: ratios.get(name) if ratios.get(name) and 0 < ratios[name] < 20 else None
+        row = {"as_of": d.isoformat(), "total_pc": total, "index_pc": pick("INDEX PUT/CALL RATIO"), "equity_pc": pick("EQUITY PUT/CALL RATIO"),
+               "etp_pc": pick("EXCHANGE TRADED PRODUCTS PUT/CALL RATIO"), "source": "CBOE 每日市場統計"}
+        log("cboe:putcall", "success", as_of=row["as_of"], detail=f"總比率 {total}；指數 {row['index_pc']}；ETP {row['etp_pc']}；股票 {row['equity_pc'] if row['equity_pc'] is not None else '查不到'}")
+        return [row]
+    log("cboe:putcall", "no_new_data", detail=_clip(f"最近 {len(cands)} 個平日都沒有可用資料（{', '.join(tried)}）"))
+    return None
+
+
 def probe_us_pressure():
     """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
     1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
@@ -1792,13 +1866,14 @@ def twd_fallback_chain():
 
 # ---------------------------------------------------------------- 寫入
 def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_rows=None, margin_rows=None,
-            futures_rows=None, basis_rows=None, price_rows=None):
+            futures_rows=None, basis_rows=None, price_rows=None, cot_rows=None, putcall_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
                                          f"台幣 {len([r for r in (twd_row if isinstance(twd_row, list) else [twd_row]) if r and not r.get('stale_fallback')])} 筆、"
                                          f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆、"
                                          f"外資 {len(inst_rows or [])} 筆、融資 {len(margin_rows or [])} 筆、"
-                                         f"期貨部位 {len(futures_rows or [])} 筆、基差 {len(basis_rows or [])} 筆、持股現價 {len(price_rows or [])} 筆）")
+                                         f"期貨部位 {len(futures_rows or [])} 筆、基差 {len(basis_rows or [])} 筆、持股現價 {len(price_rows or [])} 筆、"
+                                         f"COT {len(cot_rows or [])} 筆、Put/Call {len(putcall_rows or [])} 筆）")
         return
     if not sb_ready():
         log("persist", "skipped", detail="未設定 SUPABASE_URL / SUPABASE_SERVICE_KEY，只寫本機檔，未寫正式資料庫")
@@ -1832,6 +1907,12 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_
     if price_rows:
         ok, msg = sb_upsert("stock_prices", price_rows, "market,code,as_of,source")
         log("persist:stock_prices", "success" if ok else "failure", detail=msg)
+    if cot_rows:
+        ok, msg = sb_upsert("us_cot", cot_rows, "report_date,market")
+        log("persist:us_cot", "success" if ok else "failure", detail=msg)
+    if putcall_rows:
+        ok, msg = sb_upsert("us_putcall", putcall_rows, "as_of")
+        log("persist:us_putcall", "success" if ok else "failure", detail=msg)
 
 
 def flush_log(dry_run):
@@ -1859,7 +1940,7 @@ def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
-    inst_rows = margin_rows = futures_rows = basis_rows = price_rows = None
+    inst_rows = margin_rows = futures_rows = basis_rows = price_rows = cot_rows = putcall_rows = None
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -1877,6 +1958,8 @@ def run_job(job, dry_run=False):
         margin_rows = twse_margin()
         futures_rows = taifex_futures()
         basis_rows = taifex_basis(tw_rows)
+        cot_rows = cftc_cot()
+        putcall_rows = cboe_putcall()
         hold, herr = load_holdings()
         if hold is None:
             log("prices:holdings", "skipped", detail=_clip(f"{herr}；不抓持股現價"))
@@ -1901,10 +1984,10 @@ def run_job(job, dry_run=False):
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
-    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows, basis_rows, price_rows)
+    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows, basis_rows, price_rows, cot_rows, putcall_rows)
     return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows,
             "tw_breadth": breadth_rows, "tw_institutional": inst_rows, "tw_margin": margin_rows,
-            "tw_futures": futures_rows, "tw_basis": basis_rows, "prices": price_rows}
+            "tw_futures": futures_rows, "tw_basis": basis_rows, "prices": price_rows, "us_cot": cot_rows, "us_putcall": putcall_rows}
 
 
 def main(argv=None):

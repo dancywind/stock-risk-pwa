@@ -130,6 +130,10 @@ CBOE_PC_URLS = {
     "totalpc_csv": "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv",
     "daily_json": "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options",
 }
+# 已用真實回傳驗證：CFTC TFF（期貨 only）標普 500 合併合約；CBOE 每日市場統計 JSON
+CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
+CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
+CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill")
