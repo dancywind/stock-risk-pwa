@@ -1485,6 +1485,45 @@ def tw_ranges(price_rows, as_of_today=None):
     return price_rows
 
 
+def tw_breadth_update(dry_run=False, max_days=10):
+    """呼叫資料庫函式 compute_tw_breadth 算台股廣度指標。最新一個兩市場都完成的交易日一定重算；
+    歷史涵蓋滿 330 天後，才補最近 60 天缺的日期（避免用不完整歷史算出一堆之後會變的舊列）。"""
+    if not sb_ready():
+        log("tw_breadth", "skipped", detail="未設定 Supabase，不計算廣度指標")
+        return None
+    days, err = sb_request("GET", "tw_hist_days?select=market,as_of&status=eq.ok&order=as_of.desc&limit=1000")
+    if days is None:
+        log("tw_breadth", "failure", detail=_clip(f"讀取回補進度失敗：{err}"))
+        return None
+    by_date = {}
+    for r in days:
+        by_date.setdefault(r["as_of"], set()).add(r["market"])
+    complete = sorted((d for d, ms in by_date.items() if {"TWSE", "TPEX"} <= ms), reverse=True)
+    if not complete:
+        log("tw_breadth", "no_new_data", detail="還沒有上市與上櫃都完成回補的交易日")
+        return None
+    latest = complete[0]
+    todo = [latest]
+    cover = (date.fromisoformat(latest) - date.fromisoformat(complete[-1])).days
+    if cover >= 330:
+        have, err = sb_request("GET", f"tw_breadth_ma?select=as_of&as_of=gte.{(date.today() - timedelta(days=60)).isoformat()}&limit=1000")
+        have_set = {r["as_of"] for r in (have or [])}
+        todo += [d for d in complete if d != latest and (date.today() - date.fromisoformat(d)).days <= 60 and d not in have_set][:max_days]
+    done = 0
+    for d in todo:
+        if dry_run:
+            log("tw_breadth", "skipped", as_of=d, detail="--dry-run：不計算")
+            continue
+        res, err = sb_request("POST", "rpc/compute_tw_breadth", {"d": d})
+        if res is None:
+            log("tw_breadth", "failure", as_of=d, detail=_clip(f"呼叫 compute_tw_breadth 失敗：{err}（請先執行 new_tables_breadth.sql）"))
+            return None
+        done += 1
+    if done:
+        log("tw_breadth", "success", as_of=todo[0], detail=f"已計算 {done} 個日期（最新 {latest}，歷史涵蓋 {cover} 天）")
+    return done
+
+
 def probe_hist2():
     """只讀探測：Nasdaq 對槓桿 ETF 的歷史行情端點、櫃買中心『上櫃股票每日收盤行情』的完整欄位。"""
     hold, herr = load_holdings()
@@ -1643,8 +1682,10 @@ def run_job(job, dry_run=False):
         probe_hist2()
     if job == "tw_backfill":
         tw_backfill(dry_run=dry_run)
+        tw_breadth_update(dry_run=dry_run, max_days=40)
     if job in ("full", "tw_close") and not dry_run:
         tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7)
+        tw_breadth_update(dry_run=False, max_days=10)
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
