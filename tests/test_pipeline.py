@@ -743,7 +743,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_hist2") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_us_pressure") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -1746,6 +1746,142 @@ def test_backfill_returns_new_days_and_crash_check_wiring():
             assert cc.call_args[0][0] == ["N1", "R"] and cc.call_args.kwargs == {"dry_run": True}
     finally:
         for p_ in patches: p_.stop()
+
+
+# ---------------------------------------------------------------- 槓桿 ETF 52 週（Nasdaq 歷史行情，含分割偵測）
+def etf_hist_rows(n=260, start_close=20.0, jump_at=None, jump_ratio=1.0, end_date=None, hi_spike=None):
+    end = end_date or (TODAY - timedelta(days=1))
+    while end.weekday() >= 5:
+        end -= timedelta(days=1)
+    days, d = [], end
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.sort()
+    rows, c = [], start_close
+    for i, day in enumerate(days):
+        if jump_at is not None and i == jump_at:
+            c *= jump_ratio
+        else:
+            c *= 1.002 if i % 2 else 0.999
+        high = c * 1.03 if hi_spike != i else c * 1.5
+        rows.append({"date": day.strftime("%m/%d/%Y"), "close": f"{c:.3f}", "volume": "1", "open": f"{c:.3f}", "high": f"${high:.3f}", "low": f"{c * 0.97:.3f}"})
+    return list(reversed(rows))                                     # Nasdaq 由新到舊
+
+
+def hist_body(rows):
+    return json.dumps({"data": {"symbol": "MUU", "tradesTable": {"rows": rows}}}).encode()
+
+
+def run_etf_range(rows, close, price_date=None):
+    pd_ = price_date or (TODAY - timedelta(days=1)).isoformat()
+    while date.fromisoformat(pd_).weekday() >= 5:
+        pd_ = (date.fromisoformat(pd_) - timedelta(days=1)).isoformat()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", hist_body(rows), "")):
+        return fetch.nasdaq_hist_range("MUU", "etf", close, pd_)
+
+
+def test_etf_range_uses_highs_lows_when_clean():
+    rows = etf_hist_rows()
+    last = float(rows[0]["close"])
+    lo, hi, why = run_etf_range(rows, last)
+    assert lo == min(float(r["low"]) for r in rows) and hi == max(float(r["high"].replace("$", "")) for r in rows)
+    assert "沒有分割跳動" in why and "260 個交易日" in why
+
+
+def test_etf_range_rejects_unadjusted_split_and_short_or_stale_history():
+    rows = etf_hist_rows(jump_at=120, jump_ratio=15.0)                      # 反向分割沒調整：1.8 → 27 的 15 倍跳動（跟 MUU 的情況一樣）
+    lo, hi, why = run_etf_range(rows, float(rows[0]["close"]))
+    assert lo is None and "分割" in why and "15.00 倍" in why
+    rows = etf_hist_rows(jump_at=120, jump_ratio=0.1)                       # 一股分成十股
+    assert run_etf_range(rows, float(rows[0]["close"]))[0] is None
+    rows = etf_hist_rows(n=120)                                             # 歷史太短（這檔 ETF 才上市不到一年）
+    lo, hi, why = run_etf_range(rows, float(rows[0]["close"]))
+    assert lo is None and "不足以算 52 週" in why
+    rows = etf_hist_rows(end_date=TODAY - timedelta(days=20))               # 最新一筆太舊
+    assert "差太多" in run_etf_range(rows, float(rows[0]["close"]))[2]
+    rows = etf_hist_rows()
+    assert "不在歷史區間" in run_etf_range(rows, 999.0)[2]                  # 收盤價跑出區間
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timed out")):
+        assert fetch.nasdaq_hist_range("MUU", "etf", 1.0, D(1))[0] is None
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>", "")):
+        assert "不是 JSON" in fetch.nasdaq_hist_range("MUU", "etf", 1.0, D(1))[2]
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", hist_body([]), "")):
+        assert "沒有可用" in fetch.nasdaq_hist_range("MUU", "etf", 1.0, D(1))[2]
+
+
+def test_nasdaq_prices_fills_etf_range_from_history_but_not_for_plain_stocks():
+    ts = (TODAY - timedelta(days=1)).strftime("%b %d, %Y").replace(" 0", " ")
+    hist = etf_hist_rows()
+    close = float(hist[0]["close"])
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        seen.append(url)
+        if "/historical" in url:
+            return 200, "application/json", hist_body(hist), ""
+        d = {"data": {"marketStatus": "Closed", "assetClass": "ETF", "primaryData": {"lastSalePrice": f"${close}", "netChange": "-1", "lastTradeTimestamp": ts, "isRealTime": False}, "keyStats": None}}
+        return 200, "application/json", json.dumps(d).encode(), ""
+    muu = [{"market": "US", "symbol": "MUU", "name": "x", "kind": "leveraged_etf", "pos_key": "MUU"}]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        r = fetch.nasdaq_prices(muu)[0]
+    assert r["low_52w"] is not None and "Nasdaq 歷史行情" in r["range_source"]
+    assert any("/historical" in u and "assetclass=etf" in u for u in seen)            # 歷史行情沿用報價成功的分類
+    # 反向分割沒調整 → 區間不採用，價格本身仍照存，原因寫進紀錄
+    bad = etf_hist_rows(jump_at=120, jump_ratio=15.0)
+    def raw2(url, timeout=None, headers=None):
+        if "/historical" in url:
+            return 200, "application/json", hist_body(bad), ""
+        return raw(url)
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw2), mock.patch.object(fetch.time, "sleep"):
+        r = fetch.nasdaq_prices(muu)[0]
+    assert r["high_52w"] is None and r["range_source"] is None and r["close"] == close
+    assert "52 週區間查不到" in fetch.LOG[-1]["detail"] and "分割" in fetch.LOG[-1]["detail"]
+    # 一般股票沒有 keyStats 也不去打歷史行情（避免多餘請求）
+    calls = []
+    def raw3(url, timeout=None, headers=None):
+        calls.append(url); return raw(url)
+    stock = [{"market": "US", "symbol": "ORCL", "name": "x", "kind": "stock", "pos_key": "ORCL"}]
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw3), mock.patch.object(fetch.time, "sleep"):
+        fetch.nasdaq_prices(stock)
+    assert not any("/historical" in u for u in calls)
+
+
+# ---------------------------------------------------------------- 美股資金壓力來源探測
+def test_probe_us_pressure_logs_three_sources():
+    reset()
+    cftc = json.dumps([{"market_and_exchange_names": "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE", "report_date_as_yyyy_mm_dd": "2026-10-27T00:00:00.000",
+                        "lev_money_positions_long": "100", "lev_money_positions_short": "300"}]).encode()
+    finra = b"<html><body><table><tr><td>Debit Balances in Customers' Securities Margin Accounts</td><td>1,234,567</td></tr></table></body></html>"
+    def raw(url, timeout=None, headers=None):
+        if "cftc.gov" in url: return 200, "application/json", cftc, ""
+        if "finra.org" in url: return 200, "text/html", finra, ""
+        if "totalpc.csv" in url: return 200, "text/csv", b"DATE,CALL,PUT,TOTAL,P/C Ratio\n2019-10-04,1,1,2,0.9\n", ""
+        return 404, "text/html", b"not found", "HTTP 404"
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_us_pressure()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert by["probe:cftc_tff"]["status"] == "success" and "S&P 500 Consolidated" in by["probe:cftc_tff"]["detail"] and "2026-10-27" in by["probe:cftc_tff"]["detail"]
+    assert "lev_money_positions_long" in by["probe:cftc_tff_row"]["detail"]
+    assert by["probe:finra_margin"]["status"] == "success" and "1,234,567" in by["probe:finra_margin"]["detail"]
+    assert by["probe:cboe_pc:totalpc_csv"]["status"] == "success" and "2019-10-04" in by["probe:cboe_pc:totalpc_csv"]["detail"]
+    assert by["probe:cboe_pc:daily_json"]["status"] == "failure"
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_us_pressure_failures_and_js_only_finra_page():
+    reset()
+    def raw(url, timeout=None, headers=None):
+        if "finra.org" in url: return 200, "text/html", b"<html><script>app()</script></html>", ""
+        return None, "", b"", "timed out"
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw):
+        fetch.probe_us_pressure()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert by["probe:cftc_tff"]["status"] == "failure" and "連線失敗" in by["probe:cftc_tff"]["detail"]
+    assert by["probe:finra_margin"]["status"] == "failure" and "找不到 Debit Balances" in by["probe:finra_margin"]["detail"]
 
 
 def test_twd_layer_order_fixed():
