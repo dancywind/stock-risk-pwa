@@ -52,6 +52,12 @@ TWSE_MI_MARGN = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectTyp
 PROBE_URLS = {"BFI82U": TWSE_BFI82U, "MI_MARGN": TWSE_MI_MARGN}
 # 期交所開放資料說明文件（網址依 data.gov.tw 官方資料集頁面；先前的 /v1/swagger.json 回傳非 JSON）
 TAIFEX_SWAGGER = "https://openapi.taifex.com.tw/swagger.json"
+# 期交所「期貨市場三大法人-區分各期貨契約-依日期」。網址與欄位名稱已用真實回傳驗證。
+# 必須帶 Accept: application/json（fetch_json 預設已帶）。
+TAIFEX_FUTURES_URL = ("https://openapi.taifex.com.tw/v1/"
+                      "MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate")
+TAIFEX_CONTRACT = "臺股期貨"      # 只取大台指（TX）；小型、微型台指目前不計
+TAIFEX_NET_LIMIT = 200000         # 單一身份別淨未平倉口數合理上限，超過視為壞資料
 # 外資買賣超（新台幣元）合理上限；超過視為壞資料
 INST_NET_LIMIT = 2e12
 INST_SIDE_LIMIT = 5e12

@@ -500,6 +500,65 @@ def twse_margin():
              "margin_units": units, "short_units": short, "source": "TWSE MI_MARGN"}]
 
 
+def taifex_futures():
+    """期交所三大法人「臺股期貨」未平倉（口數）。每個身份別一列（自營商、投信、外資…）。
+    外資列以身份別名稱開頭為「外資」辨識；找不到就失敗，不猜。
+    多方－空方 必須等於淨額，對不上就拒收。"""
+    rows, err = fetch_json(config.TAIFEX_FUTURES_URL)
+    if rows is None:
+        log("taifex:futures", "failure", detail=f"抓取失敗: {err}")
+        return None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        log("taifex:futures", "failure", detail="回傳不是預期的資料列清單")
+        return None
+    need = ("Date", "ContractCode", "Item", "OpenInterest(Long)", "OpenInterest(Short)", "OpenInterest(Net)")
+    if any(k not in rows[0] for k in need):
+        log("taifex:futures", "failure", detail=f"欄位與預期不符: {list(rows[0].keys())[:12]}")
+        return None
+
+    dated = [(twse_ymd_to_iso(r.get("Date")), r) for r in rows if isinstance(r, dict)]
+    dates = [d for d, _ in dated if d]
+    if not dates:
+        log("taifex:futures", "failure", detail="找不到有效日期")
+        return None
+    as_of = max(dates)
+    ok, why = validate_close_date(as_of)
+    if not ok:
+        log("taifex:futures", "failure", as_of=as_of, detail=f"資料日期異常: {why}")
+        return None
+
+    picked, rejected, investors = [], 0, []
+    for d, r in dated:
+        if d != as_of or r.get("ContractCode") != config.TAIFEX_CONTRACT:
+            continue
+        investor = str(r.get("Item", "")).strip()
+        investors.append(investor)
+        lng = parse_number(r.get("OpenInterest(Long)"))
+        sht = parse_number(r.get("OpenInterest(Short)"))
+        net = parse_number(r.get("OpenInterest(Net)"))
+        if (None in (lng, sht, net) or lng < 0 or sht < 0 or abs(net - (lng - sht)) > 0
+                or abs(net) > config.TAIFEX_NET_LIMIT):
+            rejected += 1
+            continue
+        picked.append({
+            "as_of": as_of, "contract": config.TAIFEX_CONTRACT, "investor": investor,
+            "oi_long": lng, "oi_short": sht, "oi_net": net,
+            "oi_net_value_thousand": parse_number(r.get("ContractValueofOpenInterest(Net)(Thousands)")),
+            "source": "TAIFEX 三大法人-區分各期貨契約",
+        })
+    if rejected:
+        log("taifex:futures", "failure", as_of=as_of, detail=f"{rejected} 列驗證不過（多空與淨額對不上或數字異常），已拒收")
+    foreign = [p for p in picked if p["investor"].startswith("外資")]
+    if not foreign:
+        log("taifex:futures", "failure", as_of=as_of,
+            detail=f"找不到外資列；{config.TAIFEX_CONTRACT} 現有身份別：{investors}")
+        return None
+    f = foreign[0]
+    log("taifex:futures", "success", as_of=as_of,
+        detail=f"{config.TAIFEX_CONTRACT} {f['investor']} 淨未平倉 {f['oi_net']:+,.0f} 口（多{f['oi_long']:,.0f}／空{f['oi_short']:,.0f}）")
+    return picked
+
+
 # ---------------------------------------------------------------- 探測（只讀）
 def _clip(text, n=900):
     text = str(text)
@@ -651,12 +710,14 @@ def twd_fallback_chain():
 
 
 # ---------------------------------------------------------------- 寫入
-def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_rows=None, margin_rows=None):
+def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_rows=None, margin_rows=None,
+            futures_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
                                          f"台幣 {1 if twd_row and not twd_row.get('stale_fallback') else 0} 筆、"
                                          f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆、"
-                                         f"外資 {len(inst_rows or [])} 筆、融資 {len(margin_rows or [])} 筆）")
+                                         f"外資 {len(inst_rows or [])} 筆、融資 {len(margin_rows or [])} 筆、"
+                                         f"期貨部位 {len(futures_rows or [])} 筆）")
         return
     if not sb_ready():
         log("persist", "skipped", detail="未設定 SUPABASE_URL / SUPABASE_SERVICE_KEY，只寫本機檔，未寫正式資料庫")
@@ -679,6 +740,9 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_
     if margin_rows:
         ok, msg = sb_upsert("tw_margin", margin_rows, "as_of,source")
         log("persist:tw_margin", "success" if ok else "failure", detail=msg)
+    if futures_rows:
+        ok, msg = sb_upsert("tw_futures_position", futures_rows, "as_of,contract,investor,source")
+        log("persist:tw_futures_position", "success" if ok else "failure", detail=msg)
 
 
 def flush_log(dry_run):
@@ -706,7 +770,7 @@ def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
-    inst_rows = margin_rows = None
+    inst_rows = margin_rows = futures_rows = None
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -720,15 +784,17 @@ def run_job(job, dry_run=False):
         breadth_rows = twse_breadth()
         inst_rows = twse_institutional()
         margin_rows = twse_margin()
+        futures_rows = taifex_futures()
     if job == "tw_probe":
         probe_twse()
         probe_extra()
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
-    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows)
+    persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows)
     return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows,
-            "tw_breadth": breadth_rows, "tw_institutional": inst_rows, "tw_margin": margin_rows}
+            "tw_breadth": breadth_rows, "tw_institutional": inst_rows, "tw_margin": margin_rows,
+            "tw_futures": futures_rows}
 
 
 def main(argv=None):
