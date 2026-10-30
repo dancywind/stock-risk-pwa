@@ -114,6 +114,12 @@ HIST_DAILY_DAYS = 3               # 每日排程順手補最近幾個平日
 RANGE52_MIN_COVERAGE_DAYS = 330   # 歷史涵蓋不到這麼多天，就不算 52 週高低
 RANGE52_MIN_ROWS = 200
 NASDAQ_HIST_URL = "https://api.nasdaq.com/api/quote/{symbol}/historical?assetclass={assetclass}&fromdate={fromdate}&limit=400&todate={todate}"
+# 台幣：FRED 官方收盤落後超過這麼多天，就另外抓較新的即期參考價（只當參考，不進收盤歷史）
+TWD_LAG_DAYS = 2
+# 大跌檢視清單（台灣：單日跌幅 9% 以上自動加入，一律標「待確認」）
+CRASH_DROP_PCT = 9.0
+CRASH_RECENT_DAYS = 10            # 回補工作每次重新檢查最近幾個完成的交易日
+CRASH_PREV_MAX_GAP_DAYS = 10      # 前一個交易日距離超過這麼多天，就不比較（避免拿很舊的價格算跌幅）
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill")

@@ -1427,6 +1427,7 @@ def tw_backfill(dry_run=False, max_days=None, window_days=None):
         return None
     done = {(r["market"], r["as_of"]) for r in done_rows}
     total_rows = days = 0
+    new_days = []
     d = today
     while d >= start and days < max_days:
         if d.weekday() < 5:
@@ -1437,7 +1438,7 @@ def tw_backfill(dry_run=False, max_days=None, window_days=None):
                     time.sleep(config.HIST_SLEEP)
                     if status.startswith("error:"):
                         log(f"hist:{m}", "failure", as_of=d.isoformat(), detail=_clip(status[6:] + "；已停止本次回補，不繼續打請求"))
-                        return {"days": days, "rows": total_rows, "stopped": True}
+                        return {"days": days, "rows": total_rows, "stopped": True, "new_days": new_days}
                     recent = (today - d).days <= 2
                     if status == "holiday" and recent:
                         log(f"hist:{m}", "no_new_data", as_of=d.isoformat(), detail="近 2 天內沒有資料（可能尚未公布），不標成休市")
@@ -1456,10 +1457,12 @@ def tw_backfill(dry_run=False, max_days=None, window_days=None):
                         log(f"hist:{m}", "failure", as_of=d.isoformat(), detail=_clip(f"進度寫入失敗：{msg}"))
                         return None
                     total_rows += len(rows)
+                    if status == "ok" and d.isoformat() not in new_days:
+                        new_days.append(d.isoformat())
                 days += 1
         d -= timedelta(days=1)
     log("tw_backfill", "success", detail=f"本次處理 {days} 個日期、寫入 {total_rows} 筆；回補範圍從 {start} 到今天，尚未完成的日期下次繼續")
-    return {"days": days, "rows": total_rows}
+    return {"days": days, "rows": total_rows, "new_days": new_days}
 
 
 def tw_ranges(price_rows, as_of_today=None):
@@ -1524,6 +1527,98 @@ def tw_breadth_update(dry_run=False, max_days=10):
     return done
 
 
+def _hist_day_rows(day_iso):
+    """讀 tw_hist 某一天全部個股的收盤（每次最多 1000 列，所以分頁）。"""
+    rows, off = [], 0
+    while off <= 6000:
+        part, err = sb_request("GET", f"tw_hist?select=market,code,close&as_of=eq.{day_iso}&order=market.asc,code.asc&limit=1000&offset={off}")
+        if part is None:
+            return None, err
+        rows += part
+        if len(part) < 1000:
+            return rows, ""
+        off += 1000
+    return rows, ""
+
+
+def _tw_names(candidates):
+    """只替入選的個股查名稱（證交所、櫃買中心各最多一次請求）。查不到就回傳空字串，不猜。"""
+    names = {}
+    if any(c["market"] == "TWSE" for c in candidates):
+        rows, _ = fetch_json(config.TWSE_AVG_URL)
+        for r in (rows if isinstance(rows, list) else []):
+            names[("TWSE", str(r.get("Code", "")).strip())] = str(r.get("Name", "")).strip()
+    if any(c["market"] == "TPEX" for c in candidates):
+        rows, _ = fetch_json(config.TPEX_QUOTES_URL)
+        for r in (rows if isinstance(rows, list) else []):
+            names[("TPEX", str(r.get("SecuritiesCompanyCode", "")).strip())] = str(r.get("CompanyName", "")).strip()
+    return names
+
+
+def _recent_complete_days(n):
+    """資料庫裡上市與上櫃都完成的最近 n 個交易日（新到舊）。"""
+    if not sb_ready():
+        return []
+    rows, _ = sb_request("GET", "tw_hist_days?select=market,as_of&status=eq.ok&order=as_of.desc&limit=400")
+    by = {}
+    for r in (rows or []):
+        by.setdefault(r["as_of"], set()).add(r["market"])
+    return sorted((d for d, m in by.items() if {"TWSE", "TPEX"} <= m), reverse=True)[:n]
+
+
+def tw_crash_check(days, dry_run=False, threshold=None):
+    """台股大跌檢視（第一步，自動加入）：單日收盤較前一個交易日跌 9% 以上，加入 crash_candidates，一律「待確認」。
+    跌幅由收盤價換算；當天若除權息，跌幅可能是參考價調整造成，所以每筆都帶這個提醒。不做任何分類，也不碰你的人工分類。"""
+    threshold = threshold or config.CRASH_DROP_PCT
+    if not sb_ready():
+        log("tw_crash", "skipped", detail="未設定 Supabase，不檢查")
+        return None
+    done, err = sb_request("GET", "tw_hist_days?select=market,as_of&status=eq.ok&order=as_of.desc&limit=1000")
+    if done is None:
+        log("tw_crash", "failure", detail=_clip(f"讀取回補進度失敗：{err}"))
+        return None
+    by = {}
+    for r in done:
+        by.setdefault(r["as_of"], set()).add(r["market"])
+    complete = sorted((d for d, m in by.items() if {"TWSE", "TPEX"} <= m), reverse=True)
+    found = []
+    for d in sorted(set(days)):
+        if d not in complete:
+            continue
+        prev = next((x for x in complete if x < d), None)
+        if prev is None or (date.fromisoformat(d) - date.fromisoformat(prev)).days > config.CRASH_PREV_MAX_GAP_DAYS:
+            log("tw_crash", "no_new_data", as_of=d, detail="找不到足夠近的前一個交易日，不比較")
+            continue
+        cur, e1 = _hist_day_rows(d)
+        pre, e2 = _hist_day_rows(prev)
+        if cur is None or pre is None:
+            log("tw_crash", "failure", as_of=d, detail=_clip(f"讀取歷史失敗：{e1 or e2}"))
+            return None
+        pm = {(r["market"], r["code"]): float(r["close"]) for r in pre if r.get("close")}
+        for r in cur:
+            p, c = pm.get((r["market"], r["code"])), float(r["close"]) if r.get("close") else None
+            if not p or not c or p <= 0 or c <= 0:
+                continue
+            drop = round((c / p - 1) * 100, 4)           # 先四捨五入，避免剛好 9.0% 因浮點誤差被漏掉
+            if drop <= -threshold:
+                found.append({"as_of": d, "market": r["market"], "code": r["code"], "close": c, "prev_close": p, "drop_pct": round(drop, 2)})
+    if not found:
+        log("tw_crash", "success", detail=f"檢查 {len(set(days))} 個交易日，沒有單日跌幅達 {threshold}% 的個股")
+        return []
+    names = _tw_names(found)
+    for f in found:
+        f["name"] = names.get((f["market"], f["code"]), "")
+        f["note"] = "依收盤價換算；若當天除權息，跌幅可能是參考價調整造成，原因待確認"
+        f["source"] = "自建歷史（證交所、櫃買中心）"
+    if dry_run:
+        log("tw_crash", "skipped", detail=f"--dry-run：找到 {len(found)} 檔，不寫入")
+        return found
+    ok, msg = sb_upsert("crash_candidates", found, "as_of,market,code")
+    log("tw_crash", "success" if ok else "failure",
+        detail=_clip(f"找到 {len(found)} 檔單日跌幅達 {threshold}%（{', '.join(f['code'] for f in found[:8])}）；{msg}"))
+    return found if ok else None
+
+
 def probe_hist2():
     """只讀探測：Nasdaq 對槓桿 ETF 的歷史行情端點、櫃買中心『上櫃股票每日收盤行情』的完整欄位。"""
     hold, herr = load_holdings()
@@ -1553,6 +1648,23 @@ def probe_hist2():
         log("probe:hist2_tpex_fields", "success" if t else "failure", detail=_clip(f"{day}｜date={t.get('date')}｜欄位 {t.get('fields')}｜首列 {(t.get('data') or [None])[0]}"))
     except (ValueError, UnicodeDecodeError, AttributeError):
         log("probe:hist2_tpex_fields", "failure", detail=_clip(f"HTTP {status}｜{err}｜不是 JSON"))
+
+
+def twd_supplement(primary):
+    """FRED 官方收盤落後時，另外抓 ExchangeRate-API 的即期參考價（第 5 層）。
+    只當較新的參考：標示不是官方收盤價，不進收盤歷史，不改動 FRED 那一列。"""
+    if not isinstance(primary, dict) or primary.get("stale_fallback") or primary.get("layer") != 3:
+        return None
+    age = (date.today() - date.fromisoformat(primary["as_of"])).days
+    if age < config.TWD_LAG_DAYS:
+        return None
+    spot = exchangerate_twd()
+    if not spot:
+        return None
+    log("twd_supplement", "success", as_of=spot["as_of"],
+        detail=f"FRED 官方收盤落後 {age} 天（{primary['as_of']}），另存較新的即期參考價 {spot['value']}（{spot['as_of']}，不是官方收盤價）")
+    return {"as_of": spot["as_of"], "value": spot["value"], "kind": "spot_aggregator", "source": "ExchangeRate-API",
+            "layer": 5, "is_close_history": False}
 
 
 # ---------------------------------------------------------------- 台幣備用鏈
@@ -1589,7 +1701,7 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_
             futures_rows=None, basis_rows=None, price_rows=None):
     if dry_run:
         log("persist", "skipped", detail=f"--dry-run：不寫 Supabase（本來會寫 macro {len(macro_rows)} 筆、"
-                                         f"台幣 {1 if twd_row and not twd_row.get('stale_fallback') else 0} 筆、"
+                                         f"台幣 {len([r for r in (twd_row if isinstance(twd_row, list) else [twd_row]) if r and not r.get('stale_fallback')])} 筆、"
                                          f"台股 {len(tw_rows or [])} 筆、廣度 {len(breadth_rows or [])} 筆、"
                                          f"外資 {len(inst_rows or [])} 筆、融資 {len(margin_rows or [])} 筆、"
                                          f"期貨部位 {len(futures_rows or [])} 筆、基差 {len(basis_rows or [])} 筆、持股現價 {len(price_rows or [])} 筆）")
@@ -1600,8 +1712,10 @@ def persist(dry_run, macro_rows, twd_row, tw_rows=None, breadth_rows=None, inst_
     if macro_rows:
         ok, msg = sb_upsert("macro_series", macro_rows, "series_id,as_of")
         log("persist:macro_series", "success" if ok else "failure", detail=msg)
-    if twd_row and not twd_row.get("stale_fallback"):
-        ok, msg = sb_upsert("twd_rates", [twd_row], "layer,source,as_of")
+    twd_list = twd_row if isinstance(twd_row, list) else ([twd_row] if twd_row else [])
+    twd_list = [r for r in twd_list if r and not r.get("stale_fallback")]
+    if twd_list:
+        ok, msg = sb_upsert("twd_rates", twd_list, "layer,source,as_of")
         log("persist:twd_rates", "success" if ok else "failure", detail=msg)
     if tw_rows:
         ok, msg = sb_upsert("market_stats", tw_rows, "market,as_of,source")
@@ -1661,6 +1775,8 @@ def run_job(job, dry_run=False):
                                    "value": r["value"], "source": "FRED"})
     if job in ("full", "tw_close"):
         twd_row = twd_fallback_chain()
+        sup = twd_supplement(twd_row)
+        twd_row = [twd_row, sup] if sup else twd_row
         tw_rows = twse_market()
         breadth_rows = twse_breadth()
         inst_rows = twse_institutional()
@@ -1681,11 +1797,13 @@ def run_job(job, dry_run=False):
     if job == "us_probe":
         probe_hist2()
     if job == "tw_backfill":
-        tw_backfill(dry_run=dry_run)
+        res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
+        tw_crash_check(list(res.get("new_days", [])) + _recent_complete_days(config.CRASH_RECENT_DAYS), dry_run=dry_run)
     if job in ("full", "tw_close") and not dry_run:
-        tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7)
+        res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
+        tw_crash_check(list(res.get("new_days", [])) + _recent_complete_days(1))
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
