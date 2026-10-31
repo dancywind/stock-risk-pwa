@@ -14,8 +14,16 @@ TODAY = date.today()
 D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 
+MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill")
+REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
+OFFENDERS = []
+NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
+
+
 def reset():
     fetch.LOG.clear()
+    for n in MODULE_FUNCS:                                      # 其他測試不該執行這些會連網的模組（它們有自己的測試）
+        setattr(fetch, n, lambda *a, **k: [])
 
 
 def fred_payload(*pairs):
@@ -687,7 +695,8 @@ def test_futures_future_date_and_bad_shapes():
         assert fetch.taifex_futures() is None
     with mock.patch.object(fetch, "fetch_json", return_value=([{"x": 1}], "")):
         assert fetch.taifex_futures() is None
-    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")), \
+            mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"denied", "HTTP 403")):       # 備用的 CSV 路徑也要替換掉，不能真的連線
         assert fetch.taifex_futures() is None
 
 
@@ -746,7 +755,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -2210,14 +2219,360 @@ def test_persist_writes_earnings_and_job_wires_them():
         for p_ in patches: p_.stop()
 
 
+# ================================================================ 模組隔離與各模組（M01–M06）
+def test_run_module_isolates_exceptions_flags_and_empty_results():
+    reset()
+    assert fetch._run_module("M02", "測試", lambda: 1 / 0) is None                           # 例外只變成這個模組的失敗
+    x = fetch.LOG[-1]
+    assert x["source"] == "module:M02" and x["status"] == "failure" and "ZeroDivisionError" in x["detail"]
+    reset()
+    assert fetch._run_module("M02", "測試", lambda: [1, 2]) == [1, 2] and fetch.LOG[-1]["status"] == "success" and "產出 2 筆" in fetch.LOG[-1]["detail"]
+    assert fetch._run_module("M03", "測試", lambda: []) == [] and fetch.LOG[-1]["status"] == "no_new_data"
+    assert fetch._run_module("M99", "不在開關表裡的模組", lambda: [1]) == [1]                  # 沒有開關的模組一律執行
+    old = dict(config.FEATURES)
+    try:
+        config.FEATURES["M02_us_quotes"] = False
+        called = []
+        assert fetch._run_module("M02", "測試", lambda: called.append(1)) is None and called == []     # 關掉就完全不執行
+        assert fetch.LOG[-1]["status"] == "skipped" and "FEATURES" in fetch.LOG[-1]["detail"]
+    finally:
+        config.FEATURES.clear(); config.FEATURES.update(old)
+
+
+def test_fred_optional_series_never_turn_the_job_red():
+    reset()
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 400")):
+        assert fetch.fred_latest("RU2000PR", 100, 20000, optional=True) is None
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "選用項目" in fetch.LOG[-1]["detail"]
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 400")):
+        assert fetch.fred_latest("DGS10", 0, 15) is None
+    assert fetch.LOG[-1]["status"] == "failure"
+    assert "RU2000PR" in config.FRED_OPTIONAL and {"DJIA", "BAMLH0A0HYM2", "RU2000PR"} <= set(config.FRED_MACRO)
+    assert config.FRED_MACRO["BAMLH0A0HYM2"][1] < 4 < config.FRED_MACRO["BAMLH0A0HYM2"][2]          # 真實利差約 3–4%，要落在合理範圍內
+
+
+def nas_quote_body(price="$745.20", pct="+0.45%", ms="Closed", real=False, ts=None, asset="etf"):
+    ts = ts or (TODAY - timedelta(days=1)).strftime("%b %d, %Y").replace(" 0", " ")
+    return json.dumps({"data": {"marketStatus": ms, "assetClass": asset, "primaryData": {"lastSalePrice": price, "netChange": "+3", "percentageChange": pct, "lastTradeTimestamp": ts, "isRealTime": real}}}).encode()
+
+
+def test_nasdaq_quote_only_accepts_closed_prices_with_their_own_date():
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas_quote_body(), "")):
+        q, why = fetch._nasdaq_quote("SPY", ("etf",))
+    assert q["close"] == 745.2 and q["pct"] == 0.45 and q["as_of"] == (TODAY - timedelta(days=1)).isoformat() and why == ""
+    for body in (nas_quote_body(ms="Pre-Market", real=True), nas_quote_body(real=True), nas_quote_body(ms="Open")):
+        with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body, "")):
+            q, why = fetch._nasdaq_quote("SPY", ("etf",))
+        assert q is None and "不是已收盤" in why
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas_quote_body(ts="Dec 31, 2099"), "")):
+        assert fetch._nasdaq_quote("SPY", ("etf",))[0] is None                                   # 日期在未來
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas_quote_body(price="N/A"), "")):
+        assert fetch._nasdaq_quote("SPY", ("etf",))[0] is None
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timed out")):
+        assert "連線失敗" in fetch._nasdaq_quote("SPY", ("etf",))[1]
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>", "")):
+        assert "不是 JSON" in fetch._nasdaq_quote("SPY", ("etf",))[1]
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        seen.append(url)
+        return 200, "application/json", (json.dumps({"data": None}).encode() if "assetclass=stocks" in url else nas_quote_body()), ""
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw):                                 # 第一個分類沒資料 → 試下一個分類
+        assert fetch._nasdaq_quote("X", ("stocks", "etf"))[0]["class"] == "etf" and len(seen) == 2
+
+
+def test_us_extra_quotes_stores_qqq_as_percent_only_and_falls_back_for_gold():
+    reset()
+    ts = (TODAY - timedelta(days=1)).strftime("%b %d, %Y").replace(" 0", " ")
+    prices = {"SPY": "$745.20", "TLT": "$88.10", "IAU": "$55.30", "QQQ": "$640.00", "SOX": "6,100.55"}
+    def raw(url, timeout=None, headers=None):
+        sym = url.split("/quote/")[1].split("/")[0]
+        if sym == "GLD":
+            return None, "", b"", "timed out"                                                      # GLD 失敗 → 改用 IAU
+        if sym == "SOX":
+            return 200, "application/json", nas_quote_body(price=prices[sym], asset="index"), ""
+        return 200, "application/json", nas_quote_body(price=prices[sym]), ""
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        out = REAL["us_extra_quotes"]()
+    by = {r["symbol"]: r for r in out}
+    assert set(by) == {"SPY", "TLT", "IAU", "QQQ", "SOX"} and "GLD" not in by
+    assert by["QQQ"]["value"] is None and by["QQQ"]["change_pct"] == 0.45 and by["QQQ"]["kind"] == "etf_proxy"      # QQQ 只存漲跌幅，不存價格
+    assert by["SPY"]["value"] == 745.2 and by["SOX"]["value"] == 6100.55 and by["SOX"]["kind"] == "index"
+    assert "備用" in by["IAU"]["label"] and "不是黃金期貨" in by["IAU"]["label"]
+    assert len({tuple(sorted(r)) for r in out}) == 1                                              # 每列欄位一致
+
+
+def test_us_extra_quotes_rejects_out_of_range_and_unclosed_prices():
+    reset()
+    def raw(url, timeout=None, headers=None):
+        sym = url.split("/quote/")[1].split("/")[0]
+        if sym == "SPY": return 200, "application/json", nas_quote_body(price="$7.45"), ""            # 少一位數 → 超出範圍
+        if sym == "TLT": return 200, "application/json", nas_quote_body(ms="Pre-Market", real=True), ""
+        if sym == "QQQ": return 200, "application/json", nas_quote_body(pct="N/A"), ""               # 沒有漲跌幅的 QQQ 不寫
+        return None, "", b"", "timed out"
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["us_extra_quotes"]() == []
+    st = {x["source"]: x for x in fetch.LOG}
+    assert st["us_quote:SPY"]["status"] == "failure" and "不在合理範圍" in st["us_quote:SPY"]["detail"]
+    assert st["us_quote:TLT"]["status"] == "skipped"
+    assert st["us_quote:QQQ"]["status"] == "failure" and "沒有漲跌幅" in st["us_quote:QQQ"]["detail"]
+
+
+def hist_pts(n, growth, end=None, start=100.0):
+    end = end or (TODAY - timedelta(days=1))
+    while end.weekday() >= 5:
+        end -= timedelta(days=1)
+    days, d = [], end
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.sort()
+    out, c = [], start
+    for g in growth if isinstance(growth, list) else [growth] * n:
+        out.append(c); c *= 1 + g
+    return list(zip(days, out))
+
+
+def test_sector_rs_computes_relative_strength_and_streak():
+    reset()
+    spy = hist_pts(30, 0.001)
+    series = {"SPY": spy, "XLK": hist_pts(30, 0.003), "XLE": hist_pts(30, 0.001), "XLF": hist_pts(30, -0.001)}
+    def nh(sym):
+        return (series[sym], "") if sym in series else (None, "查無資料")
+    with mock.patch.object(fetch, "_nasdaq_history", side_effect=nh), mock.patch.object(fetch.time, "sleep"):
+        out = REAL["sector_rs"]()
+    by = {r["symbol"]: r for r in out}
+    assert set(by) == {"XLK", "XLE", "XLF"}                                                       # 抓不到的產業 ETF 不出現，也不編
+    ret5 = lambda pts: (pts[-1][1] / pts[-6][1] - 1) * 100
+    assert abs(by["XLK"]["ret_5"] - ret5(series["XLK"])) < 0.01
+    assert abs(by["XLK"]["rs_5"] - (ret5(series["XLK"]) - ret5(spy))) < 0.01 and by["XLK"]["rs_5"] > 0
+    assert by["XLK"]["streak_days"] == 29 and by["XLF"]["streak_days"] == 0 and by["XLF"]["rs_5"] < 0     # 一直贏 SPY / 一直輸
+    assert by["XLE"]["streak_days"] == 0 and abs(by["XLE"]["rs_5"]) < 0.01                       # 和 SPY 一樣：不算贏
+    assert by["XLK"]["as_of"] == series["SPY"][-1][0].isoformat()
+    assert any(x["source"] == "sector_rs:XLV" and x["status"] == "failure" for x in fetch.LOG)
+
+
+def test_sector_rs_rejects_stale_short_split_and_missing_benchmark():
+    reset()
+    spy = hist_pts(30, 0.001)
+    series = {"SPY": spy, "XLK": hist_pts(30, 0.002, end=TODAY - timedelta(days=9)),             # 最新日期和 SPY 不同
+              "XLF": hist_pts(10, 0.002),                                                          # 歷史太短
+              "XLE": hist_pts(30, [0.0] * 14 + [1.6] + [0.0] * 15)}                                # 單日 2.6 倍：疑似分割
+    with mock.patch.object(fetch, "_nasdaq_history", side_effect=lambda s: (series.get(s), "")), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["sector_rs"]() == []
+    st = {x["source"]: x["detail"] for x in fetch.LOG}
+    assert "不同" in st["sector_rs:XLK"] and "不足" in st["sector_rs:XLF"] and "分割" in st["sector_rs:XLE"]
+    reset()
+    with mock.patch.object(fetch, "_nasdaq_history", return_value=(None, "連線失敗")):
+        assert REAL["sector_rs"]() == []
+    assert fetch.LOG[-1]["source"] == "sector_rs" and fetch.LOG[-1]["status"] == "failure"
+
+
+def test_nasdaq_history_parses_rows_and_skips_bad_ones():
+    reset()
+    rows = [{"date": "10/29/2026", "close": "$745.20"}, {"date": "10/28/2026", "close": "743.10"}, {"date": "bad", "close": "1"}, {"date": "10/27/2026", "close": "N/A"}, {"date": "13/45/2026", "close": "5"}]
+    body = json.dumps({"data": {"tradesTable": {"rows": rows}}}).encode()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body, "")):
+        pts, why = fetch._nasdaq_history("SPY")
+    assert pts == [(date(2026, 10, 28), 743.1), (date(2026, 10, 29), 745.2)]                      # 由舊到新
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timed out")):
+        assert fetch._nasdaq_history("SPY")[0] is None
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>", "")):
+        assert fetch._nasdaq_history("SPY")[1] == "不是 JSON"
+
+
+def leader_hist(code, n=260, start=100.0, step=0.5):
+    d0 = TODAY - timedelta(days=n + 40)
+    return [{"as_of": (d0 + timedelta(days=i)).isoformat(), "close": start + i * step} for i in range(n)]
+
+
+def test_tw_leaders_validates_official_names_and_computes_moving_averages():
+    reset()
+    names = [{"Code": c, "Name": nm} for c, (nm, _) in config.TW_LEADERS.items()]
+    names[1]["Name"] = "別家公司"                                                                   # 2317 的官方名稱對不上
+    hist = {c: leader_hist(c) for c in config.TW_LEADERS}
+    hist["2454"] = leader_hist("2454", n=40)                                                       # 歷史只有 40 天：只有 20 日均線
+    hist["3711"] = leader_hist("3711", n=10)                                                       # 太短：不算
+    def req(method, path, body=None, prefer=None):
+        code = path.split("code=eq.")[1].split("&")[0]
+        return hist[code], ""
+    with mock.patch.object(fetch, "fetch_json", return_value=(names, "")), mock.patch.object(fetch, "sb_request", side_effect=req):
+        out = REAL["tw_leaders_compute"]()
+    by = {r["code"]: r for r in out}
+    assert set(by) == {"2330", "2454", "2308", "2383"}                                             # 2317 名稱不符、3711 歷史太短
+    closes = [h["close"] for h in hist["2330"]]
+    assert by["2330"]["close"] == closes[-1] and by["2330"]["tier"] == 1 and by["2454"]["tier"] == 2
+    assert by["2330"]["ma20"] == round(sum(closes[-20:]) / 20, 3) and by["2330"]["ma60"] == round(sum(closes[-60:]) / 60, 3) and by["2330"]["ma200"] == round(sum(closes[-200:]) / 200, 3)
+    assert by["2330"]["ret5"] == round((closes[-1] / closes[-6] - 1) * 100, 3)
+    assert by["2454"]["ma20"] is not None and by["2454"]["ma60"] is None and by["2454"]["ma200"] is None   # 不夠的均線留空，不硬算
+    assert by["2330"]["as_of"] == hist["2330"][-1]["as_of"]
+    st = {x["source"]: x["detail"] for x in fetch.LOG}
+    assert "別家公司" in st["tw_leaders:2317"] and "不足 21 天" in st["tw_leaders:3711"]
+    assert len({tuple(sorted(r)) for r in out}) == 1
+
+
+def test_tw_leaders_without_name_table_computes_nothing():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch, "sb_request") as req:
+        assert REAL["tw_leaders_compute"]() == []
+    req.assert_not_called()                                                                       # 核對不了名稱就連資料庫都不查
+    assert fetch.LOG[-1]["status"] == "failure" and "無法核對" in fetch.LOG[-1]["detail"]
+
+
+def test_fred_history_rows_uses_own_dates_and_skips_holidays():
+    reset()
+    obs = {"observations": [{"date": D(5), "value": "."}, {"date": D(4), "value": "6000.5"}, {"date": D(3), "value": "6010"}, {"date": D(2), "value": "6020"}, {"date": "2999-01-01", "value": "6030"}]}
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=(obs, "")) as fj:
+        rows = fetch.fred_history_rows("SP500", 500, 30000)
+    assert [r["as_of"] for r in rows] == [D(4), D(3), D(2)] and rows[0]["value"] == 6000.5 and rows[0]["series_id"] == "SP500" and rows[0]["source"] == "FRED"
+    assert "observation_start=" in fj.call_args[0][0] and "sort_order=asc" in fj.call_args[0][0]
+    bad = {"observations": [{"date": D(4), "value": "6000"}, {"date": D(3), "value": "9999999"}]}
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=(bad, "")):
+        assert len(fetch.fred_history_rows("SP500", 500, 30000)) == 1
+    assert any("超出合理範圍" in x["detail"] for x in fetch.LOG)
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 500")):
+        assert fetch.fred_history_rows("SP500", 500, 30000) is None
+    with mock.patch.object(config, "fred_key", return_value=""):
+        assert fetch.fred_history_rows("SP500", 500, 30000) is None
+
+
+def test_fred_history_backfill_collects_all_configured_series():
+    reset()
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": D(3), "value": "6000"}]}, "")):
+        rows = REAL["fred_history_backfill"]()
+    assert {r["series_id"] for r in rows} == set(config.FRED_HISTORY) == {"SP500", "NASDAQCOM", "DJIA"}
+
+
+def test_tw_index_history_walks_months_back_and_stops_on_error():
+    reset()
+    calls = []
+    def mrows(url):
+        calls.append(url)
+        ym = url.split("date=")[1][:6]
+        return [{"market": "TW", "as_of": f"{ym[:4]}-{ym[4:]}-05", "close": 22000.0, "change_pct": 0.1, "turnover": 5e11, "source": "TWSE FMTQIK"}], ""
+    with mock.patch.object(fetch, "_twse_month_rows", side_effect=mrows), mock.patch.object(fetch.time, "sleep") as sl:
+        out = REAL["tw_index_history"]()
+    assert len(out) == config.TW_INDEX_HISTORY_MONTHS == len(calls) == sl.call_count
+    months = [u.split("date=")[1][:6] for u in calls]
+    assert months[0] == TODAY.strftime("%Y%m") and len(set(months)) == len(months)               # 從本月往前，每月一次，沒有重複
+    assert all(r["source"] == "TWSE FMTQIK" for r in out)
+    reset()
+    state = {"n": 0}
+    def flaky(url):
+        state["n"] += 1
+        return (None, "HTTP 403") if state["n"] == 3 else ([{"market": "TW", "as_of": "2026-01-05", "close": 1.0, "change_pct": 0, "turnover": 1, "source": "TWSE FMTQIK"}], "")
+    with mock.patch.object(fetch, "_twse_month_rows", side_effect=flaky), mock.patch.object(fetch.time, "sleep"):
+        out = REAL["tw_index_history"]()
+    assert len(out) == 2 and state["n"] == 3 and fetch.LOG[-1]["status"] == "failure" and "已停止" in fetch.LOG[-1]["detail"]    # 出錯就停，不繼續打請求
+
+
+def test_persist_extra_tables_are_independent_chunked_and_dry_run_safe():
+    reset()
+    ups = []
+    def up(table, rows, key):
+        ups.append((table, len(rows), key))
+        return (False, "boom") if table == "sector_rs" else (True, "ok")
+    big = [{"symbol": str(i), "as_of": "x"} for i in range(1100)]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", side_effect=up):
+        fetch.persist_extra(False, [("us_quotes", [{"a": 1}], "symbol,as_of"), ("sector_rs", [{"a": 1}], "symbol,as_of"), ("tw_leaders", [{"a": 1}], "as_of,code"), ("macro_series", big, "series_id,as_of"), ("empty", [], "k")])
+    assert [(u[0], u[1]) for u in ups] == [("us_quotes", 1), ("sector_rs", 1), ("tw_leaders", 1), ("macro_series", 500), ("macro_series", 500), ("macro_series", 100)]   # 一張失敗不影響後面的表；大表分批
+    st = {x["source"]: x["status"] for x in fetch.LOG}
+    assert st["persist:sector_rs"] == "failure" and st["persist:us_quotes"] == "success" and st["persist:tw_leaders"] == "success" and "persist:empty" not in st
+    ups.clear(); reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", side_effect=up):
+        fetch.persist_extra(True, [("us_quotes", [{"a": 1}], "k")])
+    assert ups == [] and fetch.LOG[-1]["status"] == "skipped"
+
+
+def test_run_job_wires_modules_per_job_and_isolates_a_crashing_module():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+              mock.patch.object(fetch, "tw_backfill", return_value={"new_days": []}), mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "tw_crash_check"), mock.patch.object(fetch, "persist_extra")]
+    for p_ in patches: p_.start()
+    try:
+        quotes = [{"symbol": "SPY"}]
+        def boom(): raise RuntimeError("壞掉了")
+        with mock.patch.object(fetch, "us_extra_quotes", return_value=quotes), mock.patch.object(fetch, "sector_rs", side_effect=boom), \
+                mock.patch.object(fetch, "tw_leaders_compute", return_value=[{"code": "2330"}]):
+            fetch.run_job("tw_close", dry_run=False)
+            args = fetch.persist_extra.call_args[0]
+            tables = {t: r for t, r, c in args[1]}
+            assert tables["us_quotes"] == quotes and tables["sector_rs"] == [] and tables["tw_leaders"] == [{"code": "2330"}]    # M03 壞了，M02、M04 照常
+            st = {x["source"]: x["status"] for x in fetch.LOG}
+            assert st["module:M02"] == "success" and st["module:M03"] == "failure" and st["module:M04"] == "success"
+            fetch.persist_extra.reset_mock()
+            fetch.run_job("tw_close", dry_run=True)
+            assert "tw_leaders" not in {t for t, r, c in fetch.persist_extra.call_args[0][1]}                                   # dry-run 不算領頭股（會讀資料庫）
+        with mock.patch.object(fetch, "tw_index_history", return_value=[{"market": "TW"}]) as ih, mock.patch.object(fetch, "fred_history_backfill", return_value=[{"series_id": "SP500"}]) as fh, \
+                mock.patch.object(fetch, "tw_leaders_compute", return_value=[]):
+            fetch.persist_extra.reset_mock()
+            fetch.run_job("tw_backfill", dry_run=False)
+            ih.assert_called_once(); fh.assert_called_once()
+            keys = {t: c for t, r, c in fetch.persist_extra.call_args[0][1]}
+            assert keys["market_stats"] == "market,as_of,source" and keys["macro_series"] == "series_id,as_of"
+            ih.reset_mock(); fh.reset_mock()
+            fetch.run_job("tw_backfill", dry_run=True)
+            ih.assert_not_called(); fh.assert_not_called()                                                                         # dry-run 不打這些請求
+    finally:
+        for p_ in patches: p_.stop()
+
+
+def test_probe_round3_logs_four_sources_without_writing():
+    reset()
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap06_L_ci": {"get": {"summary": "上市公司綜合損益表(一般業)"}}, "/x": {"get": {"summary": "其他"}}}}
+    sw2 = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/mopsfin_t187ap06_O_ciA": {"get": {"summary": "上櫃公司財報資訊( 一般業)"}}}}
+    fin = [{"公司代號": "2330", "營業收入": "1", "營業毛利": "1", "營業利益": "1", "稅後淨利": "1"}]
+    def fj(url, **k):
+        if "twse" in url and url.endswith("swagger.json"): return sw, ""
+        if "tpex" in url and "swagger" in url: return sw2, ""
+        return fin, ""
+    aaii = b"<html><body><div>Bullish 38.5% Neutral 30% Bearish 31.5%</div></body></html>"
+    n100 = json.dumps({"data": {"data": {"rows": [{"symbol": "AAPL", "pctChange": "-1.2%"}]}, "date": "Oct 30, 2026"}}).encode()
+    sox = json.dumps({"data": {"marketStatus": "Closed", "primaryData": {"lastSalePrice": "6,100.55", "lastTradeTimestamp": "Oct 30, 2026"}}}).encode()
+    def raw(url, timeout=None, headers=None):
+        if "aaii" in url: return 200, "text/html", aaii, ""
+        if "nasdaq100" in url: return 200, "application/json", n100, ""
+        return 200, "application/json", sox, ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round3()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "營業毛利" in by["probe:fin_rows:twse"]["detail"] and "營業毛利" in by["probe:fin_rows:tpex"]["detail"] and "/x" not in by["probe:fin:twse"]["detail"]
+    assert by["probe:aaii"]["status"] == "success" and "Bullish 38.5%" in by["probe:aaii"]["detail"]
+    assert by["probe:nasdaq100"]["status"] == "success" and "AAPL" in by["probe:nasdaq100"]["detail"]
+    assert by["probe:sox"]["status"] == "success" and "6,100.55" in by["probe:sox"]["detail"]
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_round3_failures_are_reported_not_hidden():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"denied", "HTTP 403")):
+        fetch.probe_round3()
+    sts = {x["source"]: x["status"] for x in fetch.LOG}
+    assert sts["probe:fin:twse"] == "failure" and sts["probe:aaii"] == "failure" and sts["probe:nasdaq100"] == "failure" and sts["probe:sox"] == "failure"
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
 
 
 if __name__ == "__main__":
+    import urllib.error
+    import urllib.request
+
+    def _guard(req, *a, **k):
+        NETWORK_CALLS.append(getattr(req, "full_url", str(req)))
+        raise urllib.error.URLError("測試期間不得連網")
+    urllib.request.urlopen = _guard
     n = 0
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
+            before = len(NETWORK_CALLS)
             fn(); n += 1; print("PASS", name)
-    print(f"全部 {n} 項測試通過")
+            if len(NETWORK_CALLS) != before:
+                OFFENDERS.append((name, NETWORK_CALLS[before:][:2]))
+    assert not OFFENDERS, "這些測試偷偷連了真實網路（要用 mock 替換）：\n" + "\n".join(f"  {a}: {b}" for a, b in OFFENDERS)
+    print(f"全部 {n} 項測試通過（且沒有任何真實連網）")
