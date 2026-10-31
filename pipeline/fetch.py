@@ -1744,31 +1744,45 @@ def cboe_putcall():
     return None
 
 
+def _earn_date(token):
+    token = token.strip()
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", token)
+    try:
+        if m:
+            return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        m = re.fullmatch(r"([A-Za-z]{3})[a-z]*\.? (\d{1,2}), (\d{4})", token)
+        if m and _US_MONTHS.get(m.group(1).title()):
+            return date(int(m.group(3)), _US_MONTHS[m.group(1).title()], int(m.group(2)))
+    except ValueError:
+        return None
+    return None
+
+
 def parse_earnings_text(text, today=None):
-    """從 Nasdaq 的 reportText 找下次財報日。文字裡必須剛好有「一個」日期（mm/dd/yyyy 或 Mon dd, yyyy），
-    而且在今天到今天加 200 天之間；否則不採用，不猜。回傳 (日期, 是否預估) 或 None。"""
+    """從 Nasdaq 的 reportText 找下次財報日，回傳 (日期, 是否預估, 盤前或盤後) 或 None。
+    1) 先找明確句型「…to report earnings on <日期>」，後面還有別的日期也不受影響；
+    2) 找不到這個句型時，文字裡必須剛好只有一個日期才採用；
+    日期必須在今天到今天加 200 天之間，否則不採用，不猜。盤前＝before market open，盤後＝after market close。"""
     today = today or date.today()
     t = str(text or "")
-    found = set()
-    for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", t):
-        try:
-            found.add(date(int(m.group(3)), int(m.group(1)), int(m.group(2))))
-        except ValueError:
-            return None
-    for m in re.finditer(r"\b([A-Za-z]{3})[a-z]*\.? (\d{1,2}), (\d{4})\b", t):
-        mo = _US_MONTHS.get(m.group(1).title())
-        if mo:
-            try:
-                found.add(date(int(m.group(3)), mo, int(m.group(2))))
-            except ValueError:
+    d = None
+    m = re.search(r"report(?:s|ing)?\s+(?:its\s+)?earnings\s+on\s+(\d{1,2}/\d{1,2}/\d{4}|[A-Za-z]{3,9}\.? \d{1,2}, \d{4})", t, re.I)
+    if m:
+        d = _earn_date(m.group(1))
+    else:
+        found = set()
+        for tok in re.findall(r"\b\d{1,2}/\d{1,2}/\d{4}\b", t) + [f"{x[0]} {x[1]}, {x[2]}" for x in re.findall(r"\b([A-Za-z]{3})[a-z]*\.? (\d{1,2}), (\d{4})\b", t)]:
+            dd = _earn_date(tok)
+            if dd is None:
                 return None
-    if len(found) != 1:
+            found.add(dd)
+        if len(found) == 1:
+            d = next(iter(found))
+    if d is None or not (today <= d <= today + timedelta(days=config.EARNINGS_MAX_AHEAD_DAYS)):
         return None
-    d = next(iter(found))
-    if not (today <= d <= today + timedelta(days=config.EARNINGS_MAX_AHEAD_DAYS)):
-        return None
-    est = bool(re.search(r"estimat|tentative|projected|expected|unconfirmed|not (yet )?confirmed", t, re.I))
-    return d.isoformat(), est
+    est = bool(re.search(r"estimat|tentative|projected|expected|unconfirmed|derived from|not (yet )?confirmed", t, re.I))
+    timing = "pre" if re.search(r"before market open", t, re.I) else "post" if re.search(r"after market close", t, re.I) else None
+    return d.isoformat(), est, timing
 
 
 def nasdaq_earnings(hold):
@@ -1794,8 +1808,8 @@ def nasdaq_earnings(hold):
         if res is None:
             log(src, "no_new_data", detail=_clip(f"沒有解析出唯一的未來財報日；Nasdaq 原文：{str(text)[:260]!r}"))
             continue
-        out.append({"symbol": sym, "report_date": res[0], "is_estimate": res[1], "raw_text": str(text)[:300], "source": "Nasdaq earnings-date"})
-        log(src, "success", as_of=res[0], detail=f"下次財報日 {res[0]}（{'預估' if res[1] else '公司公布'}）")
+        out.append({"symbol": sym, "report_date": res[0], "is_estimate": res[1], "timing": res[2], "raw_text": str(text)[:300], "source": "Nasdaq earnings-date"})
+        log(src, "success", as_of=res[0], detail=f"下次財報日 {res[0]}（{'預估' if res[1] else '公司公布'}{'，盤前' if res[2] == 'pre' else '，盤後' if res[2] == 'post' else ''}）")
         time.sleep(1)
     return out
 
