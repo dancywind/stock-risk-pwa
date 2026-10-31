@@ -2079,16 +2079,23 @@ T0 = date(2026, 10, 30)
 
 def test_parse_earnings_text_requires_exactly_one_plausible_future_date():
     f = lambda s: fetch.parse_earnings_text(s, T0)
-    assert f("Oracle Corporation Common Stock is estimated to report earnings on 12/09/2026.") == ("2026-12-09", True)
-    assert f("Arm Holdings plc is expected to announce on Dec 9, 2026 after the close") == ("2026-12-09", True)
-    assert f("Earnings announcement for ORCL: Feb 3, 2027, confirmed by the company") == ("2027-02-03", False)
-    assert f("The company has not yet confirmed. Estimated date 11/18/2026") == ("2026-11-18", True)
-    assert f("Report on 12/09/2026 (12/09/2026)") == ("2026-12-09", False)                    # 同一天重複出現算同一個日期
-    assert f("Oracle reports 12/09/2026 and previously 09/10/2026") is None                    # 兩個不同日期：不猜
-    assert f("Reported on 10/01/2026") is None                                                 # 過去的日期
-    assert f("Next earnings 12/09/2027") is None                                               # 太遠，疑似解析錯誤
-    assert f("Earnings 13/45/2026") is None and f("no date here") is None and f("") is None and f(None) is None
-    assert f("on 10/30/2026") == ("2026-10-30", False)                                         # 今天算
+    # 你貼的 Nasdaq 真實原文（雙空格、星號、盤前盤後）
+    assert f("Circle Internet Group, Inc. Class A Common Stock is expected* to report earnings on  11/04/2026 before market open. ") == ("2026-11-04", True, "pre")
+    assert f("The Arm Holdings plc American Depositary Shares is expected* to report earnings on  11/04/2026 after market close.  The report date") == ("2026-11-04", True, "post")
+    assert f("Oracle Corporation Common Stock is estimated to report earnings on  12/09/2026. The upcoming earnings date is derived from an algorithm") == ("2026-12-09", True, None)
+    assert f("Arm Holdings plc is expected to report earnings on Dec 9, 2026 after market close") == ("2026-12-09", True, "post")
+    assert f("Earnings announcement for ORCL: Feb 3, 2027, confirmed by the company") == ("2027-02-03", False, None)
+    assert f("The company has not yet confirmed. Estimated date 11/18/2026") == ("2026-11-18", True, None)
+    assert f("Report on 12/09/2026 (12/09/2026)") == ("2026-12-09", False, None)                 # 同一天重複出現算同一個日期
+    # 明確句型優先：後面又出現別的日期也不受影響（真實原文後面常有說明句）
+    assert f("X is expected* to report earnings on 11/04/2026. Last report 08/05/2026.") == ("2026-11-04", True, None)
+    assert f("Oracle reports 12/09/2026 and previously 09/10/2026") is None                     # 沒有明確句型又有兩個日期：不猜
+    assert f("Reported on 10/01/2026") is None                                                  # 過去的日期
+    assert f("X is expected to report earnings on 12/09/2027") is None                          # 太遠，疑似解析錯誤
+    assert f("X is expected to report earnings on 10/01/2026") is None                          # 明確句型但日期已過
+    assert f("Earnings 13/45/2026") is None and f("X to report earnings on 13/45/2026") is None
+    assert f("no date here") is None and f("") is None and f(None) is None
+    assert f("on 10/30/2026") == ("2026-10-30", False, None)                                    # 今天算
 
 
 def earn_body(text):
@@ -2110,10 +2117,26 @@ def test_nasdaq_earnings_skips_etfs_and_never_writes_unparsed_dates():
     with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
         out = fetch.nasdaq_earnings(hold)
     assert len(urls) == 2 and not any("MUU" in u for u in urls)                                  # ETF 與台股不查
-    assert len(out) == 1 and out[0]["symbol"] == "ORCL" and out[0]["is_estimate"] is True and out[0]["report_date"] == ahead.isoformat()
+    assert len(out) == 1 and out[0]["symbol"] == "ORCL" and out[0]["is_estimate"] is True and out[0]["report_date"] == ahead.isoformat() and out[0]["timing"] is None
     assert "estimated" in out[0]["raw_text"]
     miss = [x for x in fetch.LOG if x["source"] == "nasdaq:earnings:ARM"][0]
     assert miss["status"] == "no_new_data" and "No earnings date is available" in miss["detail"]   # 沒解析出來要把原文留下來
+
+
+def test_nasdaq_earnings_keeps_timing_and_all_rows_have_same_keys():
+    reset()
+    ahead = date.today() + timedelta(days=5)
+    fmt = f"{ahead.month:02d}/{ahead.day:02d}/{ahead.year}"
+    hold = [{"market": "US", "symbol": "ARM", "name": "x", "kind": "stock", "pos_key": "ARM"}, {"market": "US", "symbol": "CRCL", "name": "x", "kind": "stock", "pos_key": "CRCL"},
+            {"market": "US", "symbol": "ORCL", "name": "x", "kind": "stock", "pos_key": "ORCL"}]
+    texts = {"/ARM/": f"Arm is expected* to report earnings on  {fmt} after market close.", "/CRCL/": f"Circle is expected* to report earnings on  {fmt} before market open.", "/ORCL/": f"Oracle is estimated to report earnings on  {fmt}."}
+    def raw(url, timeout=None, headers=None):
+        return 200, "application/json", earn_body(next(v for k, v in texts.items() if k in url)), ""
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        out = fetch.nasdaq_earnings(hold)
+    assert {r["symbol"]: r["timing"] for r in out} == {"ARM": "post", "CRCL": "pre", "ORCL": None}
+    assert len({tuple(sorted(r)) for r in out}) == 1                                              # 每列欄位一致，批次寫入才不會出現缺欄位
+    assert "，盤後" in [x for x in fetch.LOG if x["source"] == "nasdaq:earnings:ARM"][0]["detail"]
 
 
 def test_nasdaq_earnings_failures_are_logged_not_fabricated():
