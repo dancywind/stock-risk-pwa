@@ -2063,6 +2063,29 @@ def test_probe_earnings_logs_us_dates_and_tw_endpoints_without_writing():
     assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
 
 
+def test_probe_earnings_looks_into_material_news_for_investor_conferences():
+    reset()
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap04_L": {"get": {"summary": "上市公司每日重大訊息"}}, "/x": {"get": {"summary": "其他"}}}}
+    rows = [{"公司代號": "2330", "主旨": "公告本公司召開法人說明會相關資訊", "說明": "1.召開法人說明會之日期:115/11/13"},
+            {"公司代號": "1101", "主旨": "公告董事會決議", "說明": "x"}]
+    urls = []
+    def fj(url, **k):
+        urls.append(url)
+        return (sw, "") if url.endswith("swagger.json") else (rows, "")
+    with mock.patch.object(fetch, "load_holdings", return_value=([], "")), mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_earnings()
+    by = {x["source"]: x for x in fetch.LOG}
+    d = by["probe:earn_tw_rows:twse:news"]["detail"]
+    assert by["probe:earn_tw_rows:twse:news"]["status"] == "success" and "含『法人說明會』1 列" in d and "115/11/13" in d and "公告董事會決議" not in d
+    assert any(u.endswith("/opendata/t187ap04_L") for u in urls)
+    up.assert_not_called()
+    rows[0]["主旨"] = rows[0]["說明"] = "沒有"                                                    # 沒有任何法說會公告：要說沒有，不是失敗
+    reset()
+    with mock.patch.object(fetch, "load_holdings", return_value=([], "")), mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        fetch.probe_earnings()
+    assert {x["source"]: x for x in fetch.LOG}["probe:earn_tw_rows:twse:news"]["status"] == "no_new_data"
+
+
 def test_probe_earnings_failures_are_reported():
     reset()
     hold = [{"market": "US", "symbol": "ORCL", "name": "x", "kind": "stock", "pos_key": "ORCL"}]
