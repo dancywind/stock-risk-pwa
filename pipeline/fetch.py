@@ -1849,13 +1849,25 @@ def probe_earnings():
                     cands.append((path, text))
         log(f"probe:earn_tw:{tag}", "success" if cands else "no_new_data",
             detail=_clip("含法說會／財報／營收字樣的端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands[:14]) if cands else "無")))
-        pick = next((c for c in cands if "說明會" in c[1] or "法說" in c[1]), None)
-        if pick:
+        picks = []
+        first_conf = next((c for c in cands if "說明會" in c[1] or "法說" in c[1]), None)
+        if first_conf:
+            picks.append((first_conf, False))
+        first_news = next((c for c in cands if "重大訊息" in c[1]), None)
+        if first_news:
+            picks.append((first_news, True))                       # 重大訊息：法說會是公司用重大訊息公告的，只留含「法人說明會」的列
+        for (pick, news) in picks:
             rows, err = fetch_json(_openapi_base(sw, base) + pick[0])
+            key = f"{tag}:news" if news else tag
             if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-                log(f"probe:earn_tw_rows:{tag}", "success", detail=_clip(f"{pick[0]}｜共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
+                if news:
+                    hit = [r for r in rows if any("法人說明會" in str(v) for v in r.values())]
+                    log(f"probe:earn_tw_rows:{key}", "success" if hit else "no_new_data",
+                        detail=_clip(f"{pick[0]}｜共 {len(rows)} 列｜含『法人說明會』{len(hit)} 列｜欄位 {list(rows[0].keys())}｜前 2 筆 {hit[:2]}"))
+                else:
+                    log(f"probe:earn_tw_rows:{key}", "success", detail=_clip(f"{pick[0]}｜共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
             else:
-                log(f"probe:earn_tw_rows:{tag}", "failure", detail=_clip(f"{pick[0]} 抓取失敗或格式非預期: {err or str(rows)[:120]}"))
+                log(f"probe:earn_tw_rows:{key}", "failure", detail=_clip(f"{pick[0]} 抓取失敗或格式非預期: {err or str(rows)[:120]}"))
 
 
 def probe_us_pressure():
