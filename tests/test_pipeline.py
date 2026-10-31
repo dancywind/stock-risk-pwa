@@ -1734,6 +1734,25 @@ def test_crash_check_skips_days_not_complete_and_paginates():
     assert len(found) == 3 and {f["as_of"] for f in found} == {D(2)}   # 1500 列要翻頁才讀得完
 
 
+def test_crash_check_only_looks_at_recent_days_not_the_whole_backfill():
+    reset()
+    old, recent = D(60), D(2)
+    prev_old, prev_recent = D(61), D(3)
+    by_day = {prev_old: [("TWSE", "2330", 100.0)], old: [("TWSE", "2330", 80.0)],             # 兩個月前的大跌：不收
+              prev_recent: [("TWSE", "1101", 100.0)], recent: [("TWSE", "1101", 85.0)]}       # 近期的大跌：收
+    ups = []
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=crash_env(by_day)), \
+            mock.patch.object(fetch, "fetch_json", return_value=([], "")), mock.patch.object(fetch, "sb_upsert", side_effect=lambda t_, r, k: ups.append(r) or (True, "ok")):
+        found = fetch.tw_crash_check([old, recent, prev_old])
+    assert [f["code"] for f in found] == ["1101"] and all(f["as_of"] == recent for f in ups[0])
+    assert any("略過 2 個超過 30 天" in x["detail"] for x in fetch.LOG)
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=crash_env(by_day)), mock.patch.object(fetch, "sb_upsert") as up:
+        assert fetch.tw_crash_check([old, prev_old]) == []                                   # 全部太舊：不寫入
+    up.assert_not_called()
+    assert config.CRASH_MAX_AGE_DAYS == 30
+
+
 def test_backfill_returns_new_days_and_crash_check_wiring():
     reset()
     res, calls, ups, _ = run_backfill(max_days=2)
