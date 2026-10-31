@@ -166,7 +166,7 @@ def sb_last_verified_twd():
 
 
 # ---------------------------------------------------------------- 來源：FRED
-def fred_latest(series_id, low, high):
+def fred_latest(series_id, low, high, optional=False):
     """取 FRED 最近 10 筆，挑第一筆有效值，日期用該筆自己的日期。"""
     key = config.fred_key()
     if not key:
@@ -176,7 +176,10 @@ def fred_latest(series_id, low, high):
            f"&file_type=json&sort_order=desc&limit=10")
     data, err = fetch_json(url)
     if data is None:
-        log(f"fred:{series_id}", "failure", detail=f"FRED 抓取失敗: {err}")
+        if optional:
+            log(f"fred:{series_id}", "no_new_data", detail=_clip(f"FRED 查不到這個序列（可能不存在或授權限制）: {err}；這是選用項目，不算失敗"))
+        else:
+            log(f"fred:{series_id}", "failure", detail=f"FRED 抓取失敗: {err}")
         return None
     try:
         observations = data["observations"]
@@ -1875,6 +1878,312 @@ def probe_earnings():
                 log(f"probe:earn_tw_rows:{key}", "failure", detail=_clip(f"{pick[0]} 抓取失敗或格式非預期: {err or str(rows)[:120]}"))
 
 
+def _run_module(mid, label, fn, *args, **kw):
+    """執行一個模組：任何例外都只記成這個模組的失敗，不讓整個工作中斷，也不影響其他模組。
+    記錄的來源是 module:<代號>，網站的『功能檢查表』和健康檢查查詢都看這個。"""
+    key = next((k for k in config.FEATURES if k.startswith(mid + "_")), None)
+    if key is not None and not config.FEATURES.get(key, True):
+        log(f"module:{mid}", "skipped", detail=f"{label}：在設定檔 FEATURES 裡被關閉")
+        return None
+    try:
+        res = fn(*args, **kw)
+    except Exception as e:  # noqa: BLE001 — 模組隔離：不管什麼錯都只影響自己
+        log(f"module:{mid}", "failure", detail=_clip(f"{label}：執行時發生例外 {type(e).__name__}: {e}"))
+        return None
+    n = len(res) if isinstance(res, (list, tuple, dict)) else (0 if res is None else 1)
+    log(f"module:{mid}", "success" if n else "no_new_data", detail=f"{label}：產出 {n} 筆" if n else f"{label}：沒有產出資料（原因見同一輪其他紀錄）")
+    return res
+
+
+def parse_pct(text):
+    t = str(text or "").replace("%", "").replace("+", "").strip()
+    return parse_number(t)
+
+
+def _nasdaq_quote(sym, classes):
+    """Nasdaq 報價。回傳 (資料, 原因)。只採用 marketStatus=Closed 且非即時的價格；日期用報價自己的時間戳。"""
+    last = "查不到報價"
+    for ac in classes:
+        status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+        if status is None:
+            return None, f"連線失敗: {err}"
+        try:
+            j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        except (ValueError, UnicodeDecodeError):
+            return None, f"HTTP {status}，回傳不是 JSON"
+        d = j.get("data") if isinstance(j, dict) else None
+        if not isinstance(d, dict) or not isinstance(d.get("primaryData"), dict):
+            last = f"{ac} 分類沒有報價資料"
+            continue
+        pdta = d["primaryData"]
+        ms = str(d.get("marketStatus"))
+        if ms != "Closed" or pdta.get("isRealTime") is True:
+            return None, f"marketStatus={ms}、isRealTime={pdta.get('isRealTime')}，不是已收盤的價格，不採用"
+        iso = parse_us_date(pdta.get("lastTradeTimestamp"))
+        ok, why = validate_close_date(iso)
+        if not ok:
+            return None, why
+        close = parse_number(str(pdta.get("lastSalePrice", "")).replace("$", ""))
+        pct = parse_pct(pdta.get("percentageChange"))
+        if close is None:
+            return None, f"收盤價無效 {pdta.get('lastSalePrice')!r}"
+        return {"close": close, "pct": pct, "as_of": iso, "class": ac}, ""
+    return None, last
+
+
+def us_extra_quotes():
+    """模組 M02：SPY、TLT、GLD（備用 IAU）、QQQ（只存漲跌幅）、SOX 指數。價格超出合理範圍一律拒收。"""
+    out = []
+    for sym, label, kind, classes, low, high, store in config.US_QUOTES:
+        q, why = _nasdaq_quote(sym, classes)
+        used, used_label, lo, hi = sym, label, low, high
+        if q is None and sym in config.US_QUOTE_FALLBACKS:
+            fsym, flabel, lo, hi = config.US_QUOTE_FALLBACKS[sym]
+            q2, why2 = _nasdaq_quote(fsym, ("etf",))
+            if q2 is not None:
+                q, used, used_label = q2, fsym, flabel
+            else:
+                why = f"{why}；備用 {fsym} 也失敗：{why2}"
+        if q is None:
+            log(f"us_quote:{sym}", "skipped" if "不是已收盤" in why else "failure", detail=_clip(why))
+            continue
+        if not (lo <= q["close"] <= hi):
+            log(f"us_quote:{used}", "failure", as_of=q["as_of"], detail=f"價格 {q['close']} 不在合理範圍 {lo}–{hi}，拒收")
+            continue
+        if not store and q["pct"] is None:
+            log(f"us_quote:{used}", "failure", as_of=q["as_of"], detail="沒有漲跌幅，這個項目只顯示漲跌幅，不寫入")
+            continue
+        out.append({"symbol": used, "label": used_label, "kind": kind, "as_of": q["as_of"], "value": q["close"] if store else None,
+                    "change_pct": q["pct"], "source": "Nasdaq 報價（已收盤）"})
+        log(f"us_quote:{used}", "success", as_of=q["as_of"], detail=f"{'收盤 ' + str(q['close']) + '，' if store else ''}漲跌 {q['pct']}%")
+        time.sleep(1)
+    return out
+
+
+def _nasdaq_history(sym):
+    """Nasdaq 歷史行情（約 60 天，ETF）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。"""
+    today = date.today()
+    url = config.NASDAQ_HIST_URL.format(symbol=sym, assetclass="etf", fromdate=(today - timedelta(days=75)).isoformat(), todate=today.isoformat())
+    status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+    if status is None:
+        return None, f"連線失敗: {err}"
+    try:
+        rows = (((json.loads(body.decode("utf-8-sig").lstrip("\ufeff")) or {}).get("data") or {}).get("tradesTable") or {}).get("rows") or []
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None, "不是 JSON"
+    pts = []
+    for r in rows:
+        m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", str(r.get("date", "")).strip())
+        c = parse_number(str(r.get("close", "")).replace("$", ""))
+        if not m or c is None or not (0 < c < config.PRICE_LIMIT):
+            continue
+        try:
+            pts.append((date(int(m.group(3)), int(m.group(1)), int(m.group(2))), c))
+        except ValueError:
+            continue
+    pts.sort()
+    return pts, ""
+
+
+def sector_rs():
+    """模組 M03：11 檔產業 ETF 對 SPY 的相對強弱。ret_N＝近 N 個交易日報酬；rs_N＝產業報酬減 SPY 報酬（百分點）；
+    streak_days＝最近連續幾天每日報酬高於 SPY。兩邊最新日期必須相同，歷史太短或有疑似分割跳動的 ETF 不算。"""
+    bench, why = _nasdaq_history(config.SECTOR_BENCH)
+    if not bench or len(bench) < config.SECTOR_MIN_ROWS:
+        log("sector_rs", "failure", detail=_clip(f"基準 {config.SECTOR_BENCH} 歷史不足或抓取失敗: {why or len(bench or [])}"))
+        return []
+    bmap = dict(bench)
+    out = []
+    for sym, label in config.SECTOR_ETFS.items():
+        pts, why = _nasdaq_history(sym)
+        time.sleep(1)
+        if not pts or len(pts) < config.SECTOR_MIN_ROWS:
+            log(f"sector_rs:{sym}", "failure", detail=_clip(f"歷史不足或抓取失敗: {why or len(pts or [])}"))
+            continue
+        if pts[-1][0] != bench[-1][0]:
+            log(f"sector_rs:{sym}", "failure", detail=f"最新日期 {pts[-1][0]} 與 {config.SECTOR_BENCH} 的 {bench[-1][0]} 不同，不比較")
+            continue
+        if any(b[1] / a[1] >= 1.5 or b[1] / a[1] <= 0.67 for a, b in zip(pts, pts[1:])):
+            log(f"sector_rs:{sym}", "failure", detail="收盤價出現疑似分割的跳動，不計算")
+            continue
+        common = [(d, c, bmap[d]) for d, c in pts if d in bmap]
+        if len(common) < config.SECTOR_MIN_ROWS:
+            log(f"sector_rs:{sym}", "failure", detail="和 SPY 共同的交易日不足")
+            continue
+        ret = lambda n, i: (common[-1][i] / common[-1 - n][i] - 1) * 100
+        streak = 0
+        for k in range(len(common) - 1, 0, -1):
+            if common[k][1] / common[k - 1][1] > common[k][2] / common[k - 1][2]:
+                streak += 1
+            else:
+                break
+        out.append({"symbol": sym, "label": label, "as_of": common[-1][0].isoformat(), "ret_5": round(ret(5, 1), 3), "ret_20": round(ret(20, 1), 3),
+                    "rs_5": round(ret(5, 1) - ret(5, 2), 3), "rs_20": round(ret(20, 1) - ret(20, 2), 3), "streak_days": streak})
+    if out:
+        log("sector_rs", "success", as_of=out[0]["as_of"], detail=f"{len(out)} 檔產業 ETF；基準 {config.SECTOR_BENCH}")
+    return out
+
+
+def tw_leaders_compute():
+    """模組 M04：台積電＋確認籃的均線位置。名稱必須和證交所官方名稱一致才算；均線由自建歷史計算，歷史不足的均線留空。"""
+    rows, err = fetch_json(config.TWSE_AVG_URL)
+    names = {}
+    if isinstance(rows, list):
+        for r in rows:
+            if isinstance(r, dict):
+                names[str(r.get("Code", "")).strip()] = str(r.get("Name", "")).strip()
+    if not names:
+        log("tw_leaders", "failure", detail=_clip(f"取不到證交所代號名稱表，無法核對: {err}"))
+        return []
+    out = []
+    since = (date.today() - timedelta(days=400)).isoformat()
+    for code, (name, tier) in config.TW_LEADERS.items():
+        if names.get(code) != name:
+            log(f"tw_leaders:{code}", "failure", detail=f"官方名稱是 {names.get(code)!r}，和預期的 {name!r} 不符，不計算")
+            continue
+        hist, err = sb_request("GET", f"tw_hist?select=as_of,close&code=eq.{code}&market=eq.TWSE&as_of=gte.{since}&order=as_of.asc&limit=1000")
+        if not hist or len(hist) < 21:
+            log(f"tw_leaders:{code}", "failure", detail=_clip(f"自建歷史只有 {len(hist or [])} 個交易日，不足 21 天: {err or ''}"))
+            continue
+        closes = [float(h["close"]) for h in hist]
+        ma = lambda n: round(sum(closes[-n:]) / n, 3) if len(closes) >= n else None
+        ret5 = round((closes[-1] / closes[-6] - 1) * 100, 3) if len(closes) >= 6 else None
+        out.append({"as_of": hist[-1]["as_of"], "code": code, "name": name, "tier": tier, "close": closes[-1],
+                    "ma20": ma(20), "ma60": ma(60), "ma200": ma(200), "ret5": ret5})
+    if out:
+        log("tw_leaders", "success", as_of=out[0]["as_of"], detail=f"{len(out)} / {len(config.TW_LEADERS)} 檔")
+    return out
+
+
+def fred_history_rows(series_id, low, high):
+    """FRED 最近一段歷史（用各筆自己的日期）。回傳 [{series_id,label,as_of,value,source}]，失敗回傳 None。"""
+    key = config.fred_key()
+    if not key:
+        return None
+    start = (date.today() - timedelta(days=config.FRED_HISTORY_DAYS)).isoformat()
+    url = f"{config.FRED_SERIES_URL}?series_id={series_id}&api_key={key}&file_type=json&sort_order=asc&observation_start={start}"
+    data, err = fetch_json(url)
+    if data is None or not isinstance(data, dict) or not isinstance(data.get("observations"), list):
+        log(f"fred_history:{series_id}", "failure", detail=_clip(f"FRED 歷史抓取失敗: {err}"))
+        return None
+    label = config.FRED_MACRO[series_id][0]
+    out, bad = [], 0
+    for obs in data["observations"]:
+        v, why = validate_value(obs.get("value"), low, high)
+        if v is None:
+            if "超出合理範圍" in why:
+                bad += 1
+            continue                                                         # 假日空值略過
+        ok, _ = validate_close_date(obs.get("date"))
+        if ok:
+            out.append({"series_id": series_id, "label": label, "as_of": obs["date"], "value": v, "source": "FRED"})
+    if bad:
+        log(f"fred_history:{series_id}", "failure", detail=f"{bad} 筆超出合理範圍，已略過")
+    return out
+
+
+def fred_history_backfill():
+    """模組 M06：把 SP500、NASDAQCOM、DJIA 的近一年歷史寫進 macro_series（用來算從高點回落與月績效）。"""
+    out = []
+    for sid in config.FRED_HISTORY:
+        low, high = config.FRED_MACRO[sid][1], config.FRED_MACRO[sid][2]
+        rows = fred_history_rows(sid, low, high)
+        if rows:
+            out.extend(rows)
+            log(f"fred_history:{sid}", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 筆（{rows[0]['as_of']} 到 {rows[-1]['as_of']}）")
+    return out
+
+
+def tw_index_history():
+    """模組 M05：加權指數近 13 個月的收盤與成交金額（證交所 FMTQIK 每月一次，間隔 3 秒），用來算從高點回落、下跌放量。"""
+    today = date.today()
+    out = []
+    y, m = today.year, today.month
+    for i in range(config.TW_INDEX_HISTORY_MONTHS):
+        url = f"{config.TWSE_FMTQIK}?response=json&date={y}{m:02d}01"
+        rows, why = _twse_month_rows(url)
+        time.sleep(config.HIST_SLEEP)
+        if rows is None:
+            log("tw_index_history", "failure", detail=_clip(f"{y}-{m:02d}：{why}；已停止，不繼續打請求"))
+            return out
+        out.extend(rows)
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    if out:
+        log("tw_index_history", "success", as_of=max(r["as_of"] for r in out), detail=f"{len(out)} 個交易日（{min(r['as_of'] for r in out)} 到 {max(r['as_of'] for r in out)}）")
+    return out
+
+
+def persist_extra(dry_run, tables):
+    """寫入模組產出的資料表：tables = [(表名, 列, on_conflict)]。每張表獨立，一張寫失敗不影響其他。"""
+    for table, rows, conflict in tables:
+        if not rows:
+            continue
+        if dry_run or not sb_ready():
+            log(f"persist:{table}", "skipped", detail=f"{'--dry-run' if dry_run else '未設定 Supabase'}：{len(rows)} 筆不寫入")
+            continue
+        for chunk in _chunks(rows, 500):
+            ok, msg = sb_upsert(table, chunk, conflict)
+            if not ok:
+                log(f"persist:{table}", "failure", detail=_clip(msg))
+                break
+        else:
+            log(f"persist:{table}", "success", detail=f"已確認寫入 {len(rows)} 筆")
+
+
+def probe_round3():
+    """只讀探測第三批：1) 證交所、櫃買中心的財報資訊（三率）；2) AAII 散戶情緒；3) Nasdaq-100 名單；4) SOX 指數報價的真實結構。"""
+    for tag, sw_url, base, known in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE, None), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE, "/mopsfin_t187ap06_O_ciA")):
+        sw, err = fetch_json(sw_url)
+        if sw is None or not isinstance(sw, dict):
+            log(f"probe:fin:{tag}", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
+            continue
+        cands = []
+        for path, methods in (sw.get("paths") or {}).items():
+            for mth in (methods or {}).values():
+                text = str(mth.get("summary", "")) if isinstance(mth, dict) else ""
+                if any(k in text for k in config.FIN_KEYWORDS):
+                    cands.append((path, text))
+        log(f"probe:fin:{tag}", "success" if cands else "no_new_data", detail=_clip("財報資訊相關端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands[:12]) if cands else "無")))
+        pick = known if known and any(c[0] == known for c in cands) else next((c[0] for c in cands if "一般業" in c[1] or "_ci" in c[0]), None)
+        if pick:
+            rows, err = fetch_json(_openapi_base(sw, base) + pick)
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                log(f"probe:fin_rows:{tag}", "success", detail=_clip(f"{pick}｜共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜第 1 列 {rows[0]}"))
+            else:
+                log(f"probe:fin_rows:{tag}", "failure", detail=_clip(f"{pick} 抓取失敗或格式非預期: {err or str(rows)[:120]}"))
+    status, ctype, body, err = fetch_raw(config.AAII_URL, timeout=config.PROBE_TIMEOUT, headers={"User-Agent": config.NASDAQ_UA, "Accept": "text/html"})
+    if status is None:
+        log("probe:aaii", "failure", detail=_clip(f"連線失敗: {err}"))
+    else:
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body.decode("utf-8", errors="replace")))
+        i = text.find("Bullish")
+        log("probe:aaii", "success" if (status == 200 and i >= 0) else "failure",
+            detail=_clip(f"HTTP {status}｜{ctype}｜{len(body)} 位元組｜" + (f"『Bullish』附近：{text[i:i + 300]}" if i >= 0 else "頁面文字裡找不到 Bullish（被擋或要登入）")))
+    status, ctype, body, err = fetch_raw(config.NASDAQ100_URL, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+    if status is None:
+        log("probe:nasdaq100", "failure", detail=_clip(f"連線失敗: {err}"))
+    else:
+        try:
+            j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+            data = (j or {}).get("data") or {}
+            rows = ((data.get("data") or {}).get("rows") if isinstance(data.get("data"), dict) else None) or data.get("rows") or []
+            log("probe:nasdaq100", "success" if rows else "failure", detail=_clip(f"HTTP {status}｜{len(rows)} 列｜資料鍵 {list(data.keys())}｜第 1 列 {rows[0] if rows else None}｜日期相關 {data.get('date') or (data.get('data') or {}).get('date') if isinstance(data.get('data'), dict) else data.get('date')}"))
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            log("probe:nasdaq100", "failure", detail=_clip(f"HTTP {status}｜不是 JSON：{body[:120].decode('utf-8', errors='replace')!r}"))
+    status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol="SOX", assetclass="index"), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+    if status is None:
+        log("probe:sox", "failure", detail=_clip(f"連線失敗: {err}"))
+    else:
+        try:
+            d = (json.loads(body.decode("utf-8-sig").lstrip("\ufeff")) or {}).get("data")
+            log("probe:sox", "success" if isinstance(d, dict) and d.get("primaryData") else "failure",
+                detail=_clip(f"HTTP {status}｜marketStatus={d.get('marketStatus') if isinstance(d, dict) else None}｜primary={d.get('primaryData') if isinstance(d, dict) else None}｜資料鍵 {list(d.keys()) if isinstance(d, dict) else d}"))
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            log("probe:sox", "failure", detail=_clip(f"HTTP {status}｜不是 JSON"))
+
+
 def probe_us_pressure():
     """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
     1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
@@ -2078,7 +2387,9 @@ def run_job(job, dry_run=False):
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
-            r = fred_latest(sid, low, high)
+            if sid in ("DJIA", "BAMLH0A0HYM2", "RU2000PR") and not config.FEATURES.get("M01_fred_extra", True):
+                continue
+            r = fred_latest(sid, low, high, optional=sid in config.FRED_OPTIONAL)
             if r:
                 macro_rows.append({"series_id": sid, "label": label, "as_of": r["as_of"],
                                    "value": r["value"], "source": "FRED"})
@@ -2108,6 +2419,7 @@ def run_job(job, dry_run=False):
         probe_taifex_daily()
     if job == "us_probe":
         probe_earnings()
+        probe_round3()
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
@@ -2119,7 +2431,20 @@ def run_job(job, dry_run=False):
     if job == "us_breadth":
         log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
 
+    extra = []
+    if job in ("full", "tw_close"):
+        extra.append(("us_quotes", _run_module("M02", "美股其他行情", us_extra_quotes) or [], "symbol,as_of"))
+        extra.append(("sector_rs", _run_module("M03", "美股產業相對強弱", sector_rs) or [], "symbol,as_of"))
+        if not dry_run:
+            extra.append(("tw_leaders", _run_module("M04", "台股領頭股", tw_leaders_compute) or [], "as_of,code"))
+    if job == "tw_backfill":
+        extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
+        extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
+        if not dry_run:
+            extra.append(("tw_leaders", _run_module("M04", "台股領頭股", tw_leaders_compute) or [], "as_of,code"))
+    extra = [(t, r or [], c) for t, r, c in extra]
     persist(dry_run, macro_rows, twd_row, tw_rows, breadth_rows, inst_rows, margin_rows, futures_rows, basis_rows, price_rows, cot_rows, putcall_rows, earnings_rows)
+    persist_extra(dry_run, extra)
     return {"job": job, "macro": macro_rows, "twd": twd_row, "tw_market": tw_rows,
             "tw_breadth": breadth_rows, "tw_institutional": inst_rows, "tw_margin": margin_rows,
             "tw_futures": futures_rows, "tw_basis": basis_rows, "prices": price_rows, "us_cot": cot_rows, "us_putcall": putcall_rows, "us_earnings": earnings_rows}

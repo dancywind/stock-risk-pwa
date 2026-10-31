@@ -38,7 +38,16 @@ FRED_MACRO = {
     "DTWEXBGS": ("美元廣義指數(聯準會，非 ICE DXY)", 50.0, 200.0),
     # 聯準會 Z.1「券商對客戶的融資及其他應收款」季資料（百萬美元）。範圍和頻率都和 FINRA 的月資料不同，只當大方向參考。
     "BOGZ1FL663067003Q": ("美國券商對客戶融資及其他應收款(Fed Z.1 季資料，百萬美元)", 100000.0, 5000000.0),
+    # 模組 M01：重要指數補齊（FRED 官方日資料）
+    "DJIA": ("道瓊工業指數", 1000.0, 200000.0),
+    "BAMLH0A0HYM2": ("美國高收益債信用利差(ICE BofA OAS，%)", 0.5, 30.0),
+    "RU2000PR": ("Russell 2000 指數", 100.0, 20000.0),
 }
+# 可能不存在或授權限制的序列：抓不到時記「沒有資料」，不算失敗，不讓排程亮紅燈
+FRED_OPTIONAL = {"RU2000PR"}
+# 模組 M06：這幾個序列另外回補一段歷史，用來算「從高點回落幅度」與月績效
+FRED_HISTORY = ("SP500", "NASDAQCOM", "DJIA")
+FRED_HISTORY_DAYS = 400
 TWD_FRED_SERIES = "DEXTAUS"
 TWD_RANGE = (20.0, 45.0)  # 美元兌台幣合理範圍
 
@@ -138,11 +147,36 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v29"
+PIPELINE_VERSION = "v30"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
 EARNINGS_MAX_AHEAD_DAYS = 200      # 財報日比今天晚超過這麼多天，視為解析錯誤
+# 模組開關：改成 False 就整個關掉（排程不抓、網站顯示未啟用）。任何一個模組壞掉，不會影響其他模組。
+FEATURES = {"M01_fred_extra": True, "M02_us_quotes": True, "M03_sector_rs": True, "M04_tw_leaders": True,
+            "M05_tw_index_history": True, "M06_fred_history": True}
+# 模組 M02：美股其他行情（Nasdaq 報價，只採用已收盤的價格）。QQQ 只存漲跌幅，不存價格（規格 §13）。
+US_QUOTES = (
+    ("SPY", "標普 500 ETF（SPY）", "etf", ("etf",), 50.0, 3000.0, True),
+    ("TLT", "20 年以上美債 ETF（TLT）", "etf", ("etf",), 20.0, 400.0, True),
+    ("GLD", "黃金 ETF（GLD，不是黃金期貨）", "etf", ("etf",), 100.0, 1500.0, True),
+    ("QQQ", "納斯達克 100 ETF（QQQ，只顯示漲跌幅）", "etf_proxy", ("etf",), 50.0, 3000.0, False),
+    ("SOX", "費城半導體指數（SOX）", "index", ("index",), 500.0, 100000.0, True),
+)
+US_QUOTE_FALLBACKS = {"GLD": ("IAU", "黃金 ETF（IAU，備用，不是黃金期貨）", 20.0, 800.0)}
+# 模組 M03：美股產業相對強弱（11 檔產業 ETF 對 SPY；Nasdaq 歷史行情）
+SECTOR_ETFS = {"XLK": "科技", "XLF": "金融", "XLE": "能源", "XLV": "醫療保健", "XLY": "非必需消費", "XLP": "必需消費",
+               "XLI": "工業", "XLU": "公用事業", "XLB": "原物料", "XLRE": "房地產", "XLC": "通訊服務"}
+SECTOR_BENCH = "SPY"
+SECTOR_MIN_ROWS = 25
+# 模組 M04：台股領頭股（規格 §11）。第 1 層台積電、第 2 層確認籃；代號會用官方名稱核對，對不上就不算。
+TW_LEADERS = {"2330": ("台積電", 1), "2317": ("鴻海", 2), "2454": ("聯發科", 2), "2308": ("台達電", 2), "3711": ("日月光投控", 2), "2383": ("台光電", 2)}
+# 模組 M05：加權指數歷史（用來算從高點回落、下跌放量）
+TW_INDEX_HISTORY_MONTHS = 13
+# 探測第三批（只讀）：三率用的財報資訊、AAII 散戶情緒、Nasdaq-100 名單、SOX 指數報價
+FIN_KEYWORDS = ("財報資訊", "綜合損益")
+AAII_URL = "https://www.aaii.com/sentimentsurvey"
+NASDAQ100_URL = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
 JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill")
