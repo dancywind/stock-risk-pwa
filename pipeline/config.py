@@ -121,6 +121,7 @@ TWD_LAG_DAYS = 2
 # 大跌檢視清單（台灣：單日跌幅 9% 以上自動加入，一律標「待確認」）
 CRASH_DROP_PCT = 9.0
 CRASH_RECENT_DAYS = 10            # 回補工作每次重新檢查最近幾個完成的交易日
+CRASH_MAX_AGE_DAYS = 30           # 只檢查最近這麼多天內的交易日；更早的大跌不加入清單（避免把歷史回補的整年資料都收進來）
 CRASH_PREV_MAX_GAP_DAYS = 10      # 前一個交易日距離超過這麼多天，就不比較（避免拿很舊的價格算跌幅）
 # 槓桿 ETF 的 52 週區間：用 Nasdaq 歷史行情算。價格出現這個倍數以上的單日跳動，視為分割或反向分割沒有調整，不採用。
 SPLIT_JUMP_UP = 2.5
@@ -137,7 +138,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v28"
+PIPELINE_VERSION = "v29"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

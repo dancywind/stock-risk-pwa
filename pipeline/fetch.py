@@ -1634,6 +1634,11 @@ def tw_crash_check(days, dry_run=False, threshold=None):
         by.setdefault(r["as_of"], set()).add(r["market"])
     complete = sorted((d for d, m in by.items() if {"TWSE", "TPEX"} <= m), reverse=True)
     found = []
+    cutoff = (date.today() - timedelta(days=config.CRASH_MAX_AGE_DAYS)).isoformat()
+    skipped_old = [d for d in set(days) if d < cutoff]
+    if skipped_old:
+        log("tw_crash", "no_new_data", detail=f"略過 {len(skipped_old)} 個超過 {config.CRASH_MAX_AGE_DAYS} 天的交易日（大跌檢視只看近期）")
+    days = [d for d in days if d >= cutoff]
     for d in sorted(set(days)):
         if d not in complete:
             continue
