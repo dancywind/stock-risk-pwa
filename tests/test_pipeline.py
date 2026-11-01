@@ -2440,9 +2440,17 @@ def test_fred_history_rows_uses_own_dates_and_skips_holidays():
 
 def test_fred_history_backfill_collects_all_configured_series():
     reset()
-    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": D(3), "value": "6000"}]}, "")):
+    def fj(url, **k):                                                            # 每個序列要給它合理範圍內的數字（VIX 不可能是 6000）
+        sid = url.split("series_id=")[1].split("&")[0]
+        return {"observations": [{"date": D(3), "value": "20" if sid == "VIXCLS" else "6000"}]}, ""
+    with with_key(), mock.patch.object(fetch, "fetch_json", side_effect=fj):
         rows = REAL["fred_history_backfill"]()
-    assert {r["series_id"] for r in rows} == set(config.FRED_HISTORY) == {"SP500", "NASDAQCOM", "DJIA"}
+    assert {r["series_id"] for r in rows} == set(config.FRED_HISTORY) == {"SP500", "NASDAQCOM", "DJIA", "VIXCLS"}
+    assert [r["value"] for r in rows if r["series_id"] == "VIXCLS"] == [20.0]
+    reset()
+    with with_key(), mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": D(3), "value": "6000"}]}, "")):      # 用錯單位的 VIX 要被拒收，不能被寫進去
+        rows = REAL["fred_history_backfill"]()
+    assert "VIXCLS" not in {r["series_id"] for r in rows}
 
 
 def test_tw_index_history_walks_months_back_and_stops_on_error():
