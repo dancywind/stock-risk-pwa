@@ -2761,6 +2761,59 @@ def test_run_job_wires_v32_modules_and_isolates_failures():
         for p_ in patches: p_.stop()
 
 
+def test_tw_financials_uses_listed_company_endpoint_never_the_public_issuer_one():
+    reset()
+    # 真實的證交所說明文件裡，「公發公司（_X_）」排在「上市公司（_L_）」前面；選錯的話，上市持股全部落空
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {
+        "/opendata/t187ap06_X_ci": {"get": {"summary": "公發公司綜合損益表-一般業"}}, "/opendata/t187ap06_L_bd": {"get": {"summary": "上市公司綜合損益表(證券期貨業)"}},
+        "/opendata/t187ap06_L_ci": {"get": {"summary": "上市公司綜合損益表(一般業)"}}}}
+    sw2 = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/mopsfin_t187ap06_O_ciA": {"get": {"summary": "上櫃公司財報資訊( 一般業)"}}}}
+    urls = []
+    def fj(url, **k):
+        urls.append(url)
+        if url.endswith("swagger.json") and "twse" in url: return sw, ""
+        if "tpex" in url and "swagger" in url: return sw2, ""
+        if url.endswith("t187ap06_L_ci"): return [fin_row("2330", "台積電")], ""
+        if url.endswith("t187ap06_X_ci"): return [fin_row("9999", "不是上市公司")], ""
+        if url.endswith("mopsfin_t187ap06_O_ciA"): return [fin_row("8358", "金居", gp="300,000", op="100,000", ni="80,000")], ""
+        raise AssertionError(url)
+    prices = [{"market": "TW", "code": "2330", "name": "台積電"}, {"market": "TW", "code": "8358", "name": "金居"}]
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        out = REAL["tw_financials"](prices)
+    assert sorted(r["code"] for r in out) == ["2330", "8358"], "上市的台積電必須抓得到"
+    assert not any(u.endswith("_X_ci") for u in urls) and any(u.endswith("t187ap06_L_ci") for u in urls)
+    reset()
+    sw_only_x = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap06_X_ci": {"get": {"summary": "公發公司綜合損益表-一般業"}}}}
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (sw_only_x, "") if "twse" in u and u.endswith("swagger.json") else (sw2, "") if "swagger" in u else ([fin_row("8358", "金居")], "")):
+        out = REAL["tw_financials"](prices)
+    assert [r["code"] for r in out] == ["8358"], "只有公發公司端點時，上市那邊寫失敗，不拿它充數"
+    assert {x["source"]: x["status"] for x in fetch.LOG}["tw_fin:twse"] == "failure"
+
+
+def test_us_crash_screen_confirms_deepest_drops_first_and_says_when_it_truncates():
+    reset()
+    lst = [{"symbol": f"S{i:02d}", "companyName": f"公司{i}", "percentageChange": f"-{5 + i * 0.1:.2f}%"} for i in range(10)] + [{"symbol": "SMALL", "companyName": "x", "percentageChange": "-1.00%"}]
+    confirmed = []
+    def raw(url, timeout=None, headers=None):
+        if "list-type/nasdaq100" in url: return 200, "application/json", nas100_body(lst), ""
+        sym = url.split("/quote/")[1].split("/")[0]
+        confirmed.append(sym)
+        i = int(sym[1:])
+        return 200, "application/json", nas_quote_body(price="$90.00", pct=f"-{5 + i * 0.1:.2f}%", asset="stocks"), ""
+    with mock.patch.object(config, "US_CRASH_MAX_CONFIRM", 4), mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        out = REAL["us_crash_screen"]()
+    assert confirmed == ["S09", "S08", "S07", "S06"], "跌最多的先確認: " + str(confirmed)
+    assert [r["symbol"] for r in out] == ["S09", "S08", "S07", "S06"]
+    assert "只確認跌最多的前 4 檔，清單不完整" in [x for x in fetch.LOG if x["source"] == "us_crash:list"][0]["detail"]
+    assert "初篩跌幅達 5.0% 的有 10 檔" in [x for x in fetch.LOG if x["source"] == "us_crash:list"][0]["detail"]
+    assert all("當天初篩 10 檔，只確認跌最多的前 4 檔，清單不完整" in r["note"] for r in out)
+    reset(); confirmed.clear()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):          # 沒超過上限：不該有「不完整」字樣
+        out = REAL["us_crash_screen"]()
+    assert len(out) == 10 and not any("不完整" in r["note"] for r in out) and "不完整" not in [x for x in fetch.LOG if x["source"] == "us_crash:list"][0]["detail"]
+    assert config.US_CRASH_MAX_CONFIRM >= 60
+
+
 def test_probe_round4_logs_aaii_clues_and_exright_sources_without_writing():
     reset()
     html = (b"<html><script>var x={\"contentUrl\":\"https://www.aaii.com/files/sentiment.xls\"}</script><body>"
