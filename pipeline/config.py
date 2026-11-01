@@ -46,7 +46,7 @@ FRED_MACRO = {
 # 可能不存在或授權限制的序列：抓不到時記「沒有資料」，不算失敗，不讓排程亮紅燈
 FRED_OPTIONAL = {"RU2000PR"}
 # 模組 M06：這幾個序列另外回補一段歷史，用來算「從高點回落幅度」與月績效
-FRED_HISTORY = ("SP500", "NASDAQCOM", "DJIA")
+FRED_HISTORY = ("SP500", "NASDAQCOM", "DJIA", "VIXCLS")      # VIXCLS 用來算門檻的近一年分布
 FRED_HISTORY_DAYS = 400
 TWD_FRED_SERIES = "DEXTAUS"
 TWD_RANGE = (20.0, 45.0)  # 美元兌台幣合理範圍
@@ -147,7 +147,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v35"
+PIPELINE_VERSION = "v36"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
