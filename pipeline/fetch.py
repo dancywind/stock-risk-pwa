@@ -15,6 +15,7 @@
     python3 pipeline/fetch.py --job full --dry-run  # 照常抓資料，但不寫 Supabase
 """
 import argparse
+from collections import Counter
 import json
 import os
 import re
@@ -41,6 +42,9 @@ def _scrub(text):
         if secret:
             text = text.replace(secret, "***")
     return text
+
+
+FETCH_VERSION = "v37"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2233,6 +2237,7 @@ def tw_financials(price_rows):
         log("tw_fin", "skipped", detail="沒有台股持股代號，不抓財報資訊")
         return []
     out = []
+    cover = {}
     sw, err = fetch_json(config.TWSE_OPENAPI_SWAGGER)
     path = None
     if isinstance(sw, dict):
@@ -2254,8 +2259,20 @@ def tw_financials(price_rows):
         if got is None:
             log(f"tw_fin:{tag}", "failure", detail=_clip(f"{pth} 抓取失敗或欄位對不上：{e or ''}欄位 {keys}"))
             continue
-        log(f"tw_fin:{tag}", "success" if got else "no_new_data", detail=f"{pth}｜{len(got)} 檔持股有三率" + (f"（{got[0]['year']} 年第 {got[0]['quarter']} 季）" if got else "；你的持股不在這個來源（金融業或其他業別？）"))
+        kc_, ky_, kq_ = _fin_key(keys, ("公司代號",)), _fin_key(keys, ("年度",)), _fin_key(keys, ("季別",))
+        dicts = [r for r in rows if isinstance(r, dict)]
+        present_codes = {str(r.get(kc_, "")).strip() for r in dicts}
+        cover[tag] = {"n": len(dicts), "present": present_codes, "got": {g["code"] for g in got},
+                      "dist": [f"{y}年第{q}季×{n}" for (y, q), n in Counter((str(r.get(ky_, "")).strip(), str(r.get(kq_, "")).strip()) for r in dicts).most_common(3)]}
+        log(f"tw_fin:{tag}", "success" if got else "no_new_data", detail=f"{pth}｜{len(got)} 檔持股有三率" + (f"（{got[0]['year']} 年第 {got[0]['quarter']} 季）" if got else "；你的持股目前不在這個資料集（資料集只放已公布最新一季的公司：可能還沒公布，或不是一般業）"))
         out.extend(got)
+    if cover:
+        present_all = set().union(*[c["present"] for c in cover.values()]); got_all = set().union(*[c["got"] for c in cover.values()])
+        absent = sorted(f"{c} {n}" for c, n in wanted.items() if c not in present_all)
+        skipped = sorted(f"{c} {wanted[c]}" for c in wanted if c in present_all and c not in got_all)
+        log("tw_fin:coverage", "success" if not absent and not skipped else "no_new_data",
+            detail=_clip("；".join(f"{t}：資料集 {c['n']} 列（{'、'.join(c['dist'])}）" for t, c in cover.items()) +
+                         f"｜持股 {len(wanted)} 檔：有三率 {len(got_all)} 檔｜不在任何資料集：{'、'.join(absent) or '無'}｜在資料集但欄位缺值被略過：{'、'.join(skipped) or '無'}"))
     return out
 
 
@@ -2743,7 +2760,9 @@ def main(argv=None):
 
     global CURRENT_JOB
     CURRENT_JOB = args.job
-    log("pipeline:version", "success", detail=f"程式版本 {config.PIPELINE_VERSION}｜工作 {args.job}｜{'dry-run' if args.dry_run else '正式寫入'}")
+    log("pipeline:version", "success", detail=f"程式版本 {config.PIPELINE_VERSION}｜fetch {FETCH_VERSION}｜工作 {args.job}｜{'dry-run' if args.dry_run else '正式寫入'}")
+    if FETCH_VERSION != config.PIPELINE_VERSION:                      # 兩個檔案沒有一起更新：新功能可能沒有生效，要讓它在 Actions 亮紅燈
+        log("pipeline:version_mismatch", "failure", detail=f"config.py 是 {config.PIPELINE_VERSION}，fetch.py 是 {FETCH_VERSION}：檔案沒有一起更新，請把 pipeline 資料夾裡的 fetch.py 和 config.py 都換成同一版")
     result = run_job(args.job, dry_run=args.dry_run)
     log_ok = flush_log(args.dry_run)
 
