@@ -2606,6 +2606,33 @@ def test_tw_financials_reads_both_exchanges_and_reports_missing_holdings():
     assert "欄位 ['x']" in [x for x in fetch.LOG if x["source"] == "tw_fin:twse"][0]["detail"]                            # 欄位對不上要把欄位清單記下來，我才知道怎麼改
 
 
+def test_tw_financials_logs_coverage_so_missing_holdings_can_be_explained():
+    reset()
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap06_L_ci": {"get": {"summary": "上市公司綜合損益表(一般業)"}}}}
+    sw2 = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/mopsfin_t187ap06_O_ciA": {"get": {"summary": "上櫃公司財報資訊( 一般業)"}}}}
+    bad = fin_row("2454", "聯發科"); bad["營業毛利（毛損）"] = ""                                             # 在資料集，但毛利是空的 → 被略過
+    def fj(url, **k):
+        if url.endswith("swagger.json") and "twse" in url: return sw, ""
+        if "tpex" in url and "swagger" in url: return sw2, ""
+        if url.endswith("t187ap06_L_ci"): return [fin_row("2383", "台光電"), bad, fin_row("1101", "台泥")], ""      # 台積電根本不在資料集
+        if url.endswith("mopsfin_t187ap06_O_ciA"): return [fin_row("8358", "金居")], ""
+        raise AssertionError(url)
+    prices = [{"market": "TW", "code": c, "name": n} for c, n in (("2383", "台光電"), ("2330", "台積電"), ("2454", "聯發科"), ("8358", "金居"))]
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        out = REAL["tw_financials"](prices)
+    assert sorted(r["code"] for r in out) == ["2383", "8358"]
+    cov = [x for x in fetch.LOG if x["source"] == "tw_fin:coverage"][0]
+    assert cov["status"] == "no_new_data" and "持股 4 檔：有三率 2 檔" in cov["detail"]
+    assert "不在任何資料集：2330 台積電" in cov["detail"] and "在資料集但欄位缺值被略過：2454 聯發科" in cov["detail"], cov["detail"]
+    assert "twse：資料集 3 列" in cov["detail"] and "tpex：資料集 1 列" in cov["detail"] and "年第" in cov["detail"]
+    reset()                                                                                                     # 全部都有 → success、寫「無」
+    prices2 = [{"market": "TW", "code": "2383", "name": "台光電"}, {"market": "TW", "code": "8358", "name": "金居"}]
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        REAL["tw_financials"](prices2)
+    cov = [x for x in fetch.LOG if x["source"] == "tw_fin:coverage"][0]
+    assert cov["status"] == "success" and "不在任何資料集：無" in cov["detail"] and "被略過：無" in cov["detail"]
+
+
 def nas100_body(rows):
     return json.dumps({"data": {"data": {"rows": rows}}}).encode()
 
