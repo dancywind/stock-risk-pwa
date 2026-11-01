@@ -2239,9 +2239,9 @@ def tw_financials(price_rows):
         for pth, methods in (sw.get("paths") or {}).items():
             for mth in (methods or {}).values():
                 text = str(mth.get("summary", "")) if isinstance(mth, dict) else ""
-                if "一般業" in text and ("綜合損益" in text or "財報資訊" in text):
-                    path = path or pth
-        path = path or next((pth for pth in (sw.get("paths") or {}) if "t187ap06" in pth and pth.endswith("_ci")), None)
+                if text.startswith("上市公司") and "一般業" in text and ("綜合損益" in text or "財報資訊" in text) and "_X_" not in pth:
+                    path = path or pth                                    # 必須是「上市公司」；「公發公司」（_X_）不是上市股票，選到它你的持股會全部落空
+        path = path or ("/opendata/t187ap06_L_ci" if "/opendata/t187ap06_L_ci" in (sw.get("paths") or {}) else None)
     sources = [("twse", sw, config.TWSE_OPENAPI_BASE, path, "證交所 上市公司財報資訊（一般業）")]
     sw2, err2 = fetch_json(config.TPEX_SWAGGER)
     sources.append(("tpex", sw2, config.TPEX_DEFAULT_BASE, config.TPEX_FIN_PATH, "櫃買中心 上櫃公司財報資訊（一般業）"))
@@ -2284,7 +2284,10 @@ def us_crash_screen():
         pct = parse_pct(next((r[k] for k in ("percentageChange", "pctChange", "change_pct") if k in r), None))
         if sym and pct is not None and pct <= -config.US_CRASH_PCT:
             cands.append((sym, str(r.get("companyName") or r.get("name") or "").strip(), pct))
-    log("us_crash:list", "success", detail=f"名單 {len(rows)} 檔；初篩跌幅達 {config.US_CRASH_PCT}% 的有 {len(cands)} 檔")
+    cands.sort(key=lambda x: x[2])                                     # 跌最多的先確認，萬一超過上限，漏掉的是跌得比較少的
+    cut = len(cands) > config.US_CRASH_MAX_CONFIRM
+    log("us_crash:list", "success", detail=f"名單 {len(rows)} 檔；初篩跌幅達 {config.US_CRASH_PCT}% 的有 {len(cands)} 檔" +
+        (f"；超過上限，只確認跌最多的前 {config.US_CRASH_MAX_CONFIRM} 檔，清單不完整" if cut else ""))
     out = []
     for sym, name, pct in cands[:config.US_CRASH_MAX_CONFIRM]:
         q, why = _nasdaq_quote(sym, ("stocks",))
@@ -2296,7 +2299,7 @@ def us_crash_screen():
             log(f"us_crash:{sym}", "no_new_data", as_of=q["as_of"], detail=f"名單說 {pct}%，個股報價是 {q['pct']}%，沒有達到門檻，不加入")
             continue
         out.append({"as_of": q["as_of"], "symbol": sym, "name": name, "close": q["close"], "prev_close": round(q["close"] / (1 + q["pct"] / 100), 4),
-                    "drop_pct": round(q["pct"], 2), "note": "Nasdaq-100 名單初篩、個股已收盤報價確認；若當天有分割或除息，跌幅可能是調整造成，原因待確認",
+                    "drop_pct": round(q["pct"], 2), "note": "Nasdaq-100 名單初篩、個股已收盤報價確認；若當天有分割或除息，跌幅可能是調整造成，原因待確認" + (f"。當天初篩 {len(cands)} 檔，只確認跌最多的前 {config.US_CRASH_MAX_CONFIRM} 檔，清單不完整" if cut else ""),
                     "source": "Nasdaq 報價（已收盤，只涵蓋 Nasdaq-100）"})
         log(f"us_crash:{sym}", "success", as_of=q["as_of"], detail=f"單日 {q['pct']}%，收盤 {q['close']}")
     return out

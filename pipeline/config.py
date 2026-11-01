@@ -147,7 +147,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v33"
+PIPELINE_VERSION = "v34"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -181,7 +181,7 @@ NASDAQ100_URL = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
 # v32 模組
 TPEX_FIN_PATH = "/mopsfin_t187ap06_O_ciA"           # 上櫃公司財報資訊（一般業）；上市那邊用說明文件找路徑
 US_CRASH_PCT = 5.0                                  # M08：Nasdaq-100 成分股單日跌幅門檻
-US_CRASH_MAX_CONFIRM = 20                           # 初篩最多逐檔確認幾檔
+US_CRASH_MAX_CONFIRM = 60                           # 初篩最多逐檔確認幾檔（Nasdaq-100 只有約 100 檔；超過會在紀錄和備註裡明說）
 US_LEADERS = {"AAPL": "蘋果", "MSFT": "微軟", "GOOGL": "Alphabet", "AMZN": "亞馬遜", "NVDA": "輝達", "META": "Meta", "TSLA": "特斯拉", "AVGO": "博通", "TSM": "台積電 ADR"}
 US_LEADER_HISTORY_DAYS = 130
 # 探測第四批（只讀）：台股除權息預告（證交所）
