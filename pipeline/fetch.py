@@ -1960,10 +1960,10 @@ def us_extra_quotes():
     return out
 
 
-def _nasdaq_history(sym):
-    """Nasdaq 歷史行情（約 60 天，ETF）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。"""
+def _nasdaq_history(sym, assetclass="etf", days=75):
+    """Nasdaq 歷史行情（預設約 60 天，ETF）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。"""
     today = date.today()
-    url = config.NASDAQ_HIST_URL.format(symbol=sym, assetclass="etf", fromdate=(today - timedelta(days=75)).isoformat(), todate=today.isoformat())
+    url = config.NASDAQ_HIST_URL.format(symbol=sym, assetclass=assetclass, fromdate=(today - timedelta(days=days)).isoformat(), todate=today.isoformat())
     status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
     if status is None:
         return None, f"連線失敗: {err}"
@@ -2182,6 +2182,282 @@ def probe_round3():
                 detail=_clip(f"HTTP {status}｜marketStatus={d.get('marketStatus') if isinstance(d, dict) else None}｜primary={d.get('primaryData') if isinstance(d, dict) else None}｜資料鍵 {list(d.keys()) if isinstance(d, dict) else d}"))
         except (ValueError, UnicodeDecodeError, AttributeError):
             log("probe:sox", "failure", detail=_clip(f"HTTP {status}｜不是 JSON"))
+
+
+def _fin_key(keys, needles, exclude=()):
+    for k in keys:
+        if any(n in k for n in needles) and not any(x in k for x in exclude):
+            return k
+    return None
+
+
+def _fin_rows(rows, wanted, source):
+    """把財報資訊（一般業）轉成三率。欄位用名稱關鍵字找，找不到就回傳 (None, 欄位清單)，不猜。"""
+    if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+        return None, []
+    keys = list(rows[0].keys())
+    k = {"code": _fin_key(keys, ("公司代號",)), "name": _fin_key(keys, ("公司名稱",)), "year": _fin_key(keys, ("年度",)), "q": _fin_key(keys, ("季別",)),
+         "rev": _fin_key(keys, ("營業收入",), ("成本",)), "gp": _fin_key(keys, ("營業毛利",), ("未實現", "已實現", "淨額")),
+         "op": _fin_key(keys, ("營業利益",)), "ni": _fin_key(keys, ("本期淨利", "稅後淨利"), ("歸屬", "非控制"))}
+    if None in (k["code"], k["year"], k["q"], k["rev"], k["gp"], k["op"], k["ni"]):
+        return None, keys
+    out = []
+    for r in rows:
+        code = str(r.get(k["code"], "")).strip()
+        if code not in wanted:
+            continue
+        try:
+            y = int(str(r.get(k["year"], "")).strip())
+            qs = str(r.get(k["q"], ""))
+            qm = re.search(r"[1-4]", qs)
+            q = int(qm.group(0)) if qm else {"一": 1, "二": 2, "三": 3, "四": 4}.get(next((ch for ch in qs if ch in "一二三四"), ""))
+        except ValueError:
+            continue
+        y = y + 1911 if y < 1911 else y
+        rev, gp, op, ni = (parse_number(r.get(k[x])) for x in ("rev", "gp", "op", "ni"))
+        if q is None or None in (rev, gp, op, ni) or rev <= 0 or y > date.today().year:
+            continue
+        gm, om, nm = (round(v / rev * 100, 3) for v in (gp, op, ni))
+        if not (-1000 <= gm <= 100 and -1000 <= om <= 100 and -1000 <= nm <= 200):
+            continue
+        out.append({"code": code, "name": wanted[code], "year": y, "quarter": q, "revenue": rev, "gross_profit": gp, "op_income": op, "net_income": ni,
+                    "gross_margin": gm, "op_margin": om, "net_margin": nm, "source": source})
+    return out, keys
+
+
+def tw_financials(price_rows):
+    """模組 M07：持股的三率（毛利率、營益率、淨利率）。來源：證交所、櫃買中心財報資訊（一般業）。開放資料只有最新一季，
+    所以『比上一季』要靠每天把最新一季存起來，等下一季出來才比得了。金融業等其他業別的持股，這個來源沒有，會寫查不到。"""
+    wanted = {r["code"]: r.get("name") or r["code"] for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")}
+    if not wanted:
+        log("tw_fin", "skipped", detail="沒有台股持股代號，不抓財報資訊")
+        return []
+    out = []
+    sw, err = fetch_json(config.TWSE_OPENAPI_SWAGGER)
+    path = None
+    if isinstance(sw, dict):
+        for pth, methods in (sw.get("paths") or {}).items():
+            for mth in (methods or {}).values():
+                text = str(mth.get("summary", "")) if isinstance(mth, dict) else ""
+                if "一般業" in text and ("綜合損益" in text or "財報資訊" in text):
+                    path = path or pth
+        path = path or next((pth for pth in (sw.get("paths") or {}) if "t187ap06" in pth and pth.endswith("_ci")), None)
+    sources = [("twse", sw, config.TWSE_OPENAPI_BASE, path, "證交所 上市公司財報資訊（一般業）")]
+    sw2, err2 = fetch_json(config.TPEX_SWAGGER)
+    sources.append(("tpex", sw2, config.TPEX_DEFAULT_BASE, config.TPEX_FIN_PATH, "櫃買中心 上櫃公司財報資訊（一般業）"))
+    for tag, swag, base, pth, label in sources:
+        if not pth or not isinstance(swag, dict):
+            log(f"tw_fin:{tag}", "failure", detail=_clip(f"找不到財報資訊的端點或說明文件（{err if tag == 'twse' else err2}）"))
+            continue
+        rows, e = fetch_json(_openapi_base(swag, base) + pth)
+        got, keys = _fin_rows(rows, wanted, label)
+        if got is None:
+            log(f"tw_fin:{tag}", "failure", detail=_clip(f"{pth} 抓取失敗或欄位對不上：{e or ''}欄位 {keys}"))
+            continue
+        log(f"tw_fin:{tag}", "success" if got else "no_new_data", detail=f"{pth}｜{len(got)} 檔持股有三率" + (f"（{got[0]['year']} 年第 {got[0]['quarter']} 季）" if got else "；你的持股不在這個來源（金融業或其他業別？）"))
+        out.extend(got)
+    return out
+
+
+def us_crash_screen():
+    """模組 M08：Nasdaq-100 成分股單日跌超過門檻。名單只用來初篩（它沒有資料日期），入選一定要再用個股報價確認：
+    報價已收盤、日期是報價自己的、跌幅仍達門檻，才寫入。涵蓋範圍只有 Nasdaq-100，不含只在 NYSE 的大型股。"""
+    status, ctype, body, err = fetch_raw(config.NASDAQ100_URL, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+    if status is None:
+        log("us_crash:list", "failure", detail=_clip(f"連線失敗: {err}"))
+        raise RuntimeError(f"Nasdaq-100 名單連線失敗：{err}")
+    try:
+        j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+        data = (j or {}).get("data") or {}
+        rows = ((data.get("data") or {}).get("rows") if isinstance(data.get("data"), dict) else None) or data.get("rows") or []
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        log("us_crash:list", "failure", detail=_clip(f"HTTP {status}｜不是 JSON"))
+        raise RuntimeError("Nasdaq-100 名單不是 JSON")
+    if not rows:
+        log("us_crash:list", "failure", detail=f"HTTP {status}｜名單是空的")
+        raise RuntimeError("Nasdaq-100 名單是空的")
+    cands = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol", "")).strip().upper()
+        pct = parse_pct(next((r[k] for k in ("percentageChange", "pctChange", "change_pct") if k in r), None))
+        if sym and pct is not None and pct <= -config.US_CRASH_PCT:
+            cands.append((sym, str(r.get("companyName") or r.get("name") or "").strip(), pct))
+    log("us_crash:list", "success", detail=f"名單 {len(rows)} 檔；初篩跌幅達 {config.US_CRASH_PCT}% 的有 {len(cands)} 檔")
+    out = []
+    for sym, name, pct in cands[:config.US_CRASH_MAX_CONFIRM]:
+        q, why = _nasdaq_quote(sym, ("stocks",))
+        time.sleep(1)
+        if q is None:
+            log(f"us_crash:{sym}", "skipped" if "不是已收盤" in why else "failure", detail=_clip(why))
+            continue
+        if q["pct"] is None or q["pct"] > -config.US_CRASH_PCT:
+            log(f"us_crash:{sym}", "no_new_data", as_of=q["as_of"], detail=f"名單說 {pct}%，個股報價是 {q['pct']}%，沒有達到門檻，不加入")
+            continue
+        out.append({"as_of": q["as_of"], "symbol": sym, "name": name, "close": q["close"], "prev_close": round(q["close"] / (1 + q["pct"] / 100), 4),
+                    "drop_pct": round(q["pct"], 2), "note": "Nasdaq-100 名單初篩、個股已收盤報價確認；若當天有分割或除息，跌幅可能是調整造成，原因待確認",
+                    "source": "Nasdaq 報價（已收盤，只涵蓋 Nasdaq-100）"})
+        log(f"us_crash:{sym}", "success", as_of=q["as_of"], detail=f"單日 {q['pct']}%，收盤 {q['close']}")
+    return out
+
+
+def aaii_sentiment():
+    """模組 M09：AAII 散戶情緒（看多、中立、看空）。只在三項都找得到、加起來約 100、而且頁面上有自己的資料日期時才採用。"""
+    status, ctype, body, err = fetch_raw(config.AAII_URL, timeout=config.PROBE_TIMEOUT, headers={"User-Agent": config.NASDAQ_UA, "Accept": "text/html"})
+    if status != 200:
+        log("aaii", "failure", detail=_clip(f"HTTP {status}｜{err or ctype}"))
+        return []
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body.decode("utf-8", errors="replace")))
+    val = {}
+    for key, label in (("bullish", "Bullish"), ("neutral", "Neutral"), ("bearish", "Bearish")):
+        m = re.search(label + r"[^0-9%]{0,60}?(\d{1,3}(?:\.\d+)?)\s*%", text)
+        val[key] = float(m.group(1)) if m else None
+    dm = re.search(r"(?:week ending|weekending|survey date|results (?:for|from))[^A-Za-z0-9]{0,15}(?:the week ending )?([A-Za-z]{3,9}\.? \d{1,2}(?:, ?\d{4})?)", text, re.I)
+    if None in val.values() or not dm:
+        log("aaii", "failure", detail=_clip(f"頁面抓到了，但{'三項比例沒有都找到' if None in val.values() else '找不到自己的資料日期'}，不採用｜{val}｜開頭 {text[:120]!r}"))
+        return []
+    tok = dm.group(1).replace(",", ", ").replace(",  ", ", ")
+    mm = re.match(r"([A-Za-z]{3})[a-z]*\.? (\d{1,2})(?:, (\d{4}))?", tok)
+    mon = _US_MONTHS.get(mm.group(1).title()) if mm else None
+    if not mon:
+        log("aaii", "failure", detail=_clip(f"日期格式看不懂：{dm.group(1)!r}"))
+        return []
+    today = date.today()
+    try:
+        d = date(int(mm.group(3)) if mm.group(3) else today.year, mon, int(mm.group(2)))
+        if not mm.group(3) and d > today:
+            d = date(today.year - 1, mon, int(mm.group(2)))
+    except ValueError:
+        log("aaii", "failure", detail=f"日期無效：{dm.group(1)!r}")
+        return []
+    ok, why = validate_close_date(d.isoformat())
+    total = sum(val.values())
+    if not ok or (today - d).days > 21 or not (98 <= total <= 102):
+        log("aaii", "failure", as_of=d.isoformat(), detail=_clip(f"驗證不過：日期 {d}（{why or '距今 ' + str((today - d).days) + ' 天'}）、三項合計 {total}"))
+        return []
+    log("aaii", "success", as_of=d.isoformat(), detail=f"看多 {val['bullish']}%、中立 {val['neutral']}%、看空 {val['bearish']}%")
+    return [{"as_of": d.isoformat(), "bullish": val["bullish"], "neutral": val["neutral"], "bearish": val["bearish"], "source": "AAII 散戶情緒調查（aaii.com）"}]
+
+
+def us_leaders_compute():
+    """模組 M10：美股領頭股（七巨頭、AVGO、TSM ADR）對均線，並和 SPY 比近 5 日。日期必須和 SPY 的最新日期相同，疑似分割的不算。"""
+    days = config.US_LEADER_HISTORY_DAYS
+    bench, why = _nasdaq_history(config.SECTOR_BENCH, "etf", days)
+    if not bench or len(bench) < 25:
+        log("us_leaders", "failure", detail=_clip(f"基準 {config.SECTOR_BENCH} 歷史不足或抓取失敗: {why or len(bench or [])}"))
+        return []
+    spy5 = (bench[-1][1] / bench[-6][1] - 1) * 100
+    out = []
+    for sym, name in config.US_LEADERS.items():
+        pts, why = _nasdaq_history(sym, "stocks", days)
+        time.sleep(1)
+        if not pts or len(pts) < 25:
+            log(f"us_leaders:{sym}", "failure", detail=_clip(f"歷史不足或抓取失敗: {why or len(pts or [])}"))
+            continue
+        if pts[-1][0] != bench[-1][0]:
+            log(f"us_leaders:{sym}", "failure", detail=f"最新日期 {pts[-1][0]} 與 {config.SECTOR_BENCH} 的 {bench[-1][0]} 不同，不比較")
+            continue
+        if any(b[1] / a[1] >= 1.5 or b[1] / a[1] <= 0.67 for a, b in zip(pts, pts[1:])):
+            log(f"us_leaders:{sym}", "failure", detail="收盤價出現疑似分割的跳動，不計算")
+            continue
+        c = [p[1] for p in pts]
+        ma = lambda n: round(sum(c[-n:]) / n, 3) if len(c) >= n else None
+        r5 = (c[-1] / c[-6] - 1) * 100
+        out.append({"as_of": pts[-1][0].isoformat(), "symbol": sym, "name": name, "close": c[-1], "ma20": ma(20), "ma60": ma(60), "ret5": round(r5, 3), "rel5": round(r5 - spy5, 3)})
+    if out:
+        log("us_leaders", "success", as_of=out[0]["as_of"], detail=f"{len(out)} / {len(config.US_LEADERS)} 檔")
+    return out
+
+
+def _news_path(sw):
+    for pth, methods in ((sw or {}).get("paths") or {}).items():
+        for mth in (methods or {}).values():
+            if isinstance(mth, dict) and "重大訊息" in str(mth.get("summary", "")):
+                return pth
+    return None
+
+
+def tw_investor_events(price_rows):
+    """模組 M11：從證交所、櫃買中心『每日重大訊息』找你持股的法人說明會日期（公司公告「召開法人說明會之日期」）。
+    每天的訊息只有當天的公告，所以靠每天排程累積；日期必須在今天前後合理範圍，句型對不上就不採用。"""
+    wanted = {r["code"]: r.get("name") or r["code"] for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")}
+    if not wanted:
+        log("tw_events", "skipped", detail="沒有台股持股代號，不查法說會")
+        return []
+    today = date.today()
+    out = {}
+    for tag, swurl, base in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE)):
+        sw, err = fetch_json(swurl)
+        pth = _news_path(sw) if isinstance(sw, dict) else None
+        if not pth:
+            log(f"tw_events:{tag}", "failure", detail=_clip(f"找不到重大訊息的端點（{err or '說明文件裡沒有'}）"))
+            continue
+        rows, e = fetch_json(_openapi_base(sw, base) + pth)
+        if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+            log(f"tw_events:{tag}", "failure", detail=_clip(f"{pth} 抓取失敗或格式非預期: {e or str(rows)[:100]}"))
+            continue
+        keys = list(rows[0].keys())
+        kc, kn, ks, kd = _fin_key(keys, ("公司代號",)), _fin_key(keys, ("公司名稱",)), _fin_key(keys, ("主旨",)), _fin_key(keys, ("發言日期",))
+        hit = 0
+        for r in rows:
+            code = str(r.get(kc, "")).strip() if kc else ""
+            text = " ".join(str(v) for v in r.values())
+            if code not in wanted or "法人說明會" not in text:
+                continue
+            m = re.search(r"召開法人說明會之日期[:：]\s*(\d{2,3})/(\d{1,2})/(\d{1,2})", text)
+            dates = {(m.group(1), m.group(2), m.group(3))} if m else set(re.findall(r"(\d{3})年(\d{1,2})月(\d{1,2})日", text))
+            if len(dates) != 1:
+                log(f"tw_events:{code}", "no_new_data", detail=_clip(f"{wanted[code]}：公告提到法人說明會，但沒有唯一的日期，不採用｜{str(r.get(ks, ''))[:80]}"))
+                continue
+            y, mo, d = next(iter(dates))
+            try:
+                ev = date(int(y) + 1911, int(mo), int(d))
+            except ValueError:
+                continue
+            if not (today - timedelta(days=1) <= ev <= today + timedelta(days=180)):
+                continue
+            ann = roc_to_iso(r.get(kd)) if kd else None
+            out[(code, ev.isoformat())] = {"code": code, "name": str(r.get(kn, "")).strip() or wanted[code], "event_date": ev.isoformat(),
+                                           "announced_at": ann, "subject": str(r.get(ks, ""))[:200], "source": "證交所／櫃買中心 每日重大訊息"}
+            hit += 1
+        log(f"tw_events:{tag}", "success", detail=f"{pth}｜{len(rows)} 則公告；你的持股有 {hit} 則法人說明會日期")
+    return list(out.values())
+
+
+def probe_round4():
+    """只讀探測第四批：1) AAII 頁面裡所有『Bullish』附近的文字與日期線索；2) 證交所除權息預告；3) 櫃買中心除權息端點。"""
+    status, ctype, body, err = fetch_raw(config.AAII_URL, timeout=config.PROBE_TIMEOUT, headers={"User-Agent": config.NASDAQ_UA, "Accept": "text/html"})
+    if status is None:
+        log("probe:aaii_deep", "failure", detail=_clip(f"連線失敗: {err}"))
+    else:
+        html = body.decode("utf-8", errors="replace")
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ", html)))
+        hits = [text[max(m.start() - 60, 0): m.start() + 220] for m in re.finditer(r"Bullish", text)][:4]
+        dates = re.findall(r"(?:Survey|Week|week|Results|Updated|as of)[^.]{0,80}\d{4}", text)[:4]
+        pcts = re.findall(r"(?:Bullish|Neutral|Bearish)[^%]{0,30}\d{1,2}(?:\.\d)?%", text)[:6]
+        log("probe:aaii_deep", "success" if (hits or pcts) else "failure", detail=_clip(f"HTTP {status}｜頁面可見文字 {len(text)} 字｜『Bullish』附近 {hits}｜日期線索 {dates}｜百分比 {pcts}"))
+        scripts = re.findall(r"\"(?:contentUrl|downloadUrl|url)\"\s*:\s*\"([^\"]+)\"", html)[:6]
+        log("probe:aaii_links", "success" if scripts else "no_new_data", detail=_clip(f"頁面裡的資料連結：{scripts}"))
+    j, err = fetch_json(config.EXRIGHT_URL)
+    if isinstance(j, dict):
+        data = j.get("data") or []
+        log("probe:exright_twse", "success" if data else "no_new_data", detail=_clip(f"stat={j.get('stat')}｜欄位 {j.get('fields')}｜{len(data)} 列｜前 2 列 {data[:2]}"))
+    else:
+        log("probe:exright_twse", "failure", detail=_clip(f"抓取失敗或不是 JSON: {err}"))
+    sw, err = fetch_json(config.TPEX_SWAGGER)
+    cands = []
+    if isinstance(sw, dict):
+        for path, methods in (sw.get("paths") or {}).items():
+            for mth in (methods or {}).values():
+                t = str(mth.get("summary", "")) if isinstance(mth, dict) else ""
+                if "除權" in t or "除息" in t:
+                    cands.append((path, t))
+    log("probe:exright_tpex", "success" if cands else "no_new_data", detail=_clip("櫃買中心除權息相關端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands[:8]) if cands else "無")))
+    if cands:
+        rows, err = fetch_json(_openapi_base(sw, config.TPEX_DEFAULT_BASE) + cands[0][0])
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            log("probe:exright_tpex_rows", "success", detail=_clip(f"{cands[0][0]}｜{len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
 
 
 def probe_us_pressure():
@@ -2420,6 +2696,7 @@ def run_job(job, dry_run=False):
     if job == "us_probe":
         probe_earnings()
         probe_round3()
+        probe_round4()
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
@@ -2437,6 +2714,11 @@ def run_job(job, dry_run=False):
         extra.append(("sector_rs", _run_module("M03", "美股產業相對強弱", sector_rs) or [], "symbol,as_of"))
         if not dry_run:
             extra.append(("tw_leaders", _run_module("M04", "台股領頭股", tw_leaders_compute) or [], "as_of,code"))
+        extra.append(("tw_fin_q", _run_module("M07", "台股三率", tw_financials, price_rows or []) or [], "code,year,quarter"))
+        extra.append(("us_crash_candidates", _run_module("M08", "美股大型股暴跌", us_crash_screen) or [], "as_of,symbol"))
+        extra.append(("us_aaii", _run_module("M09", "AAII 散戶情緒", aaii_sentiment) or [], "as_of"))
+        extra.append(("us_leaders", _run_module("M10", "美股領頭股", us_leaders_compute) or [], "as_of,symbol"))
+        extra.append(("tw_investor_events", _run_module("M11", "台股法說會日曆", tw_investor_events, price_rows or []) or [], "code,event_date"))
     if job == "tw_backfill":
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
