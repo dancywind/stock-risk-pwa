@@ -14,7 +14,8 @@ TODAY = date.today()
 D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 
-MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill")
+MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
+                "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -755,7 +756,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -2552,6 +2553,241 @@ def test_probe_round3_failures_are_reported_not_hidden():
         fetch.probe_round3()
     sts = {x["source"]: x["status"] for x in fetch.LOG}
     assert sts["probe:fin:twse"] == "failure" and sts["probe:aaii"] == "failure" and sts["probe:nasdaq100"] == "failure" and sts["probe:sox"] == "failure"
+
+
+# ================================================================ v32 模組：M07 三率、M08 美股暴跌、M09 AAII、M10 美股領頭股、M11 法說會
+def fin_row(code, name, y="115", q="2", rev="1,000,000", gp="500,000", op="300,000", ni="250,000"):
+    return {"出表日期": "1150815", "年度": y, "季別": q, "公司代號": code, "公司名稱": name, "營業收入": rev, "營業成本": "500,000", "營業毛利（毛損）": gp,
+            "未實現銷貨（損）益": "0", "營業毛利（毛損）淨額": "999", "營業利益（損失）": op, "本期淨利（淨損）": ni, "歸屬於母公司業主之本期淨利（淨損）": "1"}
+
+
+def test_fin_rows_compute_three_margins_and_skip_bad_rows():
+    wanted = {"2330": "台積電", "2454": "聯發科", "3711": "日月光投控"}
+    rows = [fin_row("2330", "台積電"), fin_row("2454", "聯發科", rev="0"), fin_row("9999", "不在持股"), fin_row("3711", "日月光投控", y="2999"),
+            fin_row("2330", "台積電", y="114", q="第四季", gp="400,000", op="200,000", ni="150,000"), fin_row("2454", "聯發科", gp="x")]
+    out, keys = fetch._fin_rows(rows, wanted, "測試")
+    by = {(r["code"], r["year"], r["quarter"]): r for r in out}
+    assert set(by) == {("2330", 2026, 2), ("2330", 2025, 4)}                                       # 民國年轉西元；季別「第四季」→ 4；營收 0、未來年度、壞數字、不在持股的都不收
+    r = by[("2330", 2026, 2)]
+    assert (r["gross_margin"], r["op_margin"], r["net_margin"]) == (50.0, 30.0, 25.0) and r["name"] == "台積電"      # 毛利取「營業毛利（毛損）」不是「淨額」；淨利取合併本期淨利不是歸屬母公司
+    assert by[("2330", 2025, 4)]["gross_margin"] == 40.0
+    bad = [{k: v for k, v in fin_row("2330", "台積電").items() if "毛利" not in k}]
+    assert fetch._fin_rows(bad, wanted, "x")[0] is None and "公司代號" in fetch._fin_rows(bad, wanted, "x")[1]       # 缺欄位：不猜，回傳欄位清單
+    assert fetch._fin_rows([], wanted, "x") == (None, []) and fetch._fin_rows("x", wanted, "x") == (None, [])
+    out, _ = fetch._fin_rows([fin_row("2330", "台積電", gp="2,000,000")], wanted, "x"); assert out == []              # 毛利率超過 100%：拒收
+
+
+def test_tw_financials_reads_both_exchanges_and_reports_missing_holdings():
+    reset()
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap06_L_ci": {"get": {"summary": "上市公司綜合損益表(一般業)"}}, "/opendata/t187ap06_L_basi": {"get": {"summary": "上市公司綜合損益表(金融業)"}}}}
+    sw2 = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/mopsfin_t187ap06_O_ciA": {"get": {"summary": "上櫃公司財報資訊( 一般業)"}}}}
+    urls = []
+    def fj(url, **k):
+        urls.append(url)
+        if url.endswith("swagger.json") and "twse" in url: return sw, ""
+        if "tpex" in url and "swagger" in url: return sw2, ""
+        if url.endswith("t187ap06_L_ci"): return [fin_row("2330", "台積電")], ""
+        if url.endswith("mopsfin_t187ap06_O_ciA"): return [fin_row("8358", "金居", gp="300,000", op="100,000", ni="80,000")], ""
+        raise AssertionError(url)
+    prices = [{"market": "TW", "code": "2330", "name": "台積電"}, {"market": "TW", "code": "8358", "name": "金居"}, {"market": "TW", "code": "2884", "name": "玉山金"}, {"market": "US", "code": "ORCL", "name": "x"}]
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        out = REAL["tw_financials"](prices)
+    assert sorted(r["code"] for r in out) == ["2330", "8358"] and not any("basi" in u for u in urls)                      # 一般業端點，不用金融業那個
+    assert {x["source"]: x["status"] for x in fetch.LOG}["tw_fin:twse"] == "success" and "2026 年第 2 季" in [x for x in fetch.LOG if x["source"] == "tw_fin:twse"][0]["detail"]
+    reset()
+    assert REAL["tw_financials"]([{"market": "US", "code": "ORCL"}]) == [] and fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        assert REAL["tw_financials"](prices) == []
+    assert {x["source"]: x["status"] for x in fetch.LOG}["tw_fin:twse"] == "failure" and {x["source"]: x["status"] for x in fetch.LOG}["tw_fin:tpex"] == "failure"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (sw, "") if "twse" in u and u.endswith("swagger.json") else (sw2, "") if "swagger" in u else ([{"x": 1}], "")):
+        assert REAL["tw_financials"](prices) == []
+    assert "欄位 ['x']" in [x for x in fetch.LOG if x["source"] == "tw_fin:twse"][0]["detail"]                            # 欄位對不上要把欄位清單記下來，我才知道怎麼改
+
+
+def nas100_body(rows):
+    return json.dumps({"data": {"data": {"rows": rows}}}).encode()
+
+
+def test_us_crash_screen_confirms_each_candidate_with_a_dated_closed_quote():
+    reset()
+    lst = [{"symbol": "AAA", "companyName": "A Inc", "percentageChange": "-6.10%"}, {"symbol": "BBB", "companyName": "B", "percentageChange": "-2.00%"},
+           {"symbol": "CCC", "companyName": "C", "percentageChange": "-8.00%"}, {"symbol": "DDD", "companyName": "D", "percentageChange": "-7.00%"}]
+    def raw(url, timeout=None, headers=None):
+        if "list-type/nasdaq100" in url: return 200, "application/json", nas100_body(lst), ""
+        sym = url.split("/quote/")[1].split("/")[0]
+        if sym == "AAA": return 200, "application/json", nas_quote_body(price="$93.90", pct="-6.10%", asset="stocks"), ""
+        if sym == "CCC": return 200, "application/json", nas_quote_body(ms="Open", real=True), ""            # 還沒收盤：不採用
+        if sym == "DDD": return 200, "application/json", nas_quote_body(price="$97.00", pct="-3.00%"), ""      # 名單和個股報價對不上：不加入
+        raise AssertionError(url)
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        out = REAL["us_crash_screen"]()
+    assert [r["symbol"] for r in out] == ["AAA"] and out[0]["drop_pct"] == -6.1 and out[0]["prev_close"] == 100.0 and out[0]["close"] == 93.9
+    assert out[0]["as_of"] == (TODAY - timedelta(days=1)).isoformat() and "只涵蓋 Nasdaq-100" in out[0]["source"] and "原因待確認" in out[0]["note"]
+    st = {x["source"]: x["status"] for x in fetch.LOG}
+    assert st["us_crash:CCC"] == "skipped" and st["us_crash:DDD"] == "no_new_data" and st["us_crash:AAA"] == "success" and "us_crash:BBB" not in st and "初篩跌幅達 5.0% 的有 3 檔" in [x for x in fetch.LOG if x["source"] == "us_crash:list"][0]["detail"]
+    for ret in ((None, "", b"", "timed out"), (200, "application/json", nas100_body([]), ""), (200, "text/html", b"<html>", "")):
+        reset()
+        with mock.patch.object(fetch, "fetch_raw", return_value=ret):
+            try:
+                REAL["us_crash_screen"](); raise AssertionError("名單抓不到應該要讓模組失敗")
+            except RuntimeError:
+                pass
+        assert fetch.LOG[-1]["source"] == "us_crash:list" and fetch.LOG[-1]["status"] == "failure"
+        reset()
+        with mock.patch.object(fetch, "us_crash_screen", side_effect=lambda: REAL["us_crash_screen"]()), mock.patch.object(fetch, "fetch_raw", return_value=ret):
+            assert fetch._run_module("M08", "美股大型股暴跌", fetch.us_crash_screen) is None
+        assert {x["source"]: x["status"] for x in fetch.LOG}["module:M08"] == "failure"                            # 名單抓不到＝模組失敗，不是「沒有資料」
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas100_body([{"symbol": "AAA", "companyName": "A", "percentageChange": "-1.00%"}]), "")):
+        assert REAL["us_crash_screen"]() == []                                                                       # 名單正常但沒人跌超過門檻：回傳空，這是正常狀態
+    assert fetch.LOG[-1]["status"] == "success" and "初篩跌幅達 5.0% 的有 0 檔" in fetch.LOG[-1]["detail"]
+
+
+def aaii_page(date_text, b="38.5", n="30.2", br="31.3"):
+    return f"<html><body><h1>Sentiment Survey</h1><p>Results for the week ending {date_text}</p><table><tr><td>Bullish</td><td>{b}%</td></tr><tr><td>Neutral</td><td>{n}%</td></tr><tr><td>Bearish</td><td>{br}%</td></tr></table></body></html>".encode()
+
+
+def test_aaii_requires_three_ratios_that_add_up_and_its_own_recent_date():
+    reset()
+    d = TODAY - timedelta(days=2)
+    fmt = lambda x, year=True: x.strftime("%b ") + str(x.day) + (", " + str(x.year) if year else "")
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", aaii_page(fmt(d)), "")):
+        out = REAL["aaii_sentiment"]()
+    assert out == [{"as_of": d.isoformat(), "bullish": 38.5, "neutral": 30.2, "bearish": 31.3, "source": "AAII 散戶情緒調查（aaii.com）"}]
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", aaii_page(fmt(d, year=False)), "")):
+        assert REAL["aaii_sentiment"]()[0]["as_of"] == d.isoformat()                                           # 沒寫年份：取不晚於今天的那一年
+    for body, why in ((aaii_page(fmt(d), b="60", n="30", br="30"), "合計"), (aaii_page(fmt(TODAY - timedelta(days=40))), "距今"), (b"<html>Bullish 38.5% Neutral 30% Bearish 31.5%</html>", "日期"),
+                      (aaii_page(fmt(d)).replace(b"Bearish", b"Other"), "比例"), (aaii_page("Foo 99"), "日期")):
+        reset()
+        with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", body, "")):
+            assert REAL["aaii_sentiment"]() == []
+        assert fetch.LOG[-1]["status"] == "failure" and why in fetch.LOG[-1]["detail"], (why, fetch.LOG[-1]["detail"])
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"denied", "HTTP 403")):
+        assert REAL["aaii_sentiment"]() == []
+    assert "HTTP 403" in fetch.LOG[-1]["detail"]
+
+
+def test_us_leaders_compute_ma_relative_to_spy_and_rejects_mismatch_or_split():
+    reset()
+    spy = hist_pts(70, 0.001)
+    series = {"SPY": spy, "NVDA": hist_pts(70, 0.004), "AAPL": hist_pts(70, 0.001), "MSFT": hist_pts(70, -0.002),
+              "TSLA": hist_pts(70, 0.002, end=TODAY - timedelta(days=12)), "META": hist_pts(10, 0.001), "AMZN": hist_pts(70, [0.0] * 30 + [1.6] + [0.0] * 39)}
+    calls = []
+    def nh(sym, assetclass="etf", days=75):
+        calls.append((sym, assetclass, days)); return (series.get(sym), "查無資料")
+    with mock.patch.object(fetch, "_nasdaq_history", side_effect=nh), mock.patch.object(fetch.time, "sleep"):
+        out = REAL["us_leaders_compute"]()
+    by = {r["symbol"]: r for r in out}
+    assert set(by) == {"NVDA", "AAPL", "MSFT"}                                                              # 日期對不上、歷史太短、疑似分割、抓不到的都不出現
+    assert ("NVDA", "stocks", config.US_LEADER_HISTORY_DAYS) in calls and ("SPY", "etf", config.US_LEADER_HISTORY_DAYS) in calls
+    c = [p[1] for p in series["NVDA"]]
+    assert by["NVDA"]["close"] == c[-1] and by["NVDA"]["ma20"] == round(sum(c[-20:]) / 20, 3) and by["NVDA"]["ma60"] == round(sum(c[-60:]) / 60, 3)
+    spy5 = (spy[-1][1] / spy[-6][1] - 1) * 100
+    assert abs(by["NVDA"]["rel5"] - ((c[-1] / c[-6] - 1) * 100 - spy5)) < 0.001 and by["NVDA"]["rel5"] > 0 and by["MSFT"]["rel5"] < 0 and abs(by["AAPL"]["rel5"]) < 0.01
+    assert by["NVDA"]["name"] == "輝達" and len({tuple(sorted(r)) for r in out}) == 1
+    st = {x["source"]: x["detail"] for x in fetch.LOG}
+    assert "不同" in st["us_leaders:TSLA"] and "不足" in st["us_leaders:META"] and "分割" in st["us_leaders:AMZN"] and "us_leaders:AVGO" in st
+    reset()
+    with mock.patch.object(fetch, "_nasdaq_history", return_value=(None, "連線失敗")):
+        assert REAL["us_leaders_compute"]() == []
+    assert fetch.LOG[-1]["source"] == "us_leaders" and fetch.LOG[-1]["status"] == "failure"
+
+
+def roc_text(d):
+    return f"{d.year - 1911}/{d.month}/{d.day}"
+
+
+def test_tw_investor_events_picks_only_held_companies_with_one_clear_date():
+    reset()
+    ev = TODAY + timedelta(days=10)
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap04_L": {"get": {"summary": "上市公司每日重大訊息"}}}}
+    sw2 = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/mopsfin_t187ap04_O": {"get": {"summary": "上櫃公司每日重大訊息"}}}}
+    ann = f"{TODAY.year - 1911}{TODAY.month:02d}{TODAY.day:02d}"
+    news = [{"發言日期": ann, "公司代號": "2330", "公司名稱": "台積電", "主旨": "公告本公司召開法人說明會", "說明": f"1.召開法人說明會之日期:{roc_text(ev)} 2.召開地點:台北"},
+            {"發言日期": ann, "公司代號": "2330", "公司名稱": "台積電", "主旨": "法人說明會更正", "說明": f"原訂 {TODAY.year - 1911}年{TODAY.month}月{TODAY.day}日 改為 {ev.year - 1911}年{ev.month}月{ev.day}日 召開法人說明會"},
+            {"發言日期": ann, "公司代號": "1101", "公司名稱": "台泥", "主旨": "公告召開法人說明會", "說明": f"召開法人說明會之日期:{roc_text(ev)}"},
+            {"發言日期": ann, "公司代號": "2454", "公司名稱": "聯發科", "主旨": "公告董事會決議", "說明": "董事會通過股利"},
+            {"發言日期": ann, "公司代號": "2454", "公司名稱": "聯發科", "主旨": "法人說明會", "說明": f"召開法人說明會之日期:{roc_text(TODAY - timedelta(days=30))}"}]
+    def fj(url, **k):
+        if url.endswith("swagger.json") and "twse" in url: return sw, ""
+        if "tpex" in url and "swagger" in url: return sw2, ""
+        if url.endswith("t187ap04_L"): return news, ""
+        return [], ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        out = REAL["tw_investor_events"]([{"market": "TW", "code": "2330", "name": "台積電"}, {"market": "TW", "code": "2454", "name": "聯發科"}])
+    assert [r["code"] for r in out] == ["2330"] and out[0]["event_date"] == ev.isoformat() and out[0]["announced_at"] == TODAY.isoformat() and "召開法人說明會" in out[0]["subject"]
+    st = [x for x in fetch.LOG if x["source"] == "tw_events:2330"]
+    assert st and st[0]["status"] == "no_new_data" and "沒有唯一的日期" in st[0]["detail"]                      # 同一則裡有兩個日期：不猜
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        assert REAL["tw_investor_events"]([{"market": "TW", "code": "2330", "name": "台積電"}]) == []
+    assert {x["source"]: x["status"] for x in fetch.LOG}["tw_events:twse"] == "failure"
+    reset()
+    assert REAL["tw_investor_events"]([]) == [] and fetch.LOG[-1]["status"] == "skipped"
+
+
+def test_run_job_wires_v32_modules_and_isolates_failures():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    prices = [{"market": "TW", "code": "2330", "name": "台積電"}]
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=([{"market": "TW", "name": "台積電", "symbol": None, "kind": "stock", "pos_key": "台積電"}], "")),
+              mock.patch.object(fetch, "tpex_prices", return_value=[]), mock.patch.object(fetch, "twse_prices", return_value=prices), mock.patch.object(fetch, "nasdaq_prices", return_value=[]),
+              mock.patch.object(fetch, "tw_ranges", side_effect=lambda x: x), mock.patch.object(fetch, "nasdaq_earnings", return_value=[]), mock.patch.object(fetch, "persist"),
+              mock.patch.object(fetch, "persist_extra"), mock.patch.object(fetch, "tw_backfill", return_value={"new_days": []}), mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "tw_crash_check")]
+    for p_ in patches: p_.start()
+    try:
+        def boom(*a): raise RuntimeError("壞掉了")
+        with mock.patch.object(fetch, "tw_financials", return_value=[{"code": "2330"}]) as fin, mock.patch.object(fetch, "us_crash_screen", side_effect=boom), \
+                mock.patch.object(fetch, "aaii_sentiment", return_value=[{"as_of": "x"}]), mock.patch.object(fetch, "us_leaders_compute", return_value=[{"symbol": "NVDA"}]), \
+                mock.patch.object(fetch, "tw_investor_events", return_value=[{"code": "2330"}]) as evs:
+            fetch.run_job("tw_close", dry_run=False)
+            fin.assert_called_once_with(prices); evs.assert_called_once_with(prices)                         # 持股代號傳給需要的模組
+            tables = {t: (r, c) for t, r, c in fetch.persist_extra.call_args[0][1]}
+            assert tables["tw_fin_q"] == ([{"code": "2330"}], "code,year,quarter") and tables["us_crash_candidates"][0] == [] and tables["us_aaii"][1] == "as_of"
+            assert tables["us_leaders"][1] == "as_of,symbol" and tables["tw_investor_events"][1] == "code,event_date"
+            st = {x["source"]: x["status"] for x in fetch.LOG}
+            assert st["module:M08"] == "failure" and st["module:M07"] == "success" and st["module:M09"] == "success" and st["module:M10"] == "success" and st["module:M11"] == "success"
+        old = dict(config.FEATURES)
+        try:
+            config.FEATURES["M09_aaii"] = False
+            with mock.patch.object(fetch, "aaii_sentiment") as aa:
+                fetch.run_job("tw_close", dry_run=False); aa.assert_not_called()                              # 關掉的模組完全不執行
+        finally:
+            config.FEATURES.clear(); config.FEATURES.update(old)
+    finally:
+        for p_ in patches: p_.stop()
+
+
+def test_probe_round4_logs_aaii_clues_and_exright_sources_without_writing():
+    reset()
+    html = (b"<html><script>var x={\"contentUrl\":\"https://www.aaii.com/files/sentiment.xls\"}</script><body>"
+            b"<p>Survey results for the week ending Oct 28, 2026</p><div>Bullish 38.5% Neutral 30.0% Bearish 31.5%</div></body></html>")
+    sw = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/tpex_exright_pre": {"get": {"summary": "上櫃股票除權除息預告"}}, "/x": {"get": {"summary": "其他"}}}}
+    ex = {"stat": "OK", "fields": ["資料日期", "股票代號", "股票名稱", "除權息"], "data": [["1151105", "2330", "台積電", "息"]]}
+    def fj(url, **k):
+        if "exRight" in url: return ex, ""
+        if url.endswith("swagger.json"): return sw, ""
+        return [{"代號": "8358", "除息日": "1151110"}], ""
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", html, "")), mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round4()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert by["probe:aaii_deep"]["status"] == "success" and "Bullish 38.5%" in by["probe:aaii_deep"]["detail"] and "week ending Oct 28, 2026" in by["probe:aaii_deep"]["detail"]
+    assert "sentiment.xls" in by["probe:aaii_links"]["detail"]
+    assert by["probe:exright_twse"]["status"] == "success" and "2330" in by["probe:exright_twse"]["detail"]
+    assert "/tpex_exright_pre" in by["probe:exright_tpex"]["detail"] and "/x" not in by["probe:exright_tpex"]["detail"] and "8358" in by["probe:exright_tpex_rows"]["detail"]
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_round4_failures_are_reported_not_hidden():
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"denied", "HTTP 403")), mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        fetch.probe_round4()
+    sts = {x["source"]: x["status"] for x in fetch.LOG}
+    assert sts["probe:aaii_deep"] == "failure" and sts["probe:exright_twse"] == "failure" and sts["probe:exright_tpex"] == "no_new_data"
 
 
 def test_twd_layer_order_fixed():
