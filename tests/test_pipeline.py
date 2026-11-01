@@ -2878,6 +2878,23 @@ def test_probe_round4_failures_are_reported_not_hidden():
     assert sts["probe:aaii_deep"] == "failure" and sts["probe:exright_twse"] == "failure" and sts["probe:exright_tpex"] == "no_new_data"
 
 
+def test_version_stamp_covers_both_files_and_flags_a_partial_upload():
+    reset()
+    assert fetch.FETCH_VERSION == config.PIPELINE_VERSION, "發行時兩個檔案的版本要一樣"
+    with mock.patch.object(fetch, "run_job", return_value={}), mock.patch.object(fetch, "flush_log", return_value=True), \
+            mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()):
+        assert fetch.main(["--job", "tw_probe", "--dry-run"]) == 0
+    first = fetch.LOG[0]
+    assert first["source"] == "pipeline:version" and f"程式版本 {config.PIPELINE_VERSION}｜fetch {fetch.FETCH_VERSION}｜" in first["detail"]
+    assert not any(x["source"] == "pipeline:version_mismatch" for x in fetch.LOG)
+    reset()
+    with mock.patch.object(fetch, "FETCH_VERSION", "v20"), mock.patch.object(fetch, "run_job", return_value={}), mock.patch.object(fetch, "flush_log", return_value=True), \
+            mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()):
+        code = fetch.main(["--job", "tw_probe", "--dry-run"])
+    mm = [x for x in fetch.LOG if x["source"] == "pipeline:version_mismatch"]
+    assert code == 1 and mm and mm[0]["status"] == "failure" and "fetch.py 是 v20" in mm[0]["detail"] and config.PIPELINE_VERSION in mm[0]["detail"] and "沒有一起更新" in mm[0]["detail"]
+
+
 def test_twd_layer_order_fixed():
     assert config.TWD_LAYERS == ["yahoo_twd_x", "yahoo_usdtwd_x", "fred_dextaus",
                                 "taiwan_official", "exchangerate_api"]
