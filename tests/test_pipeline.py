@@ -2973,6 +2973,73 @@ def test_inst_backfill_done_and_unconfigured_cases():
     assert [x["status"] for x in fetch.LOG if x["source"] == "inst_backfill"] == ["failure"]
 
 
+def test_run_job_daily_jobs_still_persist_todays_institutional_and_putcall_rows():
+    """回歸測試：每天抓到的外資買賣超、Put/Call 必須原封不動交給 persist（v38 曾經不小心把它們清成空的）。"""
+    reset()
+    inst = [{"as_of": D(1), "foreign_buy": 1.0, "foreign_sell": 2.0, "foreign_net": -1.0, "source": "TWSE BFI82U"}]
+    pc = [{"as_of": D(1), "total_pc": 0.9, "source": "CBOE 每日市場統計"}]
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=inst, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=pc, twd_fallback_chain=None)
+    for job in ("tw_close", "full"):
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist_extra"),
+                                                                                       mock.patch.object(fetch, "fred_latest", return_value=None)]
+        for p_ in patches: p_.start()
+        try:
+            with mock.patch.object(fetch, "persist") as pr:
+                res = fetch.run_job(job, dry_run=True)
+            args = pr.call_args[0]
+            assert args[5] == inst, f"{job}：每天的外資買賣超不能被清掉（persist 第 6 個參數）: {args[5]!r}"
+            assert args[11] == pc and res["tw_institutional"] == inst and res["us_putcall"] == pc
+        finally:
+            for p_ in patches: p_.stop()
+        reset()
+
+
+def test_tw_events_job_checks_only_event_announcements_for_codes_from_the_database():
+    reset()
+    got = []
+    ev = [{"code": "8358", "name": "金居", "event_date": D(-9), "announced_at": D(0), "subject": "x", "source": "s"}]
+    seen_codes = []
+    def reader(method, path, body=None, **k):
+        assert method == "GET" and path.startswith("stock_prices?select=code,name,as_of&market=eq.TW")
+        return [{"code": "2330", "name": "台積電", "as_of": D(1)}, {"code": "8358", "name": "金居", "as_of": D(1)}, {"code": "2330", "name": "台積電", "as_of": D(1)},
+                {"code": "9999", "name": "舊的持股", "as_of": D(5)}], ""                                    # 重複的代號、不是最新一天的都不算
+    def fake_events(price_rows):
+        seen_codes.extend(sorted(r["code"] for r in price_rows))
+        return ev
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=reader), \
+            mock.patch.object(fetch, "tw_investor_events", side_effect=fake_events), mock.patch.object(fetch, "persist_extra", side_effect=lambda dry, t: got.append((dry, t))), \
+            mock.patch.object(fetch, "persist") as pr, mock.patch.object(fetch, "twse_market") as tm, mock.patch.object(fetch, "fred_latest") as fl:
+        res = fetch.run_job("tw_events", dry_run=False)
+        pr.assert_not_called(); tm.assert_not_called(); fl.assert_not_called()                                 # 這個工作不碰其他資料
+    assert seen_codes == ["2330", "8358"] and res == {"job": "tw_events", "events": ev}
+    assert got == [(False, [("tw_investor_events", ev, "code,event_date")])], "只寫法說會的表，用 (code, event_date) 去重"
+    assert {x["source"]: x["status"] for x in fetch.LOG}["module:M11"] == "success"
+    assert "tw_events" in config.JOBS
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert fetch.run_job("tw_events")["events"] == []
+    assert fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], "")):
+        assert fetch.run_job("tw_events")["events"] == []
+    assert fetch.LOG[-1]["status"] == "skipped" and "先跑一次 tw_close" in fetch.LOG[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 401")):
+        assert fetch.run_job("tw_events")["events"] == []
+    assert fetch.LOG[-1]["status"] == "failure" and "讀取持股代號失敗" in fetch.LOG[-1]["detail"]
+
+
+def test_workflow_schedules_evening_events_job_and_every_cron_maps_to_a_job():
+    import re
+    y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
+    crons = re.findall(r'- cron: "([^"]+)"', y)
+    mapped = dict(re.findall(r'"([0-9*/ ]+)"\)\s+echo "job=(\w+)"', y))
+    assert set(crons) == set(mapped), f"每個排程都要有對應的工作：{set(crons) ^ set(mapped)}"
+    assert mapped["30 12 * * *"] == "tw_events" and mapped["15 15 * * *"] == "tw_events"
+    assert "tw_events" in re.search(r"options: \[([^\]]+)\]", y).group(1)
+    assert all(j in config.JOBS for j in mapped.values()) and len(crons) == len(set(crons))
+
+
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
     reset()
     calls = []
