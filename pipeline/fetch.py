@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v39"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v40"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2851,9 +2851,37 @@ def sb_upsert_plain(table, rows):
 
 
 # ---------------------------------------------------------------- 主流程
+def tw_events_job(dry_run=False):
+    """傍晚專用工作：只跑台股法說會（M11）。
+    原因：證交所、櫃買中心的「每日重大訊息」只放當天的公告，而公司常在收盤後才發法說會公告（例如 15:22）。
+    14:35 的 tw_close 太早，會漏掉大部分；所以在台北時間 20:30 和 23:15（午夜換成隔天的公告之前）再各抓一次。
+    要查哪些代號：用資料庫裡最新一天的台股持股收盤價紀錄（tw_close 每天寫入），不需要重新比對持股名稱。"""
+    if not sb_ready():
+        log("tw_events", "skipped", detail="未設定 Supabase，無法取得持股代號，不查法說會")
+        return {"job": "tw_events", "events": []}
+    rows, err = sb_request("GET", "stock_prices?select=code,name,as_of&market=eq.TW&order=as_of.desc&limit=200")
+    if rows is None:
+        log("tw_events", "failure", detail=_clip(f"讀取持股代號失敗：{err}"))
+        return {"job": "tw_events", "events": []}
+    latest = rows[0]["as_of"] if rows else None
+    price_rows, seen = [], set()
+    for r in rows:
+        if r.get("as_of") == latest and r.get("code") and r["code"] not in seen:
+            seen.add(r["code"])
+            price_rows.append({"market": "TW", "code": r["code"], "name": r.get("name") or r["code"]})
+    if not price_rows:
+        log("tw_events", "skipped", detail="資料庫裡還沒有台股持股的收盤價紀錄（先跑一次 tw_close）")
+        return {"job": "tw_events", "events": []}
+    events = _run_module("M11", "台股法說會日曆", tw_investor_events, price_rows) or []
+    persist_extra(dry_run, [("tw_investor_events", events, "code,event_date")])
+    return {"job": "tw_events", "events": events}
+
+
 def run_job(job, dry_run=False):
     global CURRENT_JOB
     CURRENT_JOB = job
+    if job == "tw_events":                                        # 傍晚專用：只查法說會，不碰其他資料
+        return tw_events_job(dry_run)
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
     inst_rows = margin_rows = futures_rows = basis_rows = price_rows = cot_rows = putcall_rows = earnings_rows = None
 
@@ -2893,14 +2921,14 @@ def run_job(job, dry_run=False):
         probe_earnings()
         probe_round3()
         probe_round4()
-    inst_rows, pc_rows = [], []
+    inst_hist, pc_rows = [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
         tw_crash_check(list(res.get("new_days", [])) + _recent_complete_days(config.CRASH_RECENT_DAYS), dry_run=dry_run)
         if not dry_run:
             _run_module("M13", "漲跌家數歷史（自建）", tw_breadth_hist_compute)
-            inst_rows = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
+            inst_hist = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
             pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
@@ -2921,7 +2949,7 @@ def run_job(job, dry_run=False):
         extra.append(("us_leaders", _run_module("M10", "美股領頭股", us_leaders_compute) or [], "as_of,symbol"))
         extra.append(("tw_investor_events", _run_module("M11", "台股法說會日曆", tw_investor_events, price_rows or []) or [], "code,event_date"))
     if job == "tw_backfill":
-        extra.append(("tw_institutional", inst_rows, "as_of,source"))
+        extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
