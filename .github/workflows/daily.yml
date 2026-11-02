@@ -6,13 +6,15 @@ on:
     - cron: "35 6 * * *"    # 14:35 SGT 台股收盤後（job=tw_close）
     - cron: "10 21 * * *"   # 05:10 SGT 美股廣度（job=us_breadth）
     - cron: "0 20 * * *"    # 04:00 SGT 夜間自動回補台股歷史（job=tw_backfill），回補完成後幾乎不花時間
+    - cron: "30 12 * * *"   # 20:30 SGT 傍晚查台股法說會公告（job=tw_events）：公司常在收盤後才發公告
+    - cron: "15 15 * * *"   # 23:15 SGT 午夜前再查一次（午夜之後每日重大訊息會換成隔天的）
   workflow_dispatch:
     inputs:
       job:
         description: "要跑哪個工作"
         default: "full"
         type: choice
-        options: [full, tw_close, us_breadth, tw_probe, us_probe, tw_backfill]
+        options: [full, tw_close, us_breadth, tw_probe, us_probe, tw_backfill, tw_events]
       dry_run:
         description: "只測試、不寫資料庫"
         default: false
@@ -39,6 +41,8 @@ jobs:
             "35 6 * * *")  echo "job=tw_close" >> $GITHUB_OUTPUT ;;
             "10 21 * * *") echo "job=us_breadth" >> $GITHUB_OUTPUT ;;
             "0 20 * * *")  echo "job=tw_backfill" >> $GITHUB_OUTPUT ;;
+            "30 12 * * *") echo "job=tw_events" >> $GITHUB_OUTPUT ;;
+            "15 15 * * *") echo "job=tw_events" >> $GITHUB_OUTPUT ;;
             *) echo "job=${{ github.event.inputs.job || 'full' }}" >> $GITHUB_OUTPUT ;;
           esac
       - name: 抓資料（金鑰一律用 Secrets）
