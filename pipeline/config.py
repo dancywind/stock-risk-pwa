@@ -119,6 +119,7 @@ TPEX_HIST_URLS = {
 # 台股歷史回補：每個交易日向證交所（上市）、櫃買中心（上櫃）各查一次全部個股行情，存最高、最低、收盤
 TPEX_DAY_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={slash}&type=EW&response=json"
 HIST_SLEEP = 3.0                  # 每次請求之間等幾秒，避免被交易所限流
+INST_BATCH_DAYS = 70               # 外資買賣超歷史每次最多補幾個交易日（每天 1 次請求）
 HIST_BATCH_DAYS = 70              # 每次回補最多處理幾個交易日（約 15 到 20 分鐘，低於工作的 30 分鐘上限）
 HIST_WINDOW_DAYS = 400            # 回補到幾天前
 HIST_DAILY_DAYS = 3               # 每日排程順手補最近幾個平日
@@ -147,7 +148,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v37"
+PIPELINE_VERSION = "v38"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -155,7 +156,7 @@ EARNINGS_MAX_AHEAD_DAYS = 200      # 財報日比今天晚超過這麼多天，�
 # 模組開關：改成 False 就整個關掉（排程不抓、網站顯示未啟用）。任何一個模組壞掉，不會影響其他模組。
 FEATURES = {"M01_fred_extra": True, "M02_us_quotes": True, "M03_sector_rs": True, "M04_tw_leaders": True,
             "M05_tw_index_history": True, "M06_fred_history": True, "M07_tw_fin": True, "M08_us_crash": True,
-            "M09_aaii": True, "M10_us_leaders": True, "M11_tw_events": True}
+            "M09_aaii": True, "M10_us_leaders": True, "M11_tw_events": True, "M12_inst_history": True, "M13_breadth_hist": True}
 # 模組 M02：美股其他行情（Nasdaq 報價，只採用已收盤的價格）。QQQ 只存漲跌幅，不存價格（規格 §13）。
 US_QUOTES = (
     ("SPY", "標普 500 ETF（SPY）", "etf", ("etf",), 50.0, 3000.0, True),

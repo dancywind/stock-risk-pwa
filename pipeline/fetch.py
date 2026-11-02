@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v37"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v38"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -410,18 +410,13 @@ def _twse_fetch_day(url, tag):
     return data, as_of
 
 
-def twse_institutional():
-    """三大法人買賣金額（現貨）。外資 = 外資及陸資(不含外資自營商) + 外資自營商。單位：新台幣元。
-    買進－賣出 必須等於買賣差額，對不上就拒收。"""
-    got = _twse_fetch_day(config.TWSE_BFI82U, "twse:institutional")
-    if got is None:
-        return None
-    data, as_of = got
+def _parse_institutional(data, as_of):
+    """三大法人買賣金額（現貨）的解析與驗證，不寫紀錄。回傳 (列, 備註, 錯誤原因)。
+    外資 = 外資及陸資(不含外資自營商) + 外資自營商。單位：新台幣元。買進－賣出 必須等於買賣差額，對不上就拒收。"""
     fields = data.get("fields") or []
     need = ("單位名稱", "買進金額", "賣出金額", "買賣差額")
     if any(n not in fields for n in need):
-        log("twse:institutional", "failure", as_of=as_of, detail=f"欄位與預期不符: {fields}")
-        return None
+        return None, "", f"欄位與預期不符: {fields}"
     ix = {n: fields.index(n) for n in need}
     table = {}
     for r in data.get("data") or []:
@@ -439,21 +434,18 @@ def twse_institutional():
 
     main = find(lambda l: l.startswith("外資及陸資"))
     if main is None or None in main:
-        log("twse:institutional", "failure", as_of=as_of, detail="找不到『外資及陸資』列或數字無法解析")
-        return None
+        return None, "", "找不到『外資及陸資』列或數字無法解析"
     fd = find(lambda l: l == "外資自營商")
     note = ""
     if fd is None or None in fd:
         fd, note = (0.0, 0.0, 0.0), "（外資自營商列缺漏，未計入）"
     for buy, sell, diff in (main, fd):
         if abs(diff - (buy - sell)) > 1:
-            log("twse:institutional", "failure", as_of=as_of, detail="買進－賣出 與買賣差額對不上，拒收")
-            return None
+            return None, "", "買進－賣出 與買賣差額對不上，拒收"
     f_buy, f_sell, f_net = main[0] + fd[0], main[1] + fd[1], main[2] + fd[2]
     if not (0 <= f_buy <= config.INST_SIDE_LIMIT and 0 <= f_sell <= config.INST_SIDE_LIMIT
             and abs(f_net) <= config.INST_NET_LIMIT):
-        log("twse:institutional", "failure", as_of=as_of, detail=f"外資金額 {f_buy}/{f_sell} 超出合理範圍，拒收")
-        return None
+        return None, "", f"外資金額 {f_buy}/{f_sell} 超出合理範圍，拒收"
 
     trust = find(lambda l: l.startswith("投信"))
     dealers = [t for lab, t in table.items() if lab.replace(" ", "").startswith("自營商(") and None not in t]
@@ -465,8 +457,102 @@ def twse_institutional():
         "total_net": total[2] if total and None not in total else None,
         "source": "TWSE BFI82U",
     }
-    log("twse:institutional", "success", as_of=as_of, detail=f"外資買賣超 {f_net / 1e8:+.2f} 億元（現貨）{note}")
+    return row, note, None
+
+
+def twse_institutional():
+    """三大法人買賣金額（現貨），抓最新一天。"""
+    got = _twse_fetch_day(config.TWSE_BFI82U, "twse:institutional")
+    if got is None:
+        return None
+    data, as_of = got
+    row, note, err = _parse_institutional(data, as_of)
+    if err:
+        log("twse:institutional", "failure", as_of=as_of, detail=err)
+        return None
+    log("twse:institutional", "success", as_of=as_of, detail=f"外資買賣超 {row['foreign_net'] / 1e8:+.2f} 億元（現貨）{note}")
     return [row]
+
+
+def tw_institutional_backfill(max_days=None):
+    """模組 M12：回補外資買賣超的歷史（給門檻的近一年分布用）。
+    要補哪幾天：以自建行情（tw_hist_days）裡確認過的上市交易日為準，扣掉資料庫已經有的；每次最多 INST_BATCH_DAYS 天，間隔 HIST_SLEEP 秒。
+    每一天都要驗證：證交所回傳的日期必須就是我們要的那一天（否則可能是把『最新一天』當成歷史），數字用和每日一樣的驗證。
+    連線失敗就整批停止（不繼續打請求）；某天沒有資料或驗證不過，只略過那一天。回傳要寫入的列，由 persist_extra 寫入。"""
+    max_days = max_days or config.INST_BATCH_DAYS
+    if not sb_ready():
+        log("inst_backfill", "skipped", detail="未設定 Supabase，無法判斷哪些日期已經補過，不回補")
+        return []
+    start = date.today() - timedelta(days=config.HIST_WINDOW_DAYS)
+    days, err = sb_request("GET", f"tw_hist_days?select=as_of&market=eq.TWSE&status=eq.ok&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000")
+    if days is None:
+        log("inst_backfill", "failure", detail=_clip(f"讀取交易日清單失敗：{err}"))
+        return []
+    have_rows, err = sb_request("GET", f"tw_institutional?select=as_of&source=eq.TWSE%20BFI82U&as_of=gte.{start.isoformat()}&limit=2000")
+    have = {r["as_of"] for r in (have_rows or [])}
+    todo_all = [r["as_of"] for r in days if r["as_of"] not in have]
+    todo = todo_all[:max_days]
+    if not todo:
+        log("inst_backfill", "no_new_data", detail=f"近 {config.HIST_WINDOW_DAYS} 天的 {len(days)} 個交易日，外資買賣超都已經補齊")
+        return []
+    out, skipped, bad, first_err = [], 0, 0, ""
+    for d in todo:
+        data, err = fetch_json(config.TWSE_BFI82U + "&dayDate=" + d.replace("-", ""))
+        time.sleep(config.HIST_SLEEP)
+        if data is None:
+            log("inst_backfill", "failure", as_of=d, detail=_clip(f"抓取失敗：{err}；已停止本次回補，不繼續打請求"))
+            break
+        if not isinstance(data, dict) or data.get("stat") != "OK":
+            skipped += 1
+            continue
+        as_of = twse_ymd_to_iso(data.get("date"))
+        if as_of != d:
+            bad += 1
+            first_err = first_err or f"要 {d} 但證交所回傳 {as_of}"
+            continue
+        row, _note, perr = _parse_institutional(data, as_of)
+        if perr:
+            bad += 1
+            first_err = first_err or f"{d}：{perr}"
+            continue
+        out.append(row)
+    log("inst_backfill", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
+        detail=_clip(f"本次補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") +
+                     f"；略過 {skipped} 天（證交所沒有資料）、{bad} 天（日期或數字驗證不過" + (f"：{first_err}" if first_err else "") + f"）；還有 {max(len(todo_all) - len(todo), 0)} 天下次繼續"))
+    return out
+
+
+def tw_breadth_hist_compute():
+    """模組 M13：呼叫資料庫函式 compute_tw_breadth_hist，用自建行情算每天的上漲、下跌、平盤家數（4 位數代號的股票，沒有調整除權息）。
+    第一次（資料表是空的）從回補範圍的起點開始，每 30 天一段分段重算（一次算全部可能被資料庫的逾時上限砍掉）；之後每天只重算最近 20 天。"""
+    if not sb_ready():
+        log("tw_breadth_hist", "skipped", detail="未設定 Supabase，不計算")
+        return []
+    first, err = sb_request("GET", "tw_breadth_hist?select=as_of&order=as_of.asc&limit=1")
+    if first is None:
+        log("tw_breadth_hist", "failure", detail=_clip(f"讀取失敗：{err}（請先執行 new_tables_v38.sql）"))
+        return []
+    today = date.today()
+    if first:
+        windows = [((today - timedelta(days=20)).isoformat(), None)]
+    else:
+        windows, a = [], today - timedelta(days=config.HIST_WINDOW_DAYS)
+        while a <= today:
+            b = min(a + timedelta(days=29), today)
+            windows.append((a.isoformat(), b.isoformat()))
+            a = b + timedelta(days=1)
+    total = 0
+    for p_from, p_to in windows:
+        res, err = sb_request("POST", "rpc/compute_tw_breadth_hist", {"p_from": p_from, "p_to": p_to})
+        if res is None:
+            log("tw_breadth_hist", "failure", as_of=p_from, detail=_clip(f"呼叫 compute_tw_breadth_hist 失敗（{p_from} 起）：{err}（請先執行 new_tables_v38.sql；已算 {total} 個，下次繼續）"))
+            return [{"computed": total}] if total else []
+        try:
+            total += int(res if not isinstance(res, list) else res[0])
+        except (TypeError, ValueError, IndexError):
+            pass
+    log("tw_breadth_hist", "success" if total else "no_new_data", detail=f"{'全部重算（分 ' + str(len(windows)) + ' 段）' if not first else '重算最近 20 天'}：{total} 個（日期×市場）")
+    return [{"computed": total}] if total else []
 
 
 def twse_margin():
@@ -2717,10 +2803,14 @@ def run_job(job, dry_run=False):
         probe_earnings()
         probe_round3()
         probe_round4()
+    inst_rows = []
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
         tw_crash_check(list(res.get("new_days", [])) + _recent_complete_days(config.CRASH_RECENT_DAYS), dry_run=dry_run)
+        if not dry_run:
+            _run_module("M13", "漲跌家數歷史（自建）", tw_breadth_hist_compute)
+            inst_rows = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
@@ -2740,6 +2830,7 @@ def run_job(job, dry_run=False):
         extra.append(("us_leaders", _run_module("M10", "美股領頭股", us_leaders_compute) or [], "as_of,symbol"))
         extra.append(("tw_investor_events", _run_module("M11", "台股法說會日曆", tw_investor_events, price_rows or []) or [], "code,event_date"))
     if job == "tw_backfill":
+        extra.append(("tw_institutional", inst_rows, "as_of,source"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
         if not dry_run:
