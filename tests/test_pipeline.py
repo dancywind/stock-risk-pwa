@@ -15,7 +15,8 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
-                "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events")
+                "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
+                "tw_institutional_backfill", "tw_breadth_hist_compute")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -2847,6 +2848,154 @@ def test_us_crash_screen_confirms_deepest_drops_first_and_says_when_it_truncates
         out = REAL["us_crash_screen"]()
     assert len(out) == 10 and not any("不完整" in r["note"] for r in out) and "不完整" not in [x for x in fetch.LOG if x["source"] == "us_crash:list"][0]["detail"]
     assert config.US_CRASH_MAX_CONFIRM >= 60
+
+
+def _inst_env(todo_dates, have=(), payload_for=None, fail_on=None):
+    """外資歷史回補的模擬環境：交易日清單、資料庫已有的日期、每個日期證交所的回傳。回傳 (patch 清單, 被請求的網址紀錄)"""
+    urls = []
+    def req(method, path, body=None, **k):
+        if path.startswith("tw_hist_days"): return [{"as_of": d} for d in todo_dates], ""
+        if path.startswith("tw_institutional"): return [{"as_of": d} for d in have], ""
+        raise AssertionError(path)
+    def fj(url, **k):
+        urls.append(url)
+        d = url.split("dayDate=")[1]
+        if fail_on and d == fail_on: return None, "HTTP 503"
+        return (payload_for(d) if payload_for else bfi_payload(date_str=d)), ""
+    return [mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req),
+            mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch.time, "sleep")], urls
+
+
+def _with(patches, fn):
+    for p_ in patches: p_.start()
+    try: return fn()
+    finally:
+        for p_ in patches: p_.stop()
+
+
+def test_inst_backfill_fetches_missing_trading_days_and_checks_each_returned_date():
+    reset()
+    days = [D(1), D(2), D(3), D(4)]
+    patches, urls = _inst_env(days, have=[D(2)])
+    rows = _with(patches, lambda: REAL["tw_institutional_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1), D(3), D(4)], "已經有的那天不重抓"
+    assert all(r["source"] == "TWSE BFI82U" and r["foreign_net"] == -68815276510.0 for r in rows)
+    assert len(urls) == 3 and all("&dayDate=" in u and u.startswith(config.TWSE_BFI82U) for u in urls) and urls[0].endswith(D(1).replace("-", ""))
+    log = [x for x in fetch.LOG if x["source"] == "inst_backfill"][0]
+    assert log["status"] == "success" and "本次補 3 天" in log["detail"] and "還有 0 天下次繼續" in log["detail"]
+
+
+def test_inst_backfill_rejects_wrong_date_no_data_and_bad_numbers_but_keeps_going():
+    reset()
+    days = [D(1), D(2), D(3), D(4)]
+    def pf(d):
+        if d == D(1).replace("-", ""): return bfi_payload(date_str=D(5).replace("-", ""))           # 要 D(1)，卻回傳別天（可能是把最新一天當歷史）
+        if d == D(2).replace("-", ""): return {"stat": "很抱歉，沒有符合條件的資料!"}                    # 休市或沒資料
+        if d == D(3).replace("-", ""):
+            rows = [list(x) for x in BFI_ROWS]; rows[3][3] = "-1"                                      # 買進－賣出 對不上
+            return bfi_payload(rows, date_str=d)
+        return bfi_payload(date_str=d)
+    patches, urls = _inst_env(days, payload_for=pf)
+    rows = _with(patches, lambda: REAL["tw_institutional_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(4)] and len(urls) == 4, "壞的那幾天略過，其他照常"
+    d = [x for x in fetch.LOG if x["source"] == "inst_backfill"][0]["detail"]
+    assert "略過 1 天（證交所沒有資料）" in d and "2 天（日期或數字驗證不過：要 " in d and "但證交所回傳" in d, d
+
+
+def test_inst_backfill_stops_on_connection_failure_and_respects_batch_cap():
+    reset()
+    days = [D(i) for i in range(1, 6)]
+    patches, urls = _inst_env(days, fail_on=D(2).replace("-", ""))
+    rows = _with(patches, lambda: REAL["tw_institutional_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1)] and len(urls) == 2, "連線失敗就整批停止，不繼續打請求"
+    f = [x for x in fetch.LOG if x["source"] == "inst_backfill"]
+    assert f[0]["status"] == "failure" and "已停止本次回補" in f[0]["detail"] and f[0]["as_of"] == D(2) and f[-1]["status"] == "success"
+    reset()
+    patches, urls = _inst_env(days)
+    rows = _with(patches, lambda: REAL["tw_institutional_backfill"](max_days=2))
+    assert len(rows) == 2 and len(urls) == 2
+    assert "還有 3 天下次繼續" in [x for x in fetch.LOG if x["source"] == "inst_backfill"][0]["detail"]
+
+
+def test_inst_backfill_done_and_unconfigured_cases():
+    reset()
+    patches, urls = _inst_env([D(1), D(2)], have=[D(1), D(2)])
+    assert _with(patches, lambda: REAL["tw_institutional_backfill"]()) == [] and urls == []
+    assert [x["status"] for x in fetch.LOG if x["source"] == "inst_backfill"] == ["no_new_data"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "fetch_json") as fj:
+        assert REAL["tw_institutional_backfill"]() == []
+        fj.assert_not_called()
+    assert [x["status"] for x in fetch.LOG if x["source"] == "inst_backfill"] == ["skipped"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 404")):
+        assert REAL["tw_institutional_backfill"]() == []
+    assert [x["status"] for x in fetch.LOG if x["source"] == "inst_backfill"] == ["failure"]
+
+
+def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
+    reset()
+    calls = []
+    first, rpc = [[]], [5]
+    def req(method, path, body=None, **k):
+        calls.append((method, path, body))
+        if method == "GET": return first[0], ""
+        return rpc[0], ""
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req):
+        out = REAL["tw_breadth_hist_compute"]()
+    posts = [c for c in calls if c[0] == "POST"]
+    assert all(c[1] == "rpc/compute_tw_breadth_hist" for c in posts) and len(posts) == 14, "400 天分成每 30 天一段：%d 段" % len(posts)
+    assert posts[0][2]["p_from"] == (TODAY - timedelta(days=config.HIST_WINDOW_DAYS)).isoformat() and posts[-1][2]["p_to"] == TODAY.isoformat(), "從回補範圍的起點到今天"
+    for (a1, a2), (b1, b2) in zip([(c[2]["p_from"], c[2]["p_to"]) for c in posts], [(c[2]["p_from"], c[2]["p_to"]) for c in posts[1:]]):
+        assert date.fromisoformat(b1) == date.fromisoformat(a2) + timedelta(days=1), "每一段接著上一段，不重疊也不漏"
+        assert (date.fromisoformat(a2) - date.fromisoformat(a1)).days <= 29
+    assert out == [{"computed": 5 * 14}] and "全部重算（分 14 段）" in [x for x in fetch.LOG if x["source"] == "tw_breadth_hist"][0]["detail"]
+    reset(); calls.clear(); first[0] = [{"as_of": "2025-10-01"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req):
+        REAL["tw_breadth_hist_compute"]()
+    posts = [c for c in calls if c[0] == "POST"]
+    assert len(posts) == 1 and posts[0][2] == {"p_from": (TODAY - timedelta(days=20)).isoformat(), "p_to": None}, "之後只重算最近 20 天"
+    reset(); n = [0]
+    def flaky(method, path, body=None, **k):                                                                 # 第 3 段失敗：前 2 段的結果要保留、並說明下次繼續
+        if method == "GET": return [], ""
+        n[0] += 1
+        return (None, "HTTP 500 statement timeout") if n[0] == 3 else (4, "")
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=flaky):
+        out = REAL["tw_breadth_hist_compute"]()
+    f = [x for x in fetch.LOG if x["source"] == "tw_breadth_hist"][0]
+    assert out == [{"computed": 8}] and n[0] == 3 and f["status"] == "failure" and "已算 8 個，下次繼續" in f["detail"] and "new_tables_v38.sql" in f["detail"], f["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=lambda m, p, b=None, **k: (None, "HTTP 404")):
+        assert REAL["tw_breadth_hist_compute"]() == []
+    assert "new_tables_v38.sql" in [x for x in fetch.LOG if x["source"] == "tw_breadth_hist"][0]["detail"]
+    reset(); rpc[0] = 0; first[0] = [{"as_of": "x"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req):
+        assert REAL["tw_breadth_hist_compute"]() == []
+    assert [x["status"] for x in fetch.LOG if x["source"] == "tw_breadth_hist"] == ["no_new_data"]
+
+
+def test_run_job_tw_backfill_runs_history_modules_and_persists_institutional_rows():
+    reset()
+    got = []
+    row = {"as_of": D(3), "foreign_buy": 1.0, "foreign_sell": 2.0, "foreign_net": -1.0, "source": "TWSE BFI82U"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [
+        mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "tw_backfill", return_value={}),
+        mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "tw_crash_check"),
+        mock.patch.object(fetch, "tw_institutional_backfill", return_value=[row]), mock.patch.object(fetch, "tw_breadth_hist_compute", return_value=[{"computed": 3}]),
+        mock.patch.object(fetch, "persist_extra", side_effect=lambda dry, tables: got.append((dry, [(n, rows_, c) for n, rows_, c in tables])))]
+    for p_ in patches: p_.start()
+    try:
+        fetch.run_job("tw_backfill", dry_run=False)
+        st = {x["source"]: x["status"] for x in fetch.LOG}
+        assert st["module:M12"] == "success" and st["module:M13"] == "success"
+        tables = dict((n, (r, c)) for n, r, c in got[0][1])
+        assert tables["tw_institutional"] == ([row], "as_of,source"), "外資歷史要寫進 tw_institutional，用 (as_of, source) 去重"
+        got.clear(); fetch.LOG.clear()
+        fetch.run_job("tw_backfill", dry_run=True)
+        assert "module:M12" not in {x["source"] for x in fetch.LOG}, "dry-run 不碰這兩個模組"
+    finally:
+        for p_ in patches: p_.stop()
 
 
 def test_probe_round4_logs_aaii_clues_and_exright_sources_without_writing():
