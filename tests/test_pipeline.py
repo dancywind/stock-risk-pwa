@@ -757,7 +757,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -3178,6 +3178,42 @@ def test_run_job_tw_backfill_runs_history_modules_and_persists_institutional_row
         assert "module:M12" not in {x["source"] for x in fetch.LOG}, "dry-run 不碰這兩個模組"
     finally:
         for p_ in patches: p_.stop()
+
+
+def test_probe_round5_reports_industry_field_and_value_counts_without_writing():
+    reset()
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap03_L": {"get": {"summary": "上市公司基本資料"}}, "/opendata/x": {"get": {"summary": "其他"}}}}
+    sw2 = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/mopsfin_t187ap03_O": {"get": {"summary": "上櫃公司基本資料"}}}}
+    rows = [{"公司代號": "2330", "公司名稱": "台積電", "產業別": "24"}, {"公司代號": "2317", "公司名稱": "鴻海", "產業別": "25"}, {"公司代號": "2454", "公司名稱": "聯發科", "產業別": "24"}]
+    otc = [{"SecuritiesCompanyCode": "8358", "CompanyName": "金居", "SecuritiesIndustryCode": "28"}]
+    def fj(url, **k):
+        if url.endswith("swagger.json") and "twse" in url: return sw, ""
+        if "tpex" in url and "swagger" in url: return sw2, ""
+        if url.endswith("t187ap03_L"): return rows, ""
+        if url.endswith("t187ap03_O"): return otc, ""
+        raise AssertionError(url)
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round5()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "/opendata/t187ap03_L" in by["probe:industry_paths:twse"]["detail"] and "/opendata/x" not in by["probe:industry_paths:twse"]["detail"]
+    d = by["probe:industry:twse"]["detail"]
+    assert by["probe:industry:twse"]["status"] == "success" and "共 3 列" in d and "'24': 2" in d and "'25': 1" in d and "產業欄 '產業別'" in d and "台積電" in d
+    d2 = by["probe:industry:tpex"]["detail"]
+    assert by["probe:industry:tpex"]["status"] == "success" and "SecuritiesIndustryCode" in d2 and "'28': 1" in d2
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+
+
+def test_probe_round5_failures_are_reported():
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        fetch.probe_round5()
+    assert {x["source"]: x["status"] for x in fetch.LOG} == {"probe:industry:twse": "failure", "probe:industry:tpex": "failure"}
+    reset()
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/a": {"get": {"summary": "別的"}}}}
+    with mock.patch.object(fetch, "fetch_json", return_value=(sw, "")):
+        fetch.probe_round5()
+    assert all(x["status"] == "no_new_data" and "無" in x["detail"] for x in fetch.LOG)
 
 
 def test_probe_round4_logs_aaii_clues_and_exright_sources_without_writing():
