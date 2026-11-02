@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v40"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v41"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2656,6 +2656,35 @@ def probe_round4():
             log("probe:exright_tpex_rows", "success", detail=_clip(f"{cands[0][0]}｜{len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
 
 
+def probe_round5():
+    """只讀探測第五批：台股公司基本資料裡的「產業別」（上市與上櫃）。
+    記錄：端點、列數、欄位名稱、前 2 列、產業別有哪些不同的值與各幾家（最多 45 種），下一輪才知道怎麼做台股產業相對強弱。不寫入任何資料表。"""
+    for tag, swurl, base in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE)):
+        sw, err = fetch_json(swurl)
+        if not isinstance(sw, dict):
+            log(f"probe:industry:{tag}", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
+            continue
+        cands = []
+        for pth, methods in (sw.get("paths") or {}).items():
+            for mth in (methods or {}).values():
+                t = str(mth.get("summary", "")) if isinstance(mth, dict) else ""
+                if "基本資料" in t and "公司" in t:
+                    cands.append((pth, t))
+        log(f"probe:industry_paths:{tag}", "success" if cands else "no_new_data", detail=_clip("公司基本資料端點：" + (" ; ".join(f"{p} | {t}" for p, t in cands[:6]) if cands else "無")))
+        if not cands:
+            continue
+        pth = cands[0][0]
+        rows, e = fetch_json(_openapi_base(sw, base) + pth)
+        if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+            log(f"probe:industry:{tag}", "failure", detail=_clip(f"{pth} 抓取失敗或格式非預期: {e or str(rows)[:100]}"))
+            continue
+        keys = list(rows[0].keys())
+        kind = _fin_key(keys, ("產業別", "Industry", "IndustryCode"))
+        cnt = Counter(str(r.get(kind, "")).strip() for r in rows if isinstance(r, dict)) if kind else Counter()
+        log(f"probe:industry:{tag}", "success" if kind else "no_new_data",
+            detail=_clip(f"{pth}｜共 {len(rows)} 列｜欄位 {keys}｜產業欄 {kind!r}｜不同的值 {len(cnt)} 種：{dict(cnt.most_common(45))}｜前 2 列 {rows[:2]}"))
+
+
 def probe_us_pressure():
     """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
     1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
@@ -2921,6 +2950,7 @@ def run_job(job, dry_run=False):
         probe_earnings()
         probe_round3()
         probe_round4()
+        probe_round5()
     inst_hist, pc_rows = [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
