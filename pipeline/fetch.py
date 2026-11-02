@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v38"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v39"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1809,6 +1809,21 @@ def _now_et():
     return datetime.now(ZoneInfo("America/New_York"))
 
 
+def _parse_cboe(body, d):
+    """CBOE 每日統計 JSON → Put/Call 一列（日期用呼叫端給的交易日）。總比率不在 0–20 內或格式不對就回傳 None。"""
+    try:
+        j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None
+    ratios = {str(x.get("name", "")).strip().upper(): parse_number(x.get("value")) for x in (j.get("ratios") or []) if isinstance(x, dict)} if isinstance(j, dict) else {}
+    total = ratios.get("TOTAL PUT/CALL RATIO")
+    if total is None or not (0 < total < 20):
+        return None
+    pick = lambda name: ratios.get(name) if ratios.get(name) and 0 < ratios[name] < 20 else None
+    return {"as_of": d.isoformat() if hasattr(d, "isoformat") else str(d), "total_pc": total, "index_pc": pick("INDEX PUT/CALL RATIO"), "equity_pc": pick("EQUITY PUT/CALL RATIO"),
+            "etp_pc": pick("EXCHANGE TRADED PRODUCTS PUT/CALL RATIO"), "source": "CBOE 每日市場統計"}
+
+
 def cboe_putcall():
     """CBOE 每日市場統計的 Put/Call 比率。只收『已收盤並結算』的交易日：美東日期早於今天，或今天但已過 17:00。
     由新到舊試最多 5 個平日，第一個有資料的就用，日期用它自己的交易日。"""
@@ -1825,21 +1840,61 @@ def cboe_putcall():
         if status != 200:
             time.sleep(1)
             continue
-        try:
-            j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
-        except (ValueError, UnicodeDecodeError):
+        row = _parse_cboe(body, d)
+        if row is None:
             continue
-        ratios = {str(x.get("name", "")).strip().upper(): parse_number(x.get("value")) for x in (j.get("ratios") or []) if isinstance(x, dict)} if isinstance(j, dict) else {}
-        total = ratios.get("TOTAL PUT/CALL RATIO")
-        if total is None or not (0 < total < 20):
-            continue
-        pick = lambda name: ratios.get(name) if ratios.get(name) and 0 < ratios[name] < 20 else None
-        row = {"as_of": d.isoformat(), "total_pc": total, "index_pc": pick("INDEX PUT/CALL RATIO"), "equity_pc": pick("EQUITY PUT/CALL RATIO"),
-               "etp_pc": pick("EXCHANGE TRADED PRODUCTS PUT/CALL RATIO"), "source": "CBOE 每日市場統計"}
-        log("cboe:putcall", "success", as_of=row["as_of"], detail=f"總比率 {total}；指數 {row['index_pc']}；ETP {row['etp_pc']}；股票 {row['equity_pc'] if row['equity_pc'] is not None else '查不到'}")
+        log("cboe:putcall", "success", as_of=row["as_of"], detail=f"總比率 {row['total_pc']}；指數 {row['index_pc']}；ETP {row['etp_pc']}；股票 {row['equity_pc'] if row['equity_pc'] is not None else '查不到'}")
         return [row]
     log("cboe:putcall", "no_new_data", detail=_clip(f"最近 {len(cands)} 個平日都沒有可用資料（{', '.join(tried)}）"))
     return None
+
+
+def cboe_putcall_backfill(max_days=None):
+    """模組 M14：回補 Put/Call 的歷史（給門檻的近一年分布用）。
+    要補哪幾天：以 FRED 標普 500 有資料的日期當美股交易日，扣掉資料庫已經有的；每次最多 PC_BATCH_DAYS 天，間隔 PC_SLEEP 秒。
+    CBOE 不一定保留很舊的資料：還沒成功過就連續 5 天都沒有，或已經成功過後連續 10 天都沒有，就停止並說明（不繼續打請求）。
+    連線失敗整批停止；某天格式不對只略過那一天。回傳要寫入的列，由 persist_extra 寫入。"""
+    max_days = max_days or config.PC_BATCH_DAYS
+    if not sb_ready():
+        log("pc_backfill", "skipped", detail="未設定 Supabase，無法判斷哪些日期已經補過，不回補")
+        return []
+    start = date.today() - timedelta(days=config.HIST_WINDOW_DAYS)
+    days, err = sb_request("GET", f"macro_series?select=as_of&series_id=eq.SP500&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000")
+    if not days:
+        log("pc_backfill", "failure" if days is None else "no_new_data", detail=_clip(f"讀不到美股交易日清單（FRED 標普 500 歷史）：{err or '沒有資料'}；請先跑 tw_backfill 補 FRED 歷史"))
+        return []
+    have_rows, err = sb_request("GET", f"us_putcall?select=as_of&as_of=gte.{start.isoformat()}&limit=2000")
+    have = {r["as_of"] for r in (have_rows or [])}
+    todo_all = [r["as_of"] for r in days if r["as_of"] not in have]
+    todo = todo_all[:max_days]
+    if not todo:
+        log("pc_backfill", "no_new_data", detail=f"近 {config.HIST_WINDOW_DAYS} 天的 {len(days)} 個美股交易日，Put/Call 都已經補齊")
+        return []
+    out, miss_run, missing, bad, stopped = [], 0, 0, 0, ""
+    for d in todo:
+        status, ctype, body, err = fetch_raw(config.CBOE_DAILY_URL.format(ymd=d), timeout=config.PROBE_TIMEOUT)
+        time.sleep(config.PC_SLEEP)
+        if status is None:
+            stopped = f"連線失敗：{err}；已停止本次回補，不繼續打請求"
+            log("pc_backfill", "failure", as_of=d, detail=_clip(stopped))
+            break
+        if status != 200:
+            missing += 1
+            miss_run += 1
+            if miss_run >= (5 if not out else 10):
+                stopped = f"連續 {miss_run} 天 CBOE 都沒有資料（最近一次 {d}：HTTP {status}），可能不保留更早的歷史；已停止本次回補"
+                break
+            continue
+        miss_run = 0
+        row = _parse_cboe(body, d)
+        if row is None:
+            bad += 1
+            continue
+        out.append(row)
+    log("pc_backfill", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
+        detail=_clip(f"本次補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") + f"；沒有資料 {missing} 天、格式不符 {bad} 天" +
+                     (f"；{stopped}" if stopped else f"；還有 {max(len(todo_all) - len(todo), 0)} 天下次繼續")))
+    return out
 
 
 def _earn_date(token):
@@ -2484,9 +2539,46 @@ def _news_path(sw):
     return None
 
 
+_CONF_LABELED = re.compile(r"法人說明會(?:之|的)?(?:舉行|召開|舉辦)?(?:日期|時間)\s*[:：]?\s*(\d{2,3})[/年.](\d{1,2})[/月.](\d{1,2})")
+_CONF_CANCEL = re.compile(r"取消|延期|改期|暫停|不召開|不舉行")
+
+
+def _conference_date(text, fact_raw, today):
+    """從一則重大訊息找法說會日期。回傳 (日期或 None, 來源說明, 不採用的原因)。
+    1) 說明裡有標明「法人說明會…日期：115/11/26」→ 只能有一個不同的日期；
+    2) 沒有標明，但文字裡剛好只有一個「115年11月26日」→ 採用；兩個以上（例如原訂與更正）→ 不猜；
+    3) 文字裡完全沒有日期，才用公告的「事實發生日」欄（受邀參加券商舉辦的法說會，日期通常只在這一欄）。
+    日期必須在昨天到 180 天後之間；公告提到取消、延期、改期的不採用。"""
+    if _CONF_CANCEL.search(text):
+        return None, "", "公告提到取消、延期或改期，不採用"
+    labeled = {m for m in _CONF_LABELED.findall(text)}
+    if len(labeled) > 1:
+        return None, "", "公告裡標明的法說會日期不只一個，不採用"
+    triples, how = (labeled, "") if labeled else (set(), "")
+    if not triples:
+        triples = set(re.findall(r"(\d{3})年(\d{1,2})月(\d{1,2})日", text))
+        if len(triples) > 1:
+            return None, "", "公告提到法人說明會，但沒有唯一的日期，不採用"
+    if not triples:
+        iso = roc_to_iso(fact_raw) if fact_raw else None
+        if not iso:
+            return None, "", "公告提到法人說明會，但找不到日期（說明裡沒有、事實發生日欄也是空的），不採用"
+        ev, how = date.fromisoformat(iso), "【日期取自公告的事實發生日】"
+    else:
+        y, mo, d = next(iter(triples))
+        try:
+            ev = date(int(y) + 1911, int(mo), int(d))
+        except ValueError:
+            return None, "", "日期不合法，不採用"
+    if not (today - timedelta(days=1) <= ev <= today + timedelta(days=180)):
+        return None, "", f"日期 {ev} 不在合理範圍（昨天到 180 天後），不採用"
+    return ev, how, ""
+
+
 def tw_investor_events(price_rows):
-    """模組 M11：從證交所、櫃買中心『每日重大訊息』找你持股的法人說明會日期（公司公告「召開法人說明會之日期」）。
-    每天的訊息只有當天的公告，所以靠每天排程累積；日期必須在今天前後合理範圍，句型對不上就不採用。"""
+    """模組 M11：從證交所、櫃買中心『每日重大訊息』找你持股的法人說明會日期。
+    每天的訊息只有當天的公告，所以靠每天排程累積。兩個市場的欄位名稱不一樣（上櫃是英文的 SecuritiesCompanyCode、CompanyName），
+    日期怎麼取見 _conference_date；對不上就不採用，不猜。"""
     wanted = {r["code"]: r.get("name") or r["code"] for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")}
     if not wanted:
         log("tw_events", "skipped", detail="沒有台股持股代號，不查法說會")
@@ -2504,30 +2596,28 @@ def tw_investor_events(price_rows):
             log(f"tw_events:{tag}", "failure", detail=_clip(f"{pth} 抓取失敗或格式非預期: {e or str(rows)[:100]}"))
             continue
         keys = list(rows[0].keys())
-        kc, kn, ks, kd = _fin_key(keys, ("公司代號",)), _fin_key(keys, ("公司名稱",)), _fin_key(keys, ("主旨",)), _fin_key(keys, ("發言日期",))
-        hit = 0
+        kc = _fin_key(keys, ("公司代號", "CompanyCode", "Code"))
+        kn = _fin_key(keys, ("公司名稱", "CompanyName"))
+        ks, kd, kf = _fin_key(keys, ("主旨",)), _fin_key(keys, ("發言日期",)), _fin_key(keys, ("事實發生日",))
+        if not kc:
+            log(f"tw_events:{tag}", "failure", detail=_clip(f"{pth}：找不到公司代號欄（欄位 {keys}），不採用"))
+            continue
+        hit = conf = 0
         for r in rows:
-            code = str(r.get(kc, "")).strip() if kc else ""
+            code = str(r.get(kc, "")).strip()
             text = " ".join(str(v) for v in r.values())
             if code not in wanted or "法人說明會" not in text:
                 continue
-            m = re.search(r"召開法人說明會之日期[:：]\s*(\d{2,3})/(\d{1,2})/(\d{1,2})", text)
-            dates = {(m.group(1), m.group(2), m.group(3))} if m else set(re.findall(r"(\d{3})年(\d{1,2})月(\d{1,2})日", text))
-            if len(dates) != 1:
-                log(f"tw_events:{code}", "no_new_data", detail=_clip(f"{wanted[code]}：公告提到法人說明會，但沒有唯一的日期，不採用｜{str(r.get(ks, ''))[:80]}"))
-                continue
-            y, mo, d = next(iter(dates))
-            try:
-                ev = date(int(y) + 1911, int(mo), int(d))
-            except ValueError:
-                continue
-            if not (today - timedelta(days=1) <= ev <= today + timedelta(days=180)):
+            conf += 1
+            ev, how, why = _conference_date(text, r.get(kf) if kf else None, today)
+            if ev is None:
+                log(f"tw_events:{code}", "no_new_data", detail=_clip(f"{wanted[code]}：{why}｜{str(r.get(ks, ''))[:80]}"))
                 continue
             ann = roc_to_iso(r.get(kd)) if kd else None
-            out[(code, ev.isoformat())] = {"code": code, "name": str(r.get(kn, "")).strip() or wanted[code], "event_date": ev.isoformat(),
-                                           "announced_at": ann, "subject": str(r.get(ks, ""))[:200], "source": "證交所／櫃買中心 每日重大訊息"}
+            out[(code, ev.isoformat())] = {"code": code, "name": (str(r.get(kn, "")).strip() if kn else "") or wanted[code], "event_date": ev.isoformat(),
+                                           "announced_at": ann, "subject": (how + str(r.get(ks, "")))[:200], "source": "證交所／櫃買中心 每日重大訊息"}
             hit += 1
-        log(f"tw_events:{tag}", "success", detail=f"{pth}｜{len(rows)} 則公告；你的持股有 {hit} 則法人說明會日期")
+        log(f"tw_events:{tag}", "success", detail=f"{pth}｜{len(rows)} 則公告；你的持股有 {conf} 則提到法人說明會，其中 {hit} 則取得日期")
     return list(out.values())
 
 
@@ -2803,7 +2893,7 @@ def run_job(job, dry_run=False):
         probe_earnings()
         probe_round3()
         probe_round4()
-    inst_rows = []
+    inst_rows, pc_rows = [], []
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
@@ -2811,6 +2901,7 @@ def run_job(job, dry_run=False):
         if not dry_run:
             _run_module("M13", "漲跌家數歷史（自建）", tw_breadth_hist_compute)
             inst_rows = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
+            pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
@@ -2831,6 +2922,7 @@ def run_job(job, dry_run=False):
         extra.append(("tw_investor_events", _run_module("M11", "台股法說會日曆", tw_investor_events, price_rows or []) or [], "code,event_date"))
     if job == "tw_backfill":
         extra.append(("tw_institutional", inst_rows, "as_of,source"))
+        extra.append(("us_putcall", pc_rows, "as_of"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
         if not dry_run:
