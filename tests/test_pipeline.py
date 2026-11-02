@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -2765,6 +2765,46 @@ def test_tw_investor_events_picks_only_held_companies_with_one_clear_date():
     assert REAL["tw_investor_events"]([]) == [] and fetch.LOG[-1]["status"] == "skipped"
 
 
+def test_tw_events_reads_real_formats_otc_english_keys_and_fact_date_fallback():
+    reset()
+    ev = TODAY + timedelta(days=12)
+    fact = f"{ev.year - 1911}{ev.month:02d}{ev.day:02d}"
+    ann = f"{TODAY.year - 1911}{TODAY.month:02d}{TODAY.day:02d}"
+    sw = {"servers": [{"url": "https://openapi.twse.com.tw/v1"}], "paths": {"/opendata/t187ap04_L": {"get": {"summary": "上市公司每日重大訊息"}}}}
+    sw2 = {"servers": [{"url": "https://www.tpex.org.tw/openapi/v1"}], "paths": {"/mopsfin_t187ap04_O": {"get": {"summary": "上櫃公司每日重大訊息"}}}}
+    twse = [  # 上市：欄位名稱「主旨 」後面有空白（真實回傳就是這樣）；受邀參加型，日期只在「事實發生日」
+        {"出表日期": ann, "發言日期": ann, "發言時間": "140235", "公司代號": "2330", "公司名稱": "台積電", "主旨 ": "本公司受邀參加凱基證券公司所舉辦之上市公司法人說明會，說明本公司營運展望與經營績效", "符合條款": "第12款", "事實發生日": fact, "說明": "1.事實發生日:民國 2.公司名稱:台積電"},
+        {"出表日期": ann, "發言日期": ann, "發言時間": "140300", "公司代號": "1101", "公司名稱": "台泥", "主旨 ": "公告本公司受邀參加法人說明會", "符合條款": "第12款", "事實發生日": fact, "說明": "x"},      # 不是持股
+        {"出表日期": ann, "發言日期": ann, "發言時間": "140400", "公司代號": "2454", "公司名稱": "聯發科", "主旨 ": "公告本公司取消法人說明會", "符合條款": "第12款", "事實發生日": fact, "說明": "因故取消"}]    # 取消
+    tpex = [  # 上櫃：欄位是英文（SecuritiesCompanyCode、CompanyName）；說明裡標明日期（句型「召開法人說明會日期」沒有「之」）
+        {"Date": ann, "發言日期": ann, "發言時間": "152221", "SecuritiesCompanyCode": "8358", "CompanyName": "金居", "主旨": "本公司受邀參加富邦證券舉辦之法人說明會", "符合條款": "第12款", "事實發生日": ann, "說明": f"1.召開法人說明會日期：{ev.year - 1911}/{ev.month}/{ev.day} 2.地點：線上"},
+        {"Date": ann, "發言日期": ann, "發言時間": "152300", "SecuritiesCompanyCode": "6488", "CompanyName": "環球晶", "主旨": "公告受邀參加法人說明會", "符合條款": "第12款", "事實發生日": f"{TODAY.year - 1911 - 1}0101", "說明": "x"},         # 事實發生日在過去 → 不採用
+        {"Date": ann, "發言日期": ann, "發言時間": "152400", "SecuritiesCompanyCode": "3105", "CompanyName": "穩懋", "主旨": "公告法人說明會", "符合條款": "第12款", "事實發生日": "", "說明": "x"}]                                    # 完全沒有日期 → 不採用
+    def fj(url, **k):
+        if url.endswith("swagger.json") and "twse" in url: return sw, ""
+        if "tpex" in url and "swagger" in url: return sw2, ""
+        if url.endswith("t187ap04_L"): return twse, ""
+        if url.endswith("t187ap04_O"): return tpex, ""
+        return [], ""
+    held = [{"market": "TW", "code": c, "name": n} for c, n in (("2330", "台積電"), ("2454", "聯發科"), ("8358", "金居"), ("6488", "環球晶"), ("3105", "穩懋"))]
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        out = REAL["tw_investor_events"](held)
+    by = {r["code"]: r for r in out}
+    assert sorted(by) == ["2330", "8358"], "取得日期的只有：受邀型（事實發生日）的台積電，與說明裡標明日期的上櫃金居: " + str(sorted(by))
+    assert by["2330"]["event_date"] == ev.isoformat() and by["2330"]["subject"].startswith("【日期取自公告的事實發生日】") and "受邀參加" in by["2330"]["subject"]
+    assert by["8358"]["event_date"] == ev.isoformat() and by["8358"]["name"] == "金居" and not by["8358"]["subject"].startswith("【"), "上櫃（英文欄位）要讀得到，且日期來自說明、不是事實發生日"
+    assert by["8358"]["announced_at"] == TODAY.isoformat()
+    why = {x["source"].split(":")[1]: x["detail"] for x in fetch.LOG if x["source"].startswith("tw_events:") and x["status"] == "no_new_data"}
+    assert "取消、延期或改期" in why["2454"] and "不在合理範圍" in why["6488"] and "找不到日期" in why["3105"], why
+    ok = {x["source"]: x["detail"] for x in fetch.LOG if x["status"] == "success"}
+    assert "你的持股有 2 則提到法人說明會，其中 1 則取得日期" in ok["tw_events:twse"] and "你的持股有 3 則提到法人說明會，其中 1 則取得日期" in ok["tw_events:tpex"], ok
+    reset()
+    bad_keys = [{"foo": "1", "bar": "2"}]                                                                        # 欄位完全認不得：失敗並說明，不亂猜
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (sw, "") if u.endswith("swagger.json") and "twse" in u else (sw2, "") if "swagger" in u else (bad_keys, "")):
+        assert REAL["tw_investor_events"](held) == []
+    assert all(x["status"] == "failure" and "找不到公司代號欄" in x["detail"] for x in fetch.LOG if x["source"].startswith("tw_events:t"))
+
+
 def test_run_job_wires_v32_modules_and_isolates_failures():
     reset()
     base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
@@ -2974,6 +3014,79 @@ def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
     assert [x["status"] for x in fetch.LOG if x["source"] == "tw_breadth_hist"] == ["no_new_data"]
 
 
+def _pc_env(days, have=(), http=None):
+    """Put/Call 回補的模擬環境：FRED 標普 500 的日期清單、資料庫已有的日期、CBOE 對每個日期的回應（預設都是 200 並給正常內容）。"""
+    urls = []
+    def req(method, path, body=None, **k):
+        if path.startswith("macro_series"): return [{"as_of": d} for d in days], ""
+        if path.startswith("us_putcall"): return [{"as_of": d} for d in have], ""
+        raise AssertionError(path)
+    def raw(url, timeout=None, headers=None):
+        urls.append(url)
+        d = url.split("/daily/")[1].split("_daily_options")[0]
+        res = http(d) if http else (200, "application/json", cboe_body(), "")
+        return res
+    return [mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req),
+            mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep")], urls
+
+
+def test_pc_backfill_fetches_missing_days_with_their_own_dates():
+    reset()
+    days = [D(1), D(2), D(3), D(4)]
+    patches, urls = _pc_env(days, have=[D(2)])
+    rows = _with(patches, lambda: REAL["cboe_putcall_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1), D(3), D(4)] and all(r["total_pc"] == 0.93 and r["source"] == "CBOE 每日市場統計" for r in rows), "已經有的不重抓，日期用請求的交易日"
+    assert len(urls) == 3 and urls[0] == config.CBOE_DAILY_URL.format(ymd=D(1))
+    d = [x for x in fetch.LOG if x["source"] == "pc_backfill"][0]
+    assert d["status"] == "success" and "本次補 3 天" in d["detail"] and "還有 0 天下次繼續" in d["detail"]
+
+
+def test_pc_backfill_skips_bad_days_stops_when_cboe_has_no_old_data_and_on_connection_failure():
+    reset()
+    days = [D(i) for i in range(1, 20)]
+    def http(d):                                                                                     # 最近 2 天正常，第 3 天格式壞，之後全部 404（CBOE 不保留更早的）
+        if d in (D(1), D(2)): return 200, "application/json", cboe_body(), ""
+        if d == D(3): return 200, "application/json", b"not json", ""
+        return 404, "text/html", b"nope", "HTTP 404"
+    patches, urls = _pc_env(days, http=http)
+    rows = _with(patches, lambda: REAL["cboe_putcall_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1), D(2)]
+    assert len(urls) == 3 + 10, "已經成功過後，連續 10 天沒有資料才停（共 3 + 10 次請求），不是把 19 天都打一遍: %d" % len(urls)
+    d = [x for x in fetch.LOG if x["source"] == "pc_backfill"][0]["detail"]
+    assert "格式不符 1 天" in d and "連續 10 天 CBOE 都沒有資料" in d and "已停止本次回補" in d and "下次繼續" not in d, d
+    reset()
+    days = [D(i) for i in range(1, 20)]
+    patches, urls = _pc_env(days, http=lambda d: (404, "text/html", b"", "HTTP 404"))                # 一天都沒成功過：連續 5 天沒有就停
+    assert _with(patches, lambda: REAL["cboe_putcall_backfill"]()) == [] and len(urls) == 5, "不能把 19 天都打一遍"
+    assert [x["status"] for x in fetch.LOG if x["source"] == "pc_backfill"] == ["no_new_data"]
+    reset()
+    patches, urls = _pc_env([D(i) for i in range(1, 6)], http=lambda d: (None, "", b"", "timeout") if d == D(2) else (200, "application/json", cboe_body(), ""))
+    rows = _with(patches, lambda: REAL["cboe_putcall_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1)] and len(urls) == 2, "連線失敗整批停止"
+    f = [x for x in fetch.LOG if x["source"] == "pc_backfill"]
+    assert f[0]["status"] == "failure" and "不繼續打請求" in f[0]["detail"]
+
+
+def test_pc_backfill_batch_cap_done_and_unconfigured():
+    reset()
+    patches, urls = _pc_env([D(i) for i in range(1, 7)])
+    rows = _with(patches, lambda: REAL["cboe_putcall_backfill"](max_days=2))
+    assert len(rows) == 2 and len(urls) == 2 and "還有 4 天下次繼續" in [x for x in fetch.LOG if x["source"] == "pc_backfill"][0]["detail"]
+    reset()
+    patches, urls = _pc_env([D(1), D(2)], have=[D(1), D(2)])
+    assert _with(patches, lambda: REAL["cboe_putcall_backfill"]()) == [] and urls == []
+    assert [x["status"] for x in fetch.LOG if x["source"] == "pc_backfill"] == ["no_new_data"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "fetch_raw") as fr:
+        assert REAL["cboe_putcall_backfill"]() == []
+        fr.assert_not_called()
+    assert [x["status"] for x in fetch.LOG if x["source"] == "pc_backfill"] == ["skipped"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], "")):          # 還沒有 FRED 歷史
+        assert REAL["cboe_putcall_backfill"]() == []
+    assert "請先跑 tw_backfill" in [x for x in fetch.LOG if x["source"] == "pc_backfill"][0]["detail"]
+
+
 def test_run_job_tw_backfill_runs_history_modules_and_persists_institutional_rows():
     reset()
     got = []
@@ -2983,6 +3096,7 @@ def test_run_job_tw_backfill_runs_history_modules_and_persists_institutional_row
         mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "tw_backfill", return_value={}),
         mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "tw_crash_check"),
         mock.patch.object(fetch, "tw_institutional_backfill", return_value=[row]), mock.patch.object(fetch, "tw_breadth_hist_compute", return_value=[{"computed": 3}]),
+        mock.patch.object(fetch, "cboe_putcall_backfill", return_value=[{"as_of": D(3), "total_pc": 0.9, "source": "CBOE 每日市場統計"}]),
         mock.patch.object(fetch, "persist_extra", side_effect=lambda dry, tables: got.append((dry, [(n, rows_, c) for n, rows_, c in tables])))]
     for p_ in patches: p_.start()
     try:
@@ -2991,6 +3105,7 @@ def test_run_job_tw_backfill_runs_history_modules_and_persists_institutional_row
         assert st["module:M12"] == "success" and st["module:M13"] == "success"
         tables = dict((n, (r, c)) for n, r, c in got[0][1])
         assert tables["tw_institutional"] == ([row], "as_of,source"), "外資歷史要寫進 tw_institutional，用 (as_of, source) 去重"
+        assert tables["us_putcall"][1] == "as_of" and tables["us_putcall"][0][0]["total_pc"] == 0.9 and st["module:M14"] == "success", "Put/Call 歷史要寫進 us_putcall，用 as_of 去重"
         got.clear(); fetch.LOG.clear()
         fetch.run_job("tw_backfill", dry_run=True)
         assert "module:M12" not in {x["source"] for x in fetch.LOG}, "dry-run 不碰這兩個模組"
