@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -24,6 +24,7 @@ NETWORK_CALLS = []                                             # 任何沒有被
 
 def reset():
     fetch.LOG.clear()
+    fetch._JSON_CACHE.clear()                                   # 說明文件的快取不能跨測試
     for n in MODULE_FUNCS:                                      # 其他測試不該執行這些會連網的模組（它們有自己的測試）
         setattr(fetch, n, lambda *a, **k: [])
 
@@ -757,7 +758,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -3724,6 +3725,164 @@ def test_probe_round9_reports_oi_options_cboe_chain_margin_and_paths_without_wri
         fetch.probe_round9()
     assert not [x for x in fetch.LOG if x["status"] == "failure"], "候選來源被擋是正常的探測結果，不能讓工作變紅"
     assert {x["source"]: x["status"] for x in fetch.LOG}["probe:cboe_chain:SPY"] == "no_new_data"
+
+
+def test_fetch_json_waits_longer_when_blocked_and_shares_swagger_within_a_run():
+    import io, urllib.error
+    reset()
+    class Resp:
+        def __init__(self, body): self._b = body
+        def read(self): return self._b
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def http_err(code): return urllib.error.HTTPError("https://x/y", code, "err", {}, io.BytesIO(b""))
+    calls = {"n": 0}
+    def urlopen_403_then_ok(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3: raise http_err(403)
+        return Resp(b'{"ok": 1}')
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=urlopen_403_then_ok), mock.patch.object(fetch.time, "sleep") as sl:
+        assert fetch.fetch_json("https://x/y") == ({"ok": 1}, "")
+    assert [c.args[0] for c in sl.call_args_list] == [config.BLOCK_BACKOFF_SECONDS * 1, config.BLOCK_BACKOFF_SECONDS * 2], "被擋（403）要等比較久：20 秒、40 秒"
+    calls["n"] = 0
+    def urlopen_404(req, timeout=None):
+        calls["n"] += 1
+        raise http_err(404)
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=urlopen_404), mock.patch.object(fetch.time, "sleep") as sl:
+        data, err = fetch.fetch_json("https://x/y")
+    assert data is None and "404" in err and calls["n"] == config.RETRIES and [c.args[0] for c in sl.call_args_list] == [config.BACKOFF_SECONDS * 1, config.BACKOFF_SECONDS * 2], "不是被擋（404）就用一般的等待"
+    for code in (429, 503):
+        with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=lambda req, timeout=None, c=code: (_ for _ in ()).throw(http_err(c))), mock.patch.object(fetch.time, "sleep") as sl:
+            fetch.fetch_json("https://x/y")
+        assert sl.call_args_list[0].args[0] == config.BLOCK_BACKOFF_SECONDS, code
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=OSError("timeout")), mock.patch.object(fetch.time, "sleep") as sl:
+        assert fetch.fetch_json("https://x/y")[0] is None
+    assert sl.call_args_list[0].args[0] == config.BACKOFF_SECONDS, "連線逾時用一般的等待"
+    # 說明文件同一輪只抓一次；失敗的不快取
+    reset()
+    n = {"c": 0}
+    def fj(url, **k):
+        n["c"] += 1
+        return ({"paths": {}}, "") if n["c"] > 1 else (None, "HTTP 403")
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        assert fetch.fetch_swagger("https://s/swagger.json")[0] is None
+        assert fetch.fetch_swagger("https://s/swagger.json")[0] == {"paths": {}}
+        assert fetch.fetch_swagger("https://s/swagger.json")[0] == {"paths": {}}
+    assert n["c"] == 2, "失敗的不快取、成功之後不再重抓：%d" % n["c"]
+
+
+def _margin_env(days, have=(), http=None):
+    urls = []
+    def req(method, path, body=None, **k):
+        if path.startswith("tw_hist_days"): return [{"as_of": d} for d in days], ""
+        if path.startswith("tw_margin"): return [{"as_of": d} for d in have], ""
+        raise AssertionError(path)
+    def fj(url, **k):
+        urls.append(url)
+        d = url.split("date=")[1][:8]
+        return http(d) if http else (margin_payload(date_str=d), "")
+    return [mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req), mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch.time, "sleep")], urls
+
+
+def test_margin_backfill_fetches_missing_days_validates_dates_and_numbers():
+    reset()
+    days = [D(1), D(2), D(3), D(4), D(5)]
+    patches, urls = _margin_env(days, have=[D(2)])
+    rows = _with(patches, lambda: REAL["tw_margin_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1), D(3), D(4), D(5)] and len(urls) == 4, "已經有的不重抓"
+    assert all(r["margin_balance"] == 633910848 * 1000 and r["source"] == "TWSE MI_MARGN" and r["margin_prev_balance"] == 632299552 * 1000 for r in rows)
+    assert all("selectType=MS" in u and "&date=" in u for u in urls) and urls[0].endswith("&date=" + D(1).replace("-", ""))
+    lg = [x for x in fetch.LOG if x["source"] == "margin_backfill"][0]
+    assert lg["status"] == "success" and "本次補 4 天" in lg["detail"] and "還有 0 天下次繼續" in lg["detail"]
+    reset()
+    def http(d):                                                                                  # D(1) 回傳別的日期；D(2) 數字對不上；D(3) 沒資料；D(4) 正常
+        if d == D(1).replace("-", ""): return margin_payload(date_str=D(9).replace("-", "")), ""
+        if d == D(2).replace("-", ""):
+            bad = [list(x) for x in MARGIN_ROWS]; bad[2][5] = "700,000,000"
+            return margin_payload(bad, date_str=d), ""
+        if d == D(3).replace("-", ""): return {"stat": "很抱歉，沒有符合條件的資料!"}, ""
+        return margin_payload(date_str=d), ""
+    patches, urls = _margin_env([D(1), D(2), D(3), D(4)], http=http)
+    rows = _with(patches, lambda: REAL["tw_margin_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(4)]
+    d = [x for x in fetch.LOG if x["source"] == "margin_backfill"][0]["detail"]
+    assert "略過 1 天（證交所沒有資料）、2 天" in d and "要 " + D(1) + " 但證交所回傳 " + D(9) in d, d
+
+
+def test_margin_backfill_cap_stop_on_failure_and_nothing_to_do():
+    reset()
+    patches, urls = _margin_env([D(i) for i in range(1, 8)])
+    rows = _with(patches, lambda: REAL["tw_margin_backfill"](max_days=3))
+    assert len(rows) == 3 and "還有 4 天下次繼續" in [x for x in fetch.LOG if x["source"] == "margin_backfill"][0]["detail"]
+    reset()
+    patches, urls = _margin_env([D(i) for i in range(1, 6)], http=lambda d: (None, "HTTP 403") if d == D(2).replace("-", "") else (margin_payload(date_str=d), ""))
+    rows = _with(patches, lambda: REAL["tw_margin_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1)] and len(urls) == 2, "連線失敗整批停止"
+    assert [x["status"] for x in fetch.LOG if x["source"] == "margin_backfill"][0] == "failure" and "不繼續打請求" in [x for x in fetch.LOG if x["source"] == "margin_backfill"][0]["detail"]
+    reset()
+    patches, urls = _margin_env([D(1), D(2)], have=[D(1), D(2)])
+    assert _with(patches, lambda: REAL["tw_margin_backfill"]()) == [] and urls == []
+    assert [x["status"] for x in fetch.LOG if x["source"] == "margin_backfill"] == ["no_new_data"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert REAL["tw_margin_backfill"]() == []
+    assert fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 401")):
+        assert REAL["tw_margin_backfill"]() == []
+    assert fetch.LOG[-1]["status"] == "failure" and "讀取交易日清單失敗" in fetch.LOG[-1]["detail"]
+
+
+def test_run_job_tw_backfill_persists_margin_history_and_isolates_m19():
+    reset()
+    row = {"as_of": D(3), "margin_balance": 6.3e11, "margin_prev_balance": 6.2e11, "margin_units": 1, "short_units": 1, "source": "TWSE MI_MARGN"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(**kw):
+        got = []
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+                  mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "tw_backfill", return_value={}), mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "tw_crash_check"),
+                  mock.patch.object(fetch, "tw_margin_backfill", **(kw or {"return_value": [row]})), mock.patch.object(fetch, "tw_industry_collect", return_value=[]),
+                  mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in patches: p_.start()
+        try:
+            fetch.run_job("tw_backfill", dry_run=False)
+        finally:
+            for p_ in patches: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go()
+    assert ("tw_margin", [row], "as_of,source") in tables and st["module:M19"] == "success"
+    reset(); tables, st = go(side_effect=RuntimeError("boom"))
+    assert st["module:M19"] == "failure" and "module:M12" in st and "module:M14" in st, "融資回補壞了不影響夜間的其他模組"
+
+
+def test_probe_round10_reports_options_pcr_tpex_margin_and_date_history_without_writing():
+    reset()
+    opt = [{"Date": "20261103", "Contract": "TXO", "ContractMonth(Week)": "202611", "StrikePrice": "23000", "CallPut": "Call", "OpenInterest": "1500", "Volume": "10"}] * 3 + [{"Contract": "TEO", "StrikePrice": "1"}]
+    pcr = [{"Date": "20261103", "PutVolume": "1", "CallVolume": "2", "PutCallVolumeRatio%": "50", "PutOI": "3", "CallOI": "4", "PutCallOIRatio%": "75"}]
+    def fj(url, **k):
+        if url.endswith("/DailyMarketReportOpt"): return opt, ""
+        if url.endswith("/PutCallRatio"): return pcr, ""
+        if url.endswith("/va01"): return [{"Date": "20261103", "Item": "x"}], ""
+        if url.endswith("tpex_mainboard_margin_balance"): return [{"Date": "1151103", "SecuritiesCompanyCode": "8358", "MarginPurchase": "1"}], ""
+        if url.endswith("tpex_margin_trading_marginspot"): return None, "HTTP 403"
+        if "MI_MARGN" in url:
+            d = url.split("date=")[1]
+            return {"stat": "OK", "date": d, "tables": [{"fields": ["代號"], "data": [[f"{1100 + i}"] for i in range(150)]}]}, ""
+        if url.endswith("STOCK_DAY_ALL"): return [{"Date": "1151103", "Code": "2330", "Name": "台積電", "TradeVolume": "1", "ClosingPrice": "1000"}], ""
+        raise AssertionError(url)
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round10()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert by["probe:taifex_opt"]["status"] == "success" and "TXO 共 3 列" in by["probe:taifex_opt"]["detail"] and "StrikePrice" in by["probe:taifex_opt"]["detail"]
+    assert by["probe:taifex_pcr"]["status"] == "success" and "PutCallOIRatio%" in by["probe:taifex_pcr"]["detail"] and by["probe:taifex_va01"]["status"] == "success"
+    assert by["probe:tpex_margin"]["status"] == "success" and "MarginPurchase" in by["probe:tpex_margin"]["detail"] and by["probe:tpex_marginspot"]["status"] == "no_new_data"
+    assert by["probe:twse_margin_date"]["status"] == "success" and "最大一張 150 列" in by["probe:twse_margin_date"]["detail"] and by["probe:twse_day_all"]["status"] == "success" and "ClosingPrice" in by["probe:twse_day_all"]["detail"]
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG) and not [x for x in fetch.LOG if x["status"] == "failure"]
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        fetch.probe_round10()
+    assert not [x for x in fetch.LOG if x["status"] == "failure"], "候選來源被擋是正常的探測結果，不能讓工作變紅"
 
 
 def test_probe_round4_logs_aaii_clues_and_exright_sources_without_writing():

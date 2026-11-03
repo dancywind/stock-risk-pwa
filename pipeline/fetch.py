@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v48"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v49"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -89,19 +89,37 @@ def validate_value(raw, low, high):
 
 
 # ---------------------------------------------------------------- 網路
+_JSON_CACHE = {}
+
+
 def fetch_json(url, headers=None, timeout=None):
-    """帶重試的抓取。失敗回傳 (None, 原因)，不拋出。"""
+    """帶重試的抓取。失敗回傳 (None, 原因)，不拋出。
+    被對方擋下（HTTP 403、429、503）時等得比較久（BLOCK_BACKOFF_SECONDS 起跳）：這類多半是暫時的限流，馬上再試只會繼續被擋。"""
     last_err = ""
     for attempt in range(1, config.RETRIES + 1):
+        blocked = False
         try:
             req = urllib.request.Request(url, headers=headers or {"User-Agent": "risk-pwa/1.0", "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
                 return json.loads(resp.read().decode("utf-8-sig").lstrip("\ufeff")), ""  # 期交所回傳開頭帶 BOM（連續多個也處理）
+        except urllib.error.HTTPError as e:
+            last_err = _scrub(e)
+            blocked = e.code in (403, 429, 503)
         except Exception as e:  # noqa: BLE001
             last_err = _scrub(e)
-            if attempt < config.RETRIES:
-                time.sleep(config.BACKOFF_SECONDS * attempt)
+        if attempt < config.RETRIES:
+            time.sleep((config.BLOCK_BACKOFF_SECONDS if blocked else config.BACKOFF_SECONDS) * attempt)
     return None, last_err
+
+
+def fetch_swagger(url):
+    """交易所的說明文件（swagger.json）：同一輪工作只抓一次，各模組共用（以前每個模組各抓一次，請求太密集可能被櫃買中心暫時擋下）。只快取成功的。"""
+    if url in _JSON_CACHE:
+        return _JSON_CACHE[url], ""
+    data, err = fetch_json(url)
+    if data is not None:
+        _JSON_CACHE[url] = data
+    return data, err
 
 
 def fetch_raw(url, timeout=None, headers=None):
@@ -555,17 +573,13 @@ def tw_breadth_hist_compute():
     return [{"computed": total}] if total else []
 
 
-def twse_margin():
-    """信用交易統計：融資金額餘額（仟元換算成元）。前日餘額＋買進－賣出－償還 必須等於今日餘額。"""
-    got = _twse_fetch_day(config.TWSE_MI_MARGN, "twse:margin")
-    if got is None:
-        return None
-    data, as_of = got
+def _parse_margin(data):
+    """信用交易統計（上市）的解析與驗證，不寫紀錄。回傳 (列, 錯誤原因)。
+    融資金額（仟元換算成元）。前日餘額＋買進－賣出－償還 必須等於今日餘額；餘額要在合理範圍。as_of 由呼叫端放進去。"""
     need = ("項目", "買進", "賣出", "現金(券)償還", "前日餘額", "今日餘額")
     table = next((t for t in (data.get("tables") or []) if all(k in (t.get("fields") or []) for k in need)), None)
     if table is None:
-        log("twse:margin", "failure", as_of=as_of, detail="找不到『信用交易統計』表格或欄位不符")
-        return None
+        return None, "找不到『信用交易統計』表格或欄位不符"
     fields = table["fields"]
     ix = {k: fields.index(k) for k in need}
     rows = {}
@@ -576,22 +590,79 @@ def twse_margin():
             continue
     amt = rows.get("融資金額(仟元)")
     if not amt or None in amt.values():
-        log("twse:margin", "failure", as_of=as_of, detail="找不到『融資金額(仟元)』列或數字無法解析")
-        return None
+        return None, "找不到『融資金額(仟元)』列或數字無法解析"
     if abs(amt["前日餘額"] + amt["買進"] - amt["賣出"] - amt["現金(券)償還"] - amt["今日餘額"]) > 1:
-        log("twse:margin", "failure", as_of=as_of, detail="前日餘額＋買進－賣出－償還 與今日餘額對不上，拒收")
-        return None
+        return None, "前日餘額＋買進－賣出－償還 與今日餘額對不上，拒收"
     balance, prev = amt["今日餘額"] * 1000, amt["前日餘額"] * 1000
     lo, hi = config.MARGIN_BALANCE_RANGE
     if not (lo <= balance <= hi):
-        log("twse:margin", "failure", as_of=as_of, detail=f"融資餘額 {balance} 超出合理範圍，拒收")
-        return None
+        return None, f"融資餘額 {balance} 超出合理範圍，拒收"
     units = (rows.get("融資(交易單位)") or {}).get("今日餘額")
     short = (rows.get("融券(交易單位)") or {}).get("今日餘額")
+    return {"margin_balance": balance, "margin_prev_balance": prev, "margin_units": units, "short_units": short, "source": "TWSE MI_MARGN"}, None
+
+
+def twse_margin():
+    """信用交易統計：融資金額餘額（仟元換算成元）。前日餘額＋買進－賣出－償還 必須等於今日餘額。"""
+    got = _twse_fetch_day(config.TWSE_MI_MARGN, "twse:margin")
+    if got is None:
+        return None
+    data, as_of = got
+    row, err = _parse_margin(data)
+    if err:
+        log("twse:margin", "failure", as_of=as_of, detail=err)
+        return None
     log("twse:margin", "success", as_of=as_of,
-        detail=f"融資餘額 {balance / 1e8:,.0f} 億元，較前日 {(balance - prev) / 1e8:+.1f} 億元")
-    return [{"as_of": as_of, "margin_balance": balance, "margin_prev_balance": prev,
-             "margin_units": units, "short_units": short, "source": "TWSE MI_MARGN"}]
+        detail=f"融資餘額 {row['margin_balance'] / 1e8:,.0f} 億元，較前日 {(row['margin_balance'] - row['margin_prev_balance']) / 1e8:+.1f} 億元")
+    return [{"as_of": as_of, **row}]
+
+
+def tw_margin_backfill(max_days=None):
+    """模組 M19：回補上市融資餘額的歷史（給融資去槓桿的「單日減少」「從高點累積減少」「連續減幾天」用）。
+    做法和外資歷史（M12）一樣：以自建行情確認過的上市交易日為準，扣掉資料庫已經有的；每次最多 MARGIN_BATCH_DAYS 天，間隔 HIST_SLEEP 秒；
+    每一天都要驗證：證交所回傳的日期必須就是我們要的那一天，數字用和每日一樣的驗證（前日＋買進－賣出－償還＝今日）。
+    連線失敗就整批停止；某天沒有資料或驗證不過，只略過那一天。"""
+    max_days = max_days or config.MARGIN_BATCH_DAYS
+    if not sb_ready():
+        log("margin_backfill", "skipped", detail="未設定 Supabase，無法判斷哪些日期已經補過，不回補")
+        return []
+    start = date.today() - timedelta(days=config.HIST_WINDOW_DAYS)
+    days, err = sb_request("GET", f"tw_hist_days?select=as_of&market=eq.TWSE&status=eq.ok&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000")
+    if days is None:
+        log("margin_backfill", "failure", detail=_clip(f"讀取交易日清單失敗：{err}"))
+        return []
+    have_rows, err = sb_request("GET", f"tw_margin?select=as_of&source=eq.TWSE%20MI_MARGN&as_of=gte.{start.isoformat()}&limit=2000")
+    have = {r["as_of"] for r in (have_rows or [])}
+    todo_all = [r["as_of"] for r in days if r["as_of"] not in have]
+    todo = todo_all[:max_days]
+    if not todo:
+        log("margin_backfill", "no_new_data", detail=f"近 {config.HIST_WINDOW_DAYS} 天的 {len(days)} 個交易日，融資餘額都已經補齊")
+        return []
+    out, skipped, bad, first_err = [], 0, 0, ""
+    for d in todo:
+        data, err = fetch_json(config.TWSE_MI_MARGN + "&date=" + d.replace("-", ""))
+        time.sleep(config.HIST_SLEEP)
+        if data is None:
+            log("margin_backfill", "failure", as_of=d, detail=_clip(f"抓取失敗：{err}；已停止本次回補，不繼續打請求"))
+            break
+        if not isinstance(data, dict) or data.get("stat") != "OK":
+            skipped += 1
+            continue
+        as_of = twse_ymd_to_iso(data.get("date"))
+        if as_of != d:
+            bad += 1
+            first_err = first_err or f"要 {d} 但證交所回傳 {as_of}"
+            continue
+        row, perr = _parse_margin(data)
+        if perr:
+            bad += 1
+            first_err = first_err or f"{d}：{perr}"
+            continue
+        out.append({"as_of": as_of, **row})
+    log("margin_backfill", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
+        detail=_clip(f"本次補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") +
+                     f"；略過 {skipped} 天（證交所沒有資料）、{bad} 天（日期或數字驗證不過" + (f"：{first_err}" if first_err else "") + f"）；還有 {max(len(todo_all) - len(todo), 0)} 天下次繼續"))
+    return out
 
 
 def _norm_ymd(text):
@@ -821,7 +892,7 @@ def probe_extra():
             log(f"probe:{name}", "success",
                 detail=_clip(f"日期{data.get('date')}｜{data.get('title')}｜欄位{data.get('fields')}｜{(data.get('data') or [])[:7]}｜頂層鍵{list(data.keys())}"))
 
-    data, err = fetch_json(config.TAIFEX_SWAGGER)
+    data, err = fetch_swagger(config.TAIFEX_SWAGGER)
     if data is None:
         log("probe:taifex_swagger", "failure", detail=f"抓取失敗: {err}")
         return
@@ -980,7 +1051,7 @@ def _taifex_base(swagger):
 def probe_taifex_daily():
     """只讀探測：期交所「期貨每日交易行情」的端點與欄位，以及臺股期貨各月份的列長什麼樣。
     只記錄結構與前幾列，不寫任何資料表。"""
-    sw, err = fetch_json(config.TAIFEX_SWAGGER)
+    sw, err = fetch_swagger(config.TAIFEX_SWAGGER)
     if sw is None:
         log("probe:taifex_daily_swagger", "failure", detail=f"抓取失敗: {err}")
         return
@@ -1073,7 +1144,7 @@ def probe_prices():
         if "證券名稱" in fields:
             ni = fields.index("證券名稱")
             twse_rows = {str(r[ni]).strip(): r for r in rows if len(r) > ni}
-    sw1, err = fetch_json(config.TWSE_OPENAPI_SWAGGER)
+    sw1, err = fetch_swagger(config.TWSE_OPENAPI_SWAGGER)
     if sw1 is None or not isinstance(sw1, dict):
         log("probe:px_twse_openapi", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
     else:
@@ -1096,7 +1167,7 @@ def probe_prices():
             log(f"probe:px_twse_oa:{tag}", "success", detail=_clip(f"共 {len(rows1)} 列｜欄位 {list(rows1[0].keys())}｜第1列 {rows1[0]}"))
 
     # 2) 櫃買中心上櫃行情
-    sw, err = fetch_json(config.TPEX_SWAGGER)
+    sw, err = fetch_swagger(config.TPEX_SWAGGER)
     tpex_rows = {}
     if sw is None or not isinstance(sw, dict):
         log("probe:px_tpex_swagger", "failure", detail=_clip(f"抓取失敗: {err}"))
@@ -1990,7 +2061,7 @@ def probe_earnings():
         log(src, "success" if data else "failure", detail=_clip(f"HTTP {status}｜data={data}｜status={(j or {}).get('status') if isinstance(j, dict) else None}"))
         time.sleep(1)
     for tag, sw_url, base in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE)):
-        sw, err = fetch_json(sw_url)
+        sw, err = fetch_swagger(sw_url)
         if sw is None or not isinstance(sw, dict):
             log(f"probe:earn_tw:{tag}", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
             continue
@@ -2323,7 +2394,7 @@ def persist_extra(dry_run, tables):
 def probe_round3():
     """只讀探測第三批：1) 證交所、櫃買中心的財報資訊（三率）；2) AAII 散戶情緒；3) Nasdaq-100 名單；4) SOX 指數報價的真實結構。"""
     for tag, sw_url, base, known in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE, None), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE, "/mopsfin_t187ap06_O_ciA")):
-        sw, err = fetch_json(sw_url)
+        sw, err = fetch_swagger(sw_url)
         if sw is None or not isinstance(sw, dict):
             log(f"probe:fin:{tag}", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
             continue
@@ -2422,7 +2493,7 @@ def tw_financials(price_rows):
         return []
     out = []
     cover = {}
-    sw, err = fetch_json(config.TWSE_OPENAPI_SWAGGER)
+    sw, err = fetch_swagger(config.TWSE_OPENAPI_SWAGGER)
     path = None
     if isinstance(sw, dict):
         for pth, methods in (sw.get("paths") or {}).items():
@@ -2432,7 +2503,7 @@ def tw_financials(price_rows):
                     path = path or pth                                    # 必須是「上市公司」；「公發公司」（_X_）不是上市股票，選到它你的持股會全部落空
         path = path or ("/opendata/t187ap06_L_ci" if "/opendata/t187ap06_L_ci" in (sw.get("paths") or {}) else None)
     sources = [("twse", sw, config.TWSE_OPENAPI_BASE, path, "證交所 上市公司財報資訊（一般業）")]
-    sw2, err2 = fetch_json(config.TPEX_SWAGGER)
+    sw2, err2 = fetch_swagger(config.TPEX_SWAGGER)
     sources.append(("tpex", sw2, config.TPEX_DEFAULT_BASE, config.TPEX_FIN_PATH, "櫃買中心 上櫃公司財報資訊（一般業）"))
     for tag, swag, base, pth, label in sources:
         if not pth or not isinstance(swag, dict):
@@ -2860,7 +2931,7 @@ def tw_investor_events(price_rows):
     today = date.today()
     out = {}
     for tag, swurl, base in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE)):
-        sw, err = fetch_json(swurl)
+        sw, err = fetch_swagger(swurl)
         pth = _news_path(sw) if isinstance(sw, dict) else None
         if not pth:
             log(f"tw_events:{tag}", "failure", detail=_clip(f"找不到重大訊息的端點（{err or '說明文件裡沒有'}）"))
@@ -2915,7 +2986,7 @@ def probe_round4():
         log("probe:exright_twse", "success" if data else "no_new_data", detail=_clip(f"stat={j.get('stat')}｜欄位 {j.get('fields')}｜{len(data)} 列｜前 2 列 {data[:2]}"))
     else:
         log("probe:exright_twse", "failure", detail=_clip(f"抓取失敗或不是 JSON: {err}"))
-    sw, err = fetch_json(config.TPEX_SWAGGER)
+    sw, err = fetch_swagger(config.TPEX_SWAGGER)
     cands = []
     if isinstance(sw, dict):
         for path, methods in (sw.get("paths") or {}).items():
@@ -2934,7 +3005,7 @@ def probe_round5():
     """只讀探測第五批：台股公司基本資料裡的「產業別」（上市與上櫃）。
     記錄：端點、列數、欄位名稱、前 2 列、產業別有哪些不同的值與各幾家（最多 45 種），下一輪才知道怎麼做台股產業相對強弱。不寫入任何資料表。"""
     for tag, swurl, base in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE)):
-        sw, err = fetch_json(swurl)
+        sw, err = fetch_swagger(swurl)
         if not isinstance(sw, dict):
             log(f"probe:industry:{tag}", "failure", detail=_clip(f"說明文件抓取失敗: {err}"))
             continue
@@ -2970,7 +3041,7 @@ def probe_round6():
         log("probe:industry_l", "success" if kind else "no_new_data", detail=_clip(f"共 {len(rows)} 列｜欄位 {keys[:14]}｜產業欄 {kind!r}｜不同的值 {len(cnt)} 種：{dict(cnt.most_common(45))}｜前 2 列 {[{k: r[k] for k in keys[:5]} for r in rows[:2]]}"))
     else:
         log("probe:industry_l", "failure", detail=_clip(f"/opendata/t187ap03_L 抓取失敗或格式非預期: {e or str(rows)[:100]}"))
-    sw, e = fetch_json(config.TPEX_SWAGGER)
+    sw, e = fetch_swagger(config.TPEX_SWAGGER)
     items = []
     if isinstance(sw, dict):
         for pth, methods in (sw.get("paths") or {}).items():
@@ -3051,7 +3122,7 @@ def probe_round9():
     只記欄位、筆數與前幾列，不寫入任何資料表；候選來源不能用是正常的探測結果，只記「沒有資料」，不讓工作變紅。"""
     ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "application/json,*/*"}
     kw = ("未沖銷", "選擇權", "Put", "波動", "PCR", "買賣權", "OpenInterest")
-    sw, err = fetch_json(config.TAIFEX_SWAGGER)
+    sw, err = fetch_swagger(config.TAIFEX_SWAGGER)
     items = []
     if isinstance(sw, dict):
         for pth, methods in (sw.get("paths") or {}).items():
@@ -3110,7 +3181,7 @@ def probe_round9():
     else:
         log("probe:tpex_margin", "no_new_data", detail=_clip(f"上櫃融資融券餘額抓取失敗或格式非預期: {err or str(rows)[:100]}"))
     for tag, swurl in (("twse", config.TWSE_OPENAPI_SWAGGER), ("tpex", config.TPEX_SWAGGER)):
-        sw2, e2 = fetch_json(swurl)
+        sw2, e2 = fetch_swagger(swurl)
         hits = []
         if isinstance(sw2, dict):
             for pth, methods in (sw2.get("paths") or {}).items():
@@ -3119,6 +3190,47 @@ def probe_round9():
                     if "維持" in t or "信用交易" in t or "融資" in t:
                         hits.append(f"{pth} | {t}")
         log(f"probe:margin_paths:{tag}", "success" if hits else "no_new_data", detail=_clip(" ; ".join(hits[:14]) if hits else f"說明文件裡找不到名稱含維持、信用交易、融資的端點（{e2 or ''}）"))
+
+
+def probe_round10():
+    """只讀探測第十批：1) 期交所選擇權每日行情、Put/Call、指數選擇權未平倉量增減的欄位；2) 櫃買中心融資融券餘額與信用交易餘額概況的欄位；
+    3) 證交所 MI_MARGN 能不能指定日期取逐檔融資（歷史）；4) 證交所全部上市股票的收盤行情欄位（算「民間算法」維持率要用）。不寫入任何資料表。"""
+    base = config.TAIFEX_DAILY_URL.rsplit("/", 1)[0]
+    for tag, name in (("taifex_opt", "DailyMarketReportOpt"), ("taifex_pcr", "PutCallRatio"), ("taifex_va01", "va01")):
+        rows, err = fetch_json(f"{base}/{name}")
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            keys = list(rows[0].keys())
+            extra = ""
+            if tag == "taifex_opt":
+                tx = [r for r in rows if str(r.get("Contract", "")).strip() == "TXO"]
+                extra = f"｜TXO 共 {len(tx)} 列｜TXO 前 2 列 {tx[:2]}"
+            log(f"probe:{tag}", "success", detail=_clip(f"共 {len(rows)} 列｜欄位 {keys}｜前 1 列 {rows[0]}{extra}"))
+        else:
+            log(f"probe:{tag}", "no_new_data", detail=_clip(f"{name} 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
+    for tag, name in (("tpex_margin", "tpex_mainboard_margin_balance"), ("tpex_marginspot", "tpex_margin_trading_marginspot")):
+        rows, err = fetch_json(f"{config.TPEX_DEFAULT_BASE}/{name}")
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            log(f"probe:{tag}", "success", detail=_clip(f"共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
+        else:
+            log(f"probe:{tag}", "no_new_data", detail=_clip(f"{name} 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
+    probe_day = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
+    for _ in range(4):                                                              # 往前找一個平日（可能剛好是假日，證交所會回沒有資料）
+        d_ = date(int(probe_day[:4]), int(probe_day[4:6]), int(probe_day[6:]))
+        if d_.weekday() < 5:
+            break
+        probe_day = (d_ - timedelta(days=1)).strftime("%Y%m%d")
+    data, err = fetch_json(f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectType=ALL&response=json&date={probe_day}")
+    if isinstance(data, dict) and data.get("tables"):
+        big = max(data["tables"], key=lambda t: len(t.get("data") or []))
+        log("probe:twse_margin_date", "success" if data.get("date") == probe_day and len(big.get("data") or []) > 100 else "no_new_data",
+            detail=_clip(f"要求 {probe_day}、回傳 date={data.get('date')}｜stat={data.get('stat')}｜最大一張 {len(big.get('data') or [])} 列｜前 1 列 {(big.get('data') or [])[:1]}"))
+    else:
+        log("probe:twse_margin_date", "no_new_data", detail=_clip(f"要求 {probe_day}：{err or str(data)[:120]}"))
+    rows, err = fetch_json(config.TWSE_OPENAPI_BASE + "/exchangeReport/STOCK_DAY_ALL")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        log("probe:twse_day_all", "success", detail=_clip(f"共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
+    else:
+        log("probe:twse_day_all", "no_new_data", detail=_clip(f"STOCK_DAY_ALL 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
 
 
 def probe_us_pressure():
@@ -3391,7 +3503,8 @@ def run_job(job, dry_run=False):
         probe_round7()
         probe_round8()
         probe_round9()
-    inst_hist, pc_rows = [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
+        probe_round10()
+    inst_hist, pc_rows, margin_hist = [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
@@ -3400,6 +3513,7 @@ def run_job(job, dry_run=False):
             _run_module("M13", "漲跌家數歷史（自建）", tw_breadth_hist_compute)
             inst_hist = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
             pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
+            margin_hist = _run_module("M19", "上市融資餘額歷史回補", tw_margin_backfill) or []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
@@ -3426,6 +3540,7 @@ def run_job(job, dry_run=False):
     if job == "tw_backfill":
         extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))
+        extra.append(("tw_margin", margin_hist, "as_of,source"))
         if not dry_run:
             extra.append(("tw_industry", _run_module("M17", "台股產業別", tw_industry_collect) or [], "code"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
