@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v47"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v48"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3044,6 +3044,83 @@ def probe_round8():
             log("probe:sp500_alt:yahoo", "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜不是預期的 JSON｜開頭 {body[:120]!r}"))
 
 
+def probe_round9():
+    """只讀探測第九批：「量價結構」四層（未平倉量 OI、量價成本 POC/VWAP、PCR 與履約價牆、隱含波動率 IV）與「融資去槓桿」要用的資料來源。
+    1) 期交所 OpenAPI：有沒有未沖銷契約量、選擇權每日行情（履約價與 OI）、Put/Call、波動率指數；2) Cboe 延遲選擇權鏈（_SPX、SPY）：有沒有 iv、open_interest；
+    3) 證交所 MI_MARGN 的逐檔融資表；4) 櫃買中心融資融券餘額；5) 兩邊 OpenAPI 有沒有名稱含「維持」或「信用」的端點。
+    只記欄位、筆數與前幾列，不寫入任何資料表；候選來源不能用是正常的探測結果，只記「沒有資料」，不讓工作變紅。"""
+    ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "application/json,*/*"}
+    kw = ("未沖銷", "選擇權", "Put", "波動", "PCR", "買賣權", "OpenInterest")
+    sw, err = fetch_json(config.TAIFEX_SWAGGER)
+    items = []
+    if isinstance(sw, dict):
+        for pth, methods in (sw.get("paths") or {}).items():
+            for mth in (methods or {}).values():
+                t = str(mth.get("summary", "")) if isinstance(mth, dict) else ""
+                if any(k in t for k in kw) or any(k in pth for k in ("Opt", "PutCall", "VIX", "Vix")):
+                    items.append(f"{pth} | {t}")
+    chunk, n = [], 0
+    for it in items[:60]:
+        if sum(len(x) + 3 for x in chunk) + len(it) > 780:
+            n += 1
+            log(f"probe:taifex_paths:{n}", "success", detail=_clip(" ; ".join(chunk)))
+            chunk = []
+        chunk.append(it)
+    if chunk or not items:
+        log(f"probe:taifex_paths:{n + 1}", "success" if items else "no_new_data", detail=_clip(" ; ".join(chunk) if chunk else f"期交所說明文件裡找不到相關端點（{err or ''}）"))
+    rows, err = fetch_json(config.TAIFEX_DAILY_URL)
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        keys = list(rows[0].keys())
+        oi = [k for k in keys if "Open" in k and "Interest" in k or "未沖銷" in k]
+        log("probe:taifex_fut_oi", "success" if oi else "no_new_data", detail=_clip(f"期貨每日行情 {len(rows)} 列｜欄位 {keys}｜疑似未平倉量欄 {oi}｜前 1 列 {rows[0]}"))
+    else:
+        log("probe:taifex_fut_oi", "no_new_data", detail=_clip(f"期貨每日行情抓取失敗或格式非預期: {err or str(rows)[:100]}"))
+    for sym in ("_SPX", "SPY"):
+        status, ctype, body, err = fetch_raw(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json", timeout=config.PROBE_TIMEOUT, headers=ua)
+        if status is None:
+            log(f"probe:cboe_chain:{sym.strip('_')}", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+            continue
+        try:
+            j = json.loads(body.decode("utf-8-sig"))
+            d_ = j.get("data") or {}
+            opts = d_.get("options") or []
+            sample = []
+            for o in opts[:400]:
+                m = re.fullmatch(r"([A-Z]+W?\d?)(\d{6})([CP])(\d{8})", str(o.get("option", "")))
+                if m and o.get("open_interest") not in (None, 0):
+                    sample.append({"到期": m.group(2), "種類": m.group(3), "履約價": int(m.group(4)) / 1000, "oi": o.get("open_interest"), "iv": o.get("iv"), "vol": o.get("volume")})
+                if len(sample) >= 3:
+                    break
+            keys = sorted((opts[0] or {}).keys()) if opts else []
+            log(f"probe:cboe_chain:{sym.strip('_')}", "success" if status == 200 and len(opts) > 10 and "iv" in keys and "open_interest" in keys else "no_new_data",
+                detail=_clip(f"HTTP {status}｜{ctype}｜頂層 {sorted(j.keys())}｜data 欄位 {sorted(k for k in d_.keys() if k != 'options')[:12]}｜共 {len(opts)} 檔合約｜合約欄位 {keys[:16]}｜解析範例 {sample}｜timestamp={j.get('timestamp')}"))
+        except (ValueError, UnicodeDecodeError, AttributeError, TypeError):
+            log(f"probe:cboe_chain:{sym.strip('_')}", "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜不是預期的 JSON｜開頭 {body[:120]!r}"))
+    data, err = fetch_json("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectType=ALL&response=json")
+    if isinstance(data, dict) and data.get("tables"):
+        tabs = data["tables"]
+        big = max(tabs, key=lambda t: len(t.get("data") or []))
+        log("probe:twse_margin_stock", "success" if len(big.get("data") or []) > 100 else "no_new_data",
+            detail=_clip(f"stat={data.get('stat')}｜{len(tabs)} 張表｜最大一張 {len(big.get('data') or [])} 列｜欄位 {big.get('fields')}｜前 2 列 {(big.get('data') or [])[:2]}"))
+    else:
+        log("probe:twse_margin_stock", "no_new_data", detail=_clip(f"逐檔融資表抓取失敗或格式非預期: {err or str(data)[:100]}"))
+    rows, err = fetch_json(config.TPEX_DEFAULT_BASE + "/tpex_mainboard_margin_balance")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        log("probe:tpex_margin", "success", detail=_clip(f"共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
+    else:
+        log("probe:tpex_margin", "no_new_data", detail=_clip(f"上櫃融資融券餘額抓取失敗或格式非預期: {err or str(rows)[:100]}"))
+    for tag, swurl in (("twse", config.TWSE_OPENAPI_SWAGGER), ("tpex", config.TPEX_SWAGGER)):
+        sw2, e2 = fetch_json(swurl)
+        hits = []
+        if isinstance(sw2, dict):
+            for pth, methods in (sw2.get("paths") or {}).items():
+                for mth in (methods or {}).values():
+                    t = str(mth.get("summary", "")) if isinstance(mth, dict) else ""
+                    if "維持" in t or "信用交易" in t or "融資" in t:
+                        hits.append(f"{pth} | {t}")
+        log(f"probe:margin_paths:{tag}", "success" if hits else "no_new_data", detail=_clip(" ; ".join(hits[:14]) if hits else f"說明文件裡找不到名稱含維持、信用交易、融資的端點（{e2 or ''}）"))
+
+
 def probe_us_pressure():
     """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
     1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
@@ -3313,6 +3390,7 @@ def run_job(job, dry_run=False):
         probe_round6()
         probe_round7()
         probe_round8()
+        probe_round9()
     inst_hist, pc_rows = [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}

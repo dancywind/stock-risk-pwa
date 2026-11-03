@@ -757,7 +757,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -3682,6 +3682,48 @@ def test_probe_round8_reports_sp500_alternative_sources_without_writing():
     with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>login</html>", "")):
         fetch.probe_round8()
     assert {x["source"]: x["status"] for x in fetch.LOG}["probe:sp500_alt:yahoo"] == "no_new_data"
+
+
+def test_probe_round9_reports_oi_options_cboe_chain_margin_and_paths_without_writing():
+    reset()
+    taifex_sw = {"paths": {"/DailyMarketReportFut": {"get": {"summary": "期貨每日交易行情"}}, "/DailyMarketReportOpt": {"get": {"summary": "選擇權每日交易行情"}},
+                           "/PutCallRatio": {"get": {"summary": "臺指選擇權Put/Call比"}}, "/OpenInterestFut": {"get": {"summary": "各期貨商品未沖銷部位"}}, "/Other": {"get": {"summary": "其他"}}}}
+    fut = [{"Date": "20261103", "Contract": "TX", "OpenInterest": "98765", "Volume": "1234", "SettlementPrice": "45000"}]
+    chain = json.dumps({"timestamp": "2026-11-03 17:00:00", "data": {"current_price": 7500.1, "options": [
+        {"option": "SPXW261106C07500000", "iv": 0.152, "open_interest": 1200, "volume": 30, "bid": 1, "ask": 2},
+        {"option": "SPXW261106P07400000", "iv": 0.181, "open_interest": 0, "volume": 5, "bid": 1, "ask": 2},
+        {"option": "SPXW261106P07450000", "iv": 0.17, "open_interest": 800, "volume": 5, "bid": 1, "ask": 2}] + [{"option": f"SPXW261107C0{7000 + i}0000", "iv": 0.2, "open_interest": 10, "volume": 1, "bid": 1, "ask": 2} for i in range(20)]}}).encode()
+    margin = {"stat": "OK", "tables": [{"title": "信用交易統計", "fields": ["項目", "買進"], "data": [["融資(交易單位)", "1"]]}, {"title": "融資融券彙總", "fields": ["代號", "名稱", "融資買進", "融資賣出", "現金償還", "前日餘額", "今日餘額"], "data": [[f"{1100 + i}", "x", "1", "2", "3", "4", "5"] for i in range(150)]}]}
+    twse_sw = {"paths": {"/a": {"get": {"summary": "信用交易統計"}}, "/b": {"get": {"summary": "其他"}}}}
+    def fj(url, **k):
+        if url == config.TAIFEX_SWAGGER: return taifex_sw, ""
+        if url == config.TAIFEX_DAILY_URL: return fut, ""
+        if "MI_MARGN" in url: return margin, ""
+        if url.endswith("tpex_mainboard_margin_balance"): return [{"Date": "1151103", "SecuritiesCompanyCode": "8358", "MarginPurchase": "1"}], ""
+        if url == config.TWSE_OPENAPI_SWAGGER: return twse_sw, ""
+        if url == config.TPEX_SWAGGER: return {"paths": {}}, ""
+        raise AssertionError(url)
+    def raw(url, timeout=None, headers=None):
+        assert "cboe.com" in url
+        return 200, "application/json", chain, ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round9()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "/DailyMarketReportOpt | 選擇權每日交易行情" in by["probe:taifex_paths:1"]["detail"] and "/PutCallRatio" in by["probe:taifex_paths:1"]["detail"] and "/OpenInterestFut" in by["probe:taifex_paths:1"]["detail"] and "/Other" not in by["probe:taifex_paths:1"]["detail"]
+    assert by["probe:taifex_fut_oi"]["status"] == "success" and "['OpenInterest']" in by["probe:taifex_fut_oi"]["detail"]
+    c = by["probe:cboe_chain:SPX"]
+    assert c["status"] == "success" and "共 23 檔合約" in c["detail"] and "'履約價': 7500.0" in c["detail"] and "'種類': 'C'" in c["detail"] and "'履約價': 7450.0" in c["detail"], c["detail"]
+    assert "'履約價': 7400.0" not in c["detail"], "OI 是 0 的合約不當範例"
+    assert by["probe:twse_margin_stock"]["status"] == "success" and "最大一張 150 列" in by["probe:twse_margin_stock"]["detail"] and "融資買進" in by["probe:twse_margin_stock"]["detail"]
+    assert by["probe:tpex_margin"]["status"] == "success" and "MarginPurchase" in by["probe:tpex_margin"]["detail"]
+    assert by["probe:margin_paths:twse"]["status"] == "success" and "/a | 信用交易統計" in by["probe:margin_paths:twse"]["detail"] and by["probe:margin_paths:tpex"]["status"] == "no_new_data"
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG) and not [x for x in fetch.LOG if x["status"] == "failure"]
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"<html>blocked</html>", "")):
+        fetch.probe_round9()
+    assert not [x for x in fetch.LOG if x["status"] == "failure"], "候選來源被擋是正常的探測結果，不能讓工作變紅"
+    assert {x["source"]: x["status"] for x in fetch.LOG}["probe:cboe_chain:SPY"] == "no_new_data"
 
 
 def test_probe_round4_logs_aaii_clues_and_exright_sources_without_writing():
