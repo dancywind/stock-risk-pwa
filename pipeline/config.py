@@ -46,8 +46,10 @@ FRED_MACRO = {
 # 可能不存在或授權限制的序列：抓不到時記「沒有資料」，不算失敗，不讓排程亮紅燈
 FRED_OPTIONAL = {"RU2000PR"}
 # 模組 M06：這幾個序列另外回補一段歷史，用來算「從高點回落幅度」與月績效
-# 模組 M18：用 Nasdaq 官方行情補 FRED 落後的天數（Nasdaq 的代號, macro_series 的序列, 分類）
-US_INDEX_FEED = (("COMP", "NASDAQCOM", ("index",)), ("SPX", "SP500", ("index",)), ("DJIA", "DJIA", ("index",)))
+# 模組 M18：用 Nasdaq 官方行情補 FRED 落後的天數。每一項：(Nasdaq 的代號, macro_series 的序列, 分類[, 選用])。
+# 選用＝抓不到只記「沒有資料」，不讓整個工作變紅；沒寫就是核心來源，抓不到會記失敗。
+# 2026-11-03 實測：Nasdaq 綜合（COMP）可以；S&P 500（SPX）與道瓊（DJIA）在 Nasdaq 的 API 歷史與報價都回「沒有資料」，所以不放進來。
+US_INDEX_FEED = (("COMP", "NASDAQCOM", ("index",)),)
 FRED_HISTORY = ("SP500", "NASDAQCOM", "DJIA", "VIXCLS")      # VIXCLS 用來算門檻的近一年分布
 FRED_HISTORY_DAYS = 400
 TWD_FRED_SERIES = "DEXTAUS"
@@ -152,7 +154,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v44"
+PIPELINE_VERSION = "v46"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

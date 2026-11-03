@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v44"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v46"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2136,7 +2136,9 @@ def us_index_quotes():
     寫進 macro_series 同一個序列（series_id 與 FRED 一樣），日期用各筆自己的日期；價格超出合理範圍一律拒收。之後 FRED 補上同一天會蓋回官方值，兩者是同一個指數的收盤。"""
     now = _now_et()
     out = []
-    for sym, sid, classes in config.US_INDEX_FEED:
+    for entry in config.US_INDEX_FEED:
+        sym, sid, classes = entry[:3]
+        optional = len(entry) > 3 and bool(entry[3])                                   # 選用來源：抓不到只記「沒有資料」，不讓整個工作變紅
         label, low, high = config.FRED_MACRO[sid]
         rows, why = _nasdaq_history(sym, classes[0], days=14)
         got, bad = [], 0
@@ -2159,7 +2161,9 @@ def us_index_quotes():
         else:
             q, qwhy = _nasdaq_quote(sym, classes)                                            # 歷史沒有可用的：退回只抓最新一筆已收盤報價
             if q is None:
-                log(f"us_index:{sid}", "skipped" if "不是已收盤" in str(qwhy) else "failure", detail=_clip(f"歷史：{why or '沒有可用的列'}；報價：{qwhy}"))
+                closed_skip = "不是已收盤" in str(qwhy)
+                log(f"us_index:{sid}", "skipped" if closed_skip else ("no_new_data" if optional else "failure"),
+                    detail=_clip(f"歷史：{why or '沒有可用的列'}；報價：{qwhy}" + ("（選用來源，Nasdaq 沒有提供；維持 FRED 的資料）" if optional and not closed_skip else "")))
             elif not (low <= q["close"] <= high):
                 log(f"us_index:{sid}", "failure", as_of=q["as_of"], detail=f"價格 {q['close']} 不在合理範圍 {low}–{high}，拒收")
             else:
@@ -3318,6 +3322,12 @@ def run_job(job, dry_run=False):
             "tw_futures": futures_rows, "tw_basis": basis_rows, "prices": price_rows, "us_cot": cot_rows, "us_putcall": putcall_rows, "us_earnings": earnings_rows}
 
 
+def _gh_escape(text, prop=False):
+    """GitHub Actions 的 ::error:: 訊息裡，% 與換行要跳脫；當作屬性（title）時，冒號和逗號也要。"""
+    t = str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return t.replace(":", "%3A").replace(",", "%2C") if prop else t
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", choices=config.JOBS, default="full")
@@ -3347,6 +3357,12 @@ def main(argv=None):
 
     failures = [r for r in LOG if r["status"] == "failure"]
     print(f"完成：{len(LOG)} 筆紀錄，其中 {len(failures)} 筆失敗")
+    for r in failures:                                                 # 把失敗的原因直接印在 Actions 紀錄裡（以前只有數字，看不出是哪一項）
+        print(f"  失敗｜{r['source']}｜{str(r.get('detail') or '')[:300]}")
+        print(f"::error title={_gh_escape(r['source'], True)}::{_gh_escape(str(r.get('detail') or '')[:300])}")      # GitHub 會把它顯示在這次執行的摘要頁最上面
+    if not log_ok:
+        print("  失敗｜寫入資料庫｜這一輪的紀錄（scan_status）沒有確認寫入成功，請檢查 Supabase 連線與金鑰")
+        print("::error title=寫入資料庫::這一輪的紀錄沒有確認寫入成功")
     return 1 if (failures or not log_ok) else 0
 
 

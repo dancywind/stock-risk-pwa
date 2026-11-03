@@ -3078,8 +3078,17 @@ def _idx_env(hist=None, quote=None, now=None):
             mock.patch.object(fetch, "_nasdaq_quote", side_effect=lambda sym, classes: (quote or {}).get(sym, (None, "沒有報價")))]
 
 
+THREE_FEED = (("COMP", "NASDAQCOM", ("index",)), ("SPX", "SP500", ("index",)), ("DJIA", "DJIA", ("index",)))
+
+
+def test_real_index_feed_only_contains_sources_verified_to_work():
+    assert [e[0] for e in config.US_INDEX_FEED] == ["COMP"], "SPX、DJIA 在 Nasdaq 的 API 實測沒有資料，不能放進來"
+    assert all(e[1] in config.FRED_MACRO for e in config.US_INDEX_FEED)
+
+
 def test_us_index_quotes_fills_lagging_days_from_official_history_only_for_closed_days():
     reset()
+    _feed = mock.patch.object(config, "US_INDEX_FEED", THREE_FEED); _feed.start()
     d = lambda n: date(2026, 11, 3) - timedelta(days=n)
     hist = {"COMP": ([(d(4), 23000.5), (d(3), 23100.0), (d(2), 23250.25), (d(1), 23300.0), (d(0), 23400.0)], ""),                      # 今天（美東 11/3）18:00 已收盤 → 全收
             "SPX": ([(d(1), 7700.0), (d(0), 7710.0), (d(2), 9999999.0)], ""),                                                           # 超出合理範圍的拒收
@@ -3097,10 +3106,12 @@ def test_us_index_quotes_fills_lagging_days_from_official_history_only_for_close
     patches = _idx_env(hist={"COMP": ([(d(1), 23300.0), (d(0), 23400.0)], ""), "SPX": (None, "x"), "DJIA": (None, "x")}, now=_dt(2026, 11, 3, 11, 0))      # 美東 11:00：今天還沒收盤
     rows = _with(patches, lambda: REAL["us_index_quotes"]())
     assert [r["as_of"] for r in rows] == [d(1).isoformat()], "今天還沒收盤的那一天不採用（盤中數字不能當收盤）"
+    _feed.stop()
 
 
 def test_us_index_quotes_falls_back_to_closed_quote_and_reports_failures():
     reset()
+    _feed = mock.patch.object(config, "US_INDEX_FEED", THREE_FEED); _feed.start()
     quote = {"COMP": ({"close": 23400.0, "pct": 0.5, "as_of": "2026-11-03", "class": "index"}, ""), "SPX": (None, "marketStatus=Open、isRealTime=False，不是已收盤的價格，不採用"),
              "DJIA": ({"close": 999999999.0, "pct": 0.1, "as_of": "2026-11-03", "class": "index"}, "")}
     patches = _idx_env(hist={}, quote=quote)                                       # 歷史全部抓不到
@@ -3113,6 +3124,20 @@ def test_us_index_quotes_falls_back_to_closed_quote_and_reports_failures():
     patches = _idx_env(hist={}, quote={})
     assert _with(patches, lambda: REAL["us_index_quotes"]()) == []
     assert all(x["status"] == "failure" for x in fetch.LOG if x["source"].startswith("us_index:"))
+    _feed.stop()
+
+
+def test_us_index_quotes_optional_source_never_turns_the_job_red_when_unavailable():
+    reset()
+    feed = (("COMP", "NASDAQCOM", ("index",)), ("SPX", "SP500", ("index",), True), ("DJIA", "DJIA", ("index",), True))
+    quote = {"COMP": (None, "index 分類沒有報價資料"), "SPX": (None, "index 分類沒有報價資料"), "DJIA": ({"close": 999999999.0, "pct": 0.1, "as_of": "2026-11-03", "class": "index"}, "")}
+    with mock.patch.object(config, "US_INDEX_FEED", feed):
+        rows = _with(_idx_env(hist={}, quote=quote), lambda: REAL["us_index_quotes"]())
+    st = {x["source"]: x for x in fetch.LOG}
+    assert rows == []
+    assert st["us_index:NASDAQCOM"]["status"] == "failure", "核心來源抓不到要記失敗"
+    assert st["us_index:SP500"]["status"] == "no_new_data" and "選用來源" in st["us_index:SP500"]["detail"], "選用來源抓不到只記沒有資料"
+    assert st["us_index:DJIA"]["status"] == "failure" and "拒收" in st["us_index:DJIA"]["detail"], "資料超出合理範圍是可疑的，選用來源也要記失敗"
 
 
 def test_run_job_daily_persists_index_rows_and_isolates_m18():
@@ -3139,6 +3164,44 @@ def test_run_job_daily_persists_index_rows_and_isolates_m18():
     assert st["module:M18"] == "failure" and "module:M08" in st, "M18 壞了不影響其他模組"
     reset(); tables, st = go("tw_backfill", False)
     assert "module:M18" not in st, "夜間回補不跑"
+
+
+def test_main_prints_each_failure_reason_and_github_annotations():
+    import io, contextlib
+    reset()
+    def fake_run_job(job, dry_run=False):
+        fetch.log("us_index:NASDAQCOM", "failure", detail="歷史：HTTP 403；報價：連線失敗: timeout\n第二行,含逗號:冒號%")
+        fetch.log("tw_close", "success", detail="這筆成功不該被印成失敗")
+        fetch.log("fred:DGS10", "failure", detail="FRED 回傳格式非預期")
+        return {}
+    buf = io.StringIO()
+    with mock.patch.object(fetch, "run_job", side_effect=fake_run_job), mock.patch.object(fetch, "flush_log", return_value=True), mock.patch.object(fetch, "sb_ready", return_value=False), \
+            mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()), contextlib.redirect_stdout(buf):
+        code = fetch.main(["--job", "tw_close", "--dry-run"])
+    out = buf.getvalue()
+    assert code == 1 and "其中 2 筆失敗" in out
+    assert "  失敗｜us_index:NASDAQCOM｜歷史：HTTP 403；報價：連線失敗: timeout" in out and "  失敗｜fred:DGS10｜FRED 回傳格式非預期" in out, out
+    assert not [l for l in out.splitlines() if l.startswith("  失敗｜tw_close")], "成功的那一筆不能被印成失敗（dry-run 會另外印出整份紀錄，所以只檢查「失敗｜」開頭的行）"
+    ann = [l for l in out.splitlines() if l.startswith("::error")]
+    assert len(ann) == 2 and ann[0].startswith("::error title=us_index%3ANASDAQCOM::") and "%0A第二行,含逗號:冒號%25" in ann[0] and "\n" not in ann[0], ann[0]
+    reset()
+    buf = io.StringIO()
+    with mock.patch.object(fetch, "run_job", return_value={}), mock.patch.object(fetch, "flush_log", return_value=True), mock.patch.object(fetch, "sb_ready", return_value=False), \
+            mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()), contextlib.redirect_stdout(buf):
+        code = fetch.main(["--job", "tw_close", "--dry-run"])
+    assert code == 0 and "其中 0 筆失敗" in buf.getvalue() and "::error" not in buf.getvalue(), "沒有失敗就不印錯誤"
+    reset()
+    buf = io.StringIO()
+    with mock.patch.object(fetch, "run_job", return_value={}), mock.patch.object(fetch, "flush_log", return_value=False), mock.patch.object(fetch, "sb_ready", return_value=False), \
+            mock.patch.object(fetch, "OUT_DIR", tempfile.mkdtemp()), contextlib.redirect_stdout(buf):
+        code = fetch.main(["--job", "tw_close", "--dry-run"])
+    assert code == 1 and "失敗｜寫入資料庫" in buf.getvalue() and "::error title=寫入資料庫::" in buf.getvalue(), "紀錄沒寫進資料庫也要明講"
+
+
+def test_workflow_uses_node24_action_versions():
+    y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
+    uses = dict(__import__("re").findall(r"uses: (actions/[\w-]+)@v(\d+)", y))
+    assert int(uses["actions/checkout"]) >= 6 and int(uses["actions/setup-python"]) >= 6 and int(uses["actions/upload-artifact"]) >= 6, uses
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
