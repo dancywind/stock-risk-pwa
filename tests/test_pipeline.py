@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -3067,6 +3067,78 @@ def test_run_job_daily_persists_exright_preview_rows_and_isolates_its_failure():
         assert st["module:M15"] == "failure" and "module:M08" in st, "除權息壞了不影響其他模組"
     finally:
         for p_ in patches: p_.stop()
+
+
+def _idx_env(hist=None, quote=None, now=None):
+    """美股指數官方行情的模擬環境：hist 與 quote 是 {Nasdaq 代號: 回傳值}；now 是美東現在時間。"""
+    from datetime import datetime as _dt
+    now = now or _dt(2026, 11, 3, 18, 0)                                           # 美東 18:00：今天已收盤
+    return [mock.patch.object(fetch, "_now_et", return_value=now), mock.patch.object(fetch.time, "sleep"),
+            mock.patch.object(fetch, "_nasdaq_history", side_effect=lambda sym, ac="etf", days=75: (hist or {}).get(sym, (None, "沒有歷史"))),
+            mock.patch.object(fetch, "_nasdaq_quote", side_effect=lambda sym, classes: (quote or {}).get(sym, (None, "沒有報價")))]
+
+
+def test_us_index_quotes_fills_lagging_days_from_official_history_only_for_closed_days():
+    reset()
+    d = lambda n: date(2026, 11, 3) - timedelta(days=n)
+    hist = {"COMP": ([(d(4), 23000.5), (d(3), 23100.0), (d(2), 23250.25), (d(1), 23300.0), (d(0), 23400.0)], ""),                      # 今天（美東 11/3）18:00 已收盤 → 全收
+            "SPX": ([(d(1), 7700.0), (d(0), 7710.0), (d(2), 9999999.0)], ""),                                                           # 超出合理範圍的拒收
+            "DJIA": ([(d(1), 48000.0)], "")}
+    patches = _idx_env(hist=hist)
+    rows = _with(patches, lambda: REAL["us_index_quotes"]())
+    by = {}
+    for r in rows: by.setdefault(r["series_id"], []).append(r)
+    assert sorted(by) == ["DJIA", "NASDAQCOM", "SP500"] and len(by["NASDAQCOM"]) == 5 and len(by["SP500"]) == 2 and len(by["DJIA"]) == 1, {k: len(v) for k, v in by.items()}
+    assert all(r["source"].startswith("Nasdaq 官方行情") and r["label"] for r in rows) and {r["as_of"] for r in by["SP500"]} == {d(0).isoformat(), d(1).isoformat()}
+    lg = {x["source"]: x for x in fetch.LOG}
+    assert lg["us_index:NASDAQCOM"]["status"] == "success" and "歷史 5 天" in lg["us_index:NASDAQCOM"]["detail"] and "略過 1 筆" in lg["us_index:SP500"]["detail"]
+    reset()
+    from datetime import datetime as _dt
+    patches = _idx_env(hist={"COMP": ([(d(1), 23300.0), (d(0), 23400.0)], ""), "SPX": (None, "x"), "DJIA": (None, "x")}, now=_dt(2026, 11, 3, 11, 0))      # 美東 11:00：今天還沒收盤
+    rows = _with(patches, lambda: REAL["us_index_quotes"]())
+    assert [r["as_of"] for r in rows] == [d(1).isoformat()], "今天還沒收盤的那一天不採用（盤中數字不能當收盤）"
+
+
+def test_us_index_quotes_falls_back_to_closed_quote_and_reports_failures():
+    reset()
+    quote = {"COMP": ({"close": 23400.0, "pct": 0.5, "as_of": "2026-11-03", "class": "index"}, ""), "SPX": (None, "marketStatus=Open、isRealTime=False，不是已收盤的價格，不採用"),
+             "DJIA": ({"close": 999999999.0, "pct": 0.1, "as_of": "2026-11-03", "class": "index"}, "")}
+    patches = _idx_env(hist={}, quote=quote)                                       # 歷史全部抓不到
+    rows = _with(patches, lambda: REAL["us_index_quotes"]())
+    assert [(r["series_id"], r["value"], r["as_of"]) for r in rows] == [("NASDAQCOM", 23400.0, "2026-11-03")], "只收到通過驗證的最新報價"
+    st = {x["source"]: x for x in fetch.LOG}
+    assert st["us_index:NASDAQCOM"]["status"] == "success" and "只取得最新報價" in st["us_index:NASDAQCOM"]["detail"]
+    assert st["us_index:SP500"]["status"] == "skipped" and st["us_index:DJIA"]["status"] == "failure" and "拒收" in st["us_index:DJIA"]["detail"]
+    reset()
+    patches = _idx_env(hist={}, quote={})
+    assert _with(patches, lambda: REAL["us_index_quotes"]()) == []
+    assert all(x["status"] == "failure" for x in fetch.LOG if x["source"].startswith("us_index:"))
+
+
+def test_run_job_daily_persists_index_rows_and_isolates_m18():
+    reset()
+    rows = [{"series_id": "NASDAQCOM", "label": "Nasdaq 綜合指數", "as_of": D(1), "value": 23400.0, "source": "Nasdaq 官方行情"}]
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(job, dry, **kw):
+        got = []
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+                  mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "us_index_quotes", **(kw or {"return_value": rows})),
+                  mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in patches: p_.start()
+        try:
+            fetch.run_job(job, dry_run=dry)
+        finally:
+            for p_ in patches: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    for job in ("tw_close", "full"):
+        reset(); tables, st = go(job, False)
+        assert ("macro_series", rows, "series_id,as_of") in tables and st["module:M18"] == "success", job
+    reset(); tables, st = go("tw_close", True)
+    assert "module:M18" not in st, "dry-run 不碰"
+    reset(); tables, st = go("tw_close", False, side_effect=RuntimeError("boom"))
+    assert st["module:M18"] == "failure" and "module:M08" in st, "M18 壞了不影響其他模組"
+    reset(); tables, st = go("tw_backfill", False)
+    assert "module:M18" not in st, "夜間回補不跑"
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

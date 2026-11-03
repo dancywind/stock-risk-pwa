@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v43"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v44"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2130,6 +2130,45 @@ def _nasdaq_history(sym, assetclass="etf", days=75):
     return pts, ""
 
 
+def us_index_quotes():
+    """模組 M18：用 Nasdaq 官方已收盤的行情補上 FRED 落後的最近幾天（FRED 的美股指數常落後 3 到 5 天，這樣顯示的資料日太舊）。
+    做法：先抓最近 14 天的歷史（index 分類），只收美東已經收盤的交易日（美東日期早於今天，或今天但已過 17:00）；歷史抓不到才退回只抓最新一筆已收盤報價。
+    寫進 macro_series 同一個序列（series_id 與 FRED 一樣），日期用各筆自己的日期；價格超出合理範圍一律拒收。之後 FRED 補上同一天會蓋回官方值，兩者是同一個指數的收盤。"""
+    now = _now_et()
+    out = []
+    for sym, sid, classes in config.US_INDEX_FEED:
+        label, low, high = config.FRED_MACRO[sid]
+        rows, why = _nasdaq_history(sym, classes[0], days=14)
+        got, bad = [], 0
+        if rows:
+            for d_, close in rows:
+                try:
+                    dd = date.fromisoformat(str(d_))
+                except ValueError:
+                    bad += 1
+                    continue
+                ok, _w = validate_close_date(dd.isoformat())
+                closed = dd < now.date() or (dd == now.date() and now.hour >= 17)
+                if not ok or not closed or not (low <= close <= high):
+                    bad += 1
+                    continue
+                got.append({"series_id": sid, "label": label, "as_of": dd.isoformat(), "value": close, "source": "Nasdaq 官方行情（已收盤，補 FRED 落後的天數）"})
+        if got:
+            out.extend(got)
+            log(f"us_index:{sid}", "success", as_of=max(r["as_of"] for r in got), detail=f"歷史 {len(got)} 天（{min(r['as_of'] for r in got)} 到 {max(r['as_of'] for r in got)}）" + (f"；略過 {bad} 筆（未收盤或超出範圍）" if bad else ""))
+        else:
+            q, qwhy = _nasdaq_quote(sym, classes)                                            # 歷史沒有可用的：退回只抓最新一筆已收盤報價
+            if q is None:
+                log(f"us_index:{sid}", "skipped" if "不是已收盤" in str(qwhy) else "failure", detail=_clip(f"歷史：{why or '沒有可用的列'}；報價：{qwhy}"))
+            elif not (low <= q["close"] <= high):
+                log(f"us_index:{sid}", "failure", as_of=q["as_of"], detail=f"價格 {q['close']} 不在合理範圍 {low}–{high}，拒收")
+            else:
+                out.append({"series_id": sid, "label": label, "as_of": q["as_of"], "value": q["close"], "source": "Nasdaq 官方報價（已收盤，補 FRED 落後的天數）"})
+                log(f"us_index:{sid}", "success", as_of=q["as_of"], detail=f"只取得最新報價（歷史不可用：{why or '沒有可用的列'}）：收盤 {q['close']}")
+        time.sleep(1)
+    return out
+
+
 def sector_rs():
     """模組 M03：11 檔產業 ETF 對 SPY 的相對強弱。ret_N＝近 N 個交易日報酬；rs_N＝產業報酬減 SPY 報酬（百分點）；
     streak_days＝最近連續幾天每日報酬高於 SPY。兩邊最新日期必須相同，歷史太短或有疑似分割跳動的 ETF 不算。"""
@@ -3260,6 +3299,8 @@ def run_job(job, dry_run=False):
         extra.append(("tw_exright_events", _run_module("M15", "台股除權息預告（上市、上櫃）", tw_exright_preview) or [], "market,code,event_date"))
         if not dry_run:
             extra.append(("tw_exright_events", _run_module("M16", "歷史除權息（含參考價）", tw_exright_history) or [], "market,code,event_date"))
+    if job in ("full", "tw_close") and not dry_run:
+        extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
     if job == "tw_backfill":
         extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))
