@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v42"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v43"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2574,26 +2574,200 @@ def parse_exright_rows(data, today=None):
     return out, bad, None
 
 
+_TPEX_KIND = {"除息": "息", "除權": "權", "除權息": "權息"}
+
+
+def parse_tpex_exright_rows(rows, today=None):
+    """櫃買中心『除權除息預告表』（/tpex_exright_prepost）→ tw_exright_events 的列。回傳 (列, 略過數, 錯誤原因)。
+    欄位是英文：ExRrightsExDividendDate（民國年 7 碼，例如 1151021）、SecuritiesCompanyCode、CompanyName、ExRrightsExDividend（除息／除權／除權息）、
+    StockDividendRatio、CashDividend。缺任何一個欄位就整份不採用；日期不在前 3 天到 180 天後、代號或種類不合、數字超出範圍的列略過。"""
+    today = today or date.today()
+    if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+        return [], 0, "格式非預期"
+    need = ("ExRrightsExDividendDate", "SecuritiesCompanyCode", "CompanyName", "ExRrightsExDividend", "StockDividendRatio", "CashDividend")
+    miss = [k for k in need if k not in rows[0]]
+    if miss:
+        return [], 0, f"欄位與預期不符：缺 {miss}；實際 {list(rows[0].keys())[:12]}"
+    out, bad = [], 0
+    for r in rows:
+        iso = roc_to_iso(r.get("ExRrightsExDividendDate"))
+        code, kind = str(r.get("SecuritiesCompanyCode", "")).strip(), _TPEX_KIND.get(str(r.get("ExRrightsExDividend", "")).strip())
+        stock, cash = parse_number(r.get("StockDividendRatio")), parse_number(r.get("CashDividend"))
+        try:
+            ev = date.fromisoformat(iso) if iso else None
+        except ValueError:
+            ev = None
+        if (ev is None or not re.fullmatch(r"[0-9A-Z]{4,6}", code) or kind is None or not (today - timedelta(days=3) <= ev <= today + timedelta(days=180))
+                or (stock is not None and not (0 <= stock <= 10)) or (cash is not None and not (0 <= cash < 10000))):
+            bad += 1
+            continue
+        out.append({"market": "TPEX", "code": code, "event_date": ev.isoformat(), "name": str(r.get("CompanyName", "")).strip()[:40], "kind": kind,
+                    "stock_rate": stock, "cash_dividend": cash, "source": "櫃買中心 除權除息預告表"})
+    return out, bad, None
+
+
 def tw_exright_preview():
-    """模組 M15：證交所『除權除息預告表』（上市證券未來幾週的除權息日）。每天收集，預告表只列即將發生的，過去的靠每天累積。
-    用途：持股的除權息日進事件日曆；大跌清單標註當天是除權息日（配股會讓價格自然下降，不是壞消息）。目前只有上市，上櫃還沒接。"""
+    """模組 M15：除權除息預告表（上市：證交所；上櫃：櫃買中心）。每天收集，預告表只列即將發生的，過去的靠每天累積。
+    用途：持股的除權息日進事件日曆；大跌清單標註當天是除權息日（配股會讓價格自然下降，不是壞消息）。
+    兩個市場各自獨立：一邊失敗不影響另一邊，各留一筆紀錄。"""
+    out = []
     data, err = fetch_json(config.EXRIGHT_URL)
     if data is None:
-        log("tw_exright", "failure", detail=_clip(f"抓取失敗：{err}"))
+        log("tw_exright:twse", "failure", detail=_clip(f"抓取失敗：{err}"))
+    elif not isinstance(data, dict) or data.get("stat") != "OK":
+        log("tw_exright:twse", "no_new_data", detail=f"證交所回覆 stat={data.get('stat') if isinstance(data, dict) else '非預期格式'}（可能目前沒有預告）")
+    else:
+        rows, bad, why = parse_exright_rows(data)
+        if why:
+            log("tw_exright:twse", "failure", detail=_clip(why))
+        elif not rows:
+            log("tw_exright:twse", "no_new_data", detail=f"預告表 {len(data.get('data') or [])} 列，沒有通過驗證的列（略過 {bad} 列）")
+        else:
+            nxt = sorted(rows, key=lambda r: r["event_date"])[:3]
+            log("tw_exright:twse", "success", as_of=nxt[0]["event_date"], detail=_clip(f"{len(rows)} 筆除權息預告（略過 {bad} 列）；最近：" + "、".join(f"{r['event_date'][5:]} {r['code']}{r['name']}（{r['kind']}）" for r in nxt)))
+            out.extend(rows)
+    rows_t, err = fetch_json(config.TPEX_DEFAULT_BASE + "/tpex_exright_prepost")
+    if rows_t is None:
+        log("tw_exright:tpex", "failure", detail=_clip(f"抓取失敗：{err}"))
+    else:
+        got, bad, why = parse_tpex_exright_rows(rows_t)
+        if why:
+            log("tw_exright:tpex", "failure" if "欄位" in why else "no_new_data", detail=_clip(why))
+        elif not got:
+            log("tw_exright:tpex", "no_new_data", detail=f"預告表 {len(rows_t)} 列，沒有通過驗證的列（略過 {bad} 列）")
+        else:
+            nxt = sorted(got, key=lambda r: r["event_date"])[:3]
+            log("tw_exright:tpex", "success", as_of=nxt[0]["event_date"], detail=_clip(f"{len(got)} 筆除權息預告（略過 {bad} 列）；最近：" + "、".join(f"{r['event_date'][5:]} {r['code']}{r['name']}（{r['kind']}）" for r in nxt)))
+            out.extend(got)
+    return out
+
+
+_EXR_HIST_FIELDS = {"date": "資料日期", "code": "股票代號", "name": "股票名稱", "prev": "除權息前收盤價", "ref": "除權息參考價", "kind": "權/息"}
+
+
+def parse_exright_hist_rows(data, today=None):
+    """證交所『除權除息計算結果表』（歷史）→ tw_exright_events 的列（只有前收盤價與參考價，沒有現金股利，所以不帶 cash_dividend／stock_rate 欄位，
+    寫入時才不會把預告表已經有的股利清成空白）。回傳 (列, 略過數, 錯誤原因)。參考價必須在前收盤價的 30% 到 100% 之間。"""
+    today = today or date.today()
+    fields = [str(f).strip() for f in (data.get("fields") or [])]
+    miss = [v for v in _EXR_HIST_FIELDS.values() if v not in fields]
+    if miss:
+        return [], 0, f"欄位與預期不符：缺 {miss}；實際 {fields[:12]}"
+    ix = {k: fields.index(v) for k, v in _EXR_HIST_FIELDS.items()}
+    out, bad = [], 0
+    for r in data.get("data") or []:
+        try:
+            m = _EXR_DATE.search(str(r[ix["date"]]))
+            code, kind = str(r[ix["code"]]).strip(), str(r[ix["kind"]]).strip()
+            prev, ref = parse_number(r[ix["prev"]]), parse_number(r[ix["ref"]])
+            if not m or not re.fullmatch(r"[0-9A-Z]{4,6}", code) or kind not in ("息", "權", "權息") or prev is None or ref is None:
+                bad += 1
+                continue
+            ev = date(int(m.group(1)) + 1911, int(m.group(2)), int(m.group(3)))
+            if not (today - timedelta(days=430) <= ev <= today + timedelta(days=1)) or not (prev > 0 and ref > 0 and ref <= prev * 1.0001 and ref >= prev * 0.3):
+                bad += 1
+                continue
+            out.append({"market": "TWSE", "code": code, "event_date": ev.isoformat(), "name": str(r[ix["name"]]).strip()[:40], "kind": kind,
+                        "prev_close": prev, "ref_price": ref, "source": "證交所 除權除息計算結果表"})
+        except (IndexError, TypeError, ValueError):
+            bad += 1
+    return out, bad, None
+
+
+def tw_exright_history():
+    """模組 M16：回補過去的除權息（證交所『除權除息計算結果表』），含除權息前收盤價與參考價。
+    為什麼要：大跌清單可以算出「扣掉除權息之後，當天實際漲跌多少」。第一次（資料表裡還沒有任何帶參考價的列）回補約 400 天，每 30 天一段；
+    之後每天只重抓最近 60 天（兩段）。段與段之間間隔 HIST_SLEEP 秒；連線失敗就整批停止；某一段沒資料或格式不對只略過那一段。"""
+    if not sb_ready():
+        log("tw_exright_hist", "skipped", detail="未設定 Supabase，無法判斷是不是第一次，不回補")
         return []
-    if not isinstance(data, dict) or data.get("stat") != "OK":
-        log("tw_exright", "no_new_data", detail=f"證交所回覆 stat={data.get('stat') if isinstance(data, dict) else '非預期格式'}（可能目前沒有預告）")
+    have, err = sb_request("GET", "tw_exright_events?select=event_date&ref_price=not.is.null&limit=1")
+    if have is None:
+        log("tw_exright_hist", "failure", detail=_clip(f"讀取失敗：{err}（請先執行 new_tables_v42.sql 與 new_tables_v43.sql）"))
         return []
-    rows, bad, why = parse_exright_rows(data)
-    if why:
-        log("tw_exright", "failure", detail=_clip(why))
+    today = date.today()
+    span = 60 if have else 400
+    windows, a = [], today - timedelta(days=span)
+    while a <= today:
+        b = min(a + timedelta(days=29), today)
+        windows.append((a.strftime("%Y%m%d"), b.strftime("%Y%m%d")))
+        a = b + timedelta(days=1)
+    out, empty, bad_total, why_first, stopped = [], 0, 0, "", False
+    for i, (wa, wb) in enumerate(windows):
+        data, err = fetch_json(config.EXRIGHT_HIST_URL.format(pa="startDate", pb="endDate", a=wa, b=wb))
+        if i < len(windows) - 1:
+            time.sleep(config.HIST_SLEEP)
+        if data is None:
+            log("tw_exright_hist", "failure", as_of=wa, detail=_clip(f"{wa}–{wb} 抓取失敗：{err}；已停止本次回補，不繼續打請求"))
+            stopped = True
+            break
+        if not isinstance(data, dict) or data.get("stat") != "OK" or not data.get("data"):
+            empty += 1
+            continue
+        rows, bad, why = parse_exright_hist_rows(data)
+        if why:
+            why_first = why_first or f"{wa}–{wb}：{why}"
+            continue
+        out.extend(rows)
+        bad_total += bad
+    if why_first and not out:
+        log("tw_exright_hist", "failure", detail=_clip(why_first))
         return []
-    if not rows:
-        log("tw_exright", "no_new_data", detail=f"預告表 {len(data.get('data') or [])} 列，沒有通過驗證的列（略過 {bad} 列）")
-        return []
-    nxt = sorted(rows, key=lambda r: r["event_date"])[:3]
-    log("tw_exright", "success", as_of=nxt[0]["event_date"], detail=_clip(f"{len(rows)} 筆除權息預告（略過 {bad} 列）；最近：" + "、".join(f"{r['event_date'][5:]} {r['code']}{r['name']}（{r['kind']}）" for r in nxt)))
-    return rows
+    log("tw_exright_hist", "success" if out else "no_new_data", as_of=max((r["event_date"] for r in out), default=None),
+        detail=_clip(f"{'第一次回補' if not have else '每日更新最近 60 天'}：{len(windows)} 段，取得 {len(out)} 筆（略過 {bad_total} 列、{empty} 段沒有資料）" + ("；中途連線失敗，下次繼續" if stopped else "") + (f"；{why_first}" if why_first else "")))
+    return out
+
+
+def tw_industry_collect():
+    """模組 M17：上市公司基本資料（/opendata/t187ap03_L）與公開發行公司基本資料（/opendata/t187ap03_P，可能涵蓋上櫃）裡的「產業別」代碼。
+    只收 4 位數代號的股票；產業別必須是 2 位數字。上市的優先，公開發行的只補上市沒有的代號。名稱對照在網頁（用證交所公布的產業別代碼表）。"""
+    out, seen = [], set()
+    for tag, path in (("L", "/opendata/t187ap03_L"), ("P", "/opendata/t187ap03_P")):
+        rows, err = fetch_json(config.TWSE_OPENAPI_BASE + path)
+        if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+            log(f"tw_industry:{tag}", "failure", detail=_clip(f"{path} 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
+            continue
+        keys = list(rows[0].keys())
+        kc, ki = _fin_key(keys, ("公司代號",)), _fin_key(keys, ("產業別",))
+        kn = _fin_key(keys, ("公司簡稱",)) or _fin_key(keys, ("公司名稱",))                  # 簡稱優先（欄位順序裡全名排在簡稱前面）
+        if not kc or not ki:
+            log(f"tw_industry:{tag}", "failure", detail=_clip(f"{path}：找不到公司代號或產業別欄（欄位 {keys[:14]}），不採用"))
+            continue
+        n_new = bad = 0
+        for r in rows:
+            code, ind = str(r.get(kc, "")).strip(), str(r.get(ki, "")).strip()
+            if not re.fullmatch(r"[1-9]\d{3}", code):
+                continue
+            if not re.fullmatch(r"\d{2}", ind):
+                bad += 1
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            out.append({"code": code, "industry": ind, "name": (str(r.get(kn, "")).strip() if kn else "")[:40], "source": f"證交所 公司基本資料（{tag}）"})
+            n_new += 1
+        log(f"tw_industry:{tag}", "success" if n_new else "no_new_data", detail=f"{path}｜{len(rows)} 列；新收 {n_new} 家（略過產業別不是 2 位數字的 {bad} 列）")
+    return out
+
+
+def probe_round7():
+    """只讀探測第七批：1) 公開發行公司基本資料（t187ap03_P）有沒有涵蓋上櫃；2) 證交所個股本益比、殖利率、股價淨值比（BWIBBU_ALL）；
+    3) 櫃買中心個股本益比、殖利率、股價淨值比（tpex_mainboard_peratio_analysis）。只記欄位與前 2 列，不寫入任何資料表。"""
+    rows, e = fetch_json(config.TWSE_OPENAPI_BASE + "/opendata/t187ap03_P")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        keys = list(rows[0].keys())
+        kc = _fin_key(keys, ("公司代號",))
+        codes = [str(r.get(kc, "")).strip() for r in rows if isinstance(r, dict)] if kc else []
+        otc_like = [c for c in codes if re.fullmatch(r"[3568]\d{3}", c)]
+        log("probe:industry_p", "success", detail=_clip(f"共 {len(rows)} 列｜4 位數代號 {sum(1 for c in codes if re.fullmatch(r'[1-9]\d{3}', c))} 家｜代號開頭 3、5、6、8（常見的上櫃）{len(otc_like)} 家，例如 {otc_like[:6]}｜欄位 {keys[:14]}"))
+    else:
+        log("probe:industry_p", "failure", detail=_clip(f"/opendata/t187ap03_P 抓取失敗或格式非預期: {e or str(rows)[:100]}"))
+    for tag, url in (("twse_pe", config.TWSE_OPENAPI_BASE + "/exchangeReport/BWIBBU_ALL"), ("tpex_pe", config.TPEX_DEFAULT_BASE + "/tpex_mainboard_peratio_analysis")):
+        rows, e = fetch_json(url)
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            log(f"probe:{tag}", "success", detail=_clip(f"共 {len(rows)} 列｜欄位 {list(rows[0].keys())}｜前 2 列 {rows[:2]}"))
+        else:
+            log(f"probe:{tag}", "failure" if rows is None else "no_new_data", detail=_clip(f"{url.rsplit('/', 1)[-1]}：{e or '沒有資料列'}｜{str(rows)[:100]}"))
 
 
 _CONF_LABELED = re.compile(r"法人說明會(?:之|的)?(?:舉行|召開|舉辦)?(?:日期|時間)\s*[:：]?\s*(\d{2,3})[/年.](\d{1,2})[/月.](\d{1,2})")
@@ -3055,6 +3229,7 @@ def run_job(job, dry_run=False):
         probe_round4()
         probe_round5()
         probe_round6()
+        probe_round7()
     inst_hist, pc_rows = [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
@@ -3082,10 +3257,14 @@ def run_job(job, dry_run=False):
         extra.append(("us_aaii", _run_module("M09", "AAII 散戶情緒", aaii_sentiment) or [], "as_of"))
         extra.append(("us_leaders", _run_module("M10", "美股領頭股", us_leaders_compute) or [], "as_of,symbol"))
         extra.append(("tw_investor_events", _run_module("M11", "台股法說會日曆", tw_investor_events, price_rows or []) or [], "code,event_date"))
-        extra.append(("tw_exright_events", _run_module("M15", "台股除權息預告（上市）", tw_exright_preview) or [], "market,code,event_date"))
+        extra.append(("tw_exright_events", _run_module("M15", "台股除權息預告（上市、上櫃）", tw_exright_preview) or [], "market,code,event_date"))
+        if not dry_run:
+            extra.append(("tw_exright_events", _run_module("M16", "歷史除權息（含參考價）", tw_exright_history) or [], "market,code,event_date"))
     if job == "tw_backfill":
         extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))
+        if not dry_run:
+            extra.append(("tw_industry", _run_module("M17", "台股產業別", tw_industry_collect) or [], "code"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
         if not dry_run:

@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -757,7 +757,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -3253,6 +3253,20 @@ def exr_row(ev, code, name, kind, stock="0.00000000", cash="5.00000000"):
     return [roc, code, name, kind, stock, "0.00000000", "0.00000000", cash, f"{code},{ev:%Y%m%d}", "", "", "0.00", ""]
 
 
+def _exr_fetch(twse=None, tpex=None):
+    """除權息預告的模擬連線：證交所網址回傳 twse，櫃買網址回傳 tpex（各自可以是 (資料, 錯誤)）。"""
+    def fj(url, **k):
+        if "TWT48U" in url: return twse if isinstance(twse, tuple) else (twse, "")
+        if "tpex_exright_prepost" in url: return tpex if isinstance(tpex, tuple) else (tpex, "")
+        raise AssertionError(url)
+    return fj
+
+
+def _tpex_exr_row(ev, code, name, kind="除息", stock="0.00000000", cash="0.67000000"):
+    return {"ExRrightsExDividendDate": f"{ev.year - 1911}{ev:%m%d}", "SecuritiesCompanyCode": code, "CompanyName": name, "ExRrightsExDividend": kind, "StockDividendRatio": stock,
+            "SubscriptionRatioToNewSharesIssued": "0.00000000", "SubscriptionPricePerShare": "0.00", "CashDividend": cash, "AllocatedForPublicUnderwriting": "0"}
+
+
 def test_tw_exright_preview_parses_real_format_and_rejects_bad_rows():
     reset()
     ev = TODAY + timedelta(days=9)
@@ -3268,36 +3282,212 @@ def test_tw_exright_preview_parses_real_format_and_rejects_bad_rows():
         ["亂碼", "2002", "x", "息"] + [""] * 9,                                                                         # 日期格式不對
         ["115年11月06日"]]                                                                                              # 列太短
     }
-    with mock.patch.object(fetch, "fetch_json", return_value=(data, "")):
+    with mock.patch.object(fetch, "fetch_json", side_effect=_exr_fetch(data, [])):
         rows = REAL["tw_exright_preview"]()
     by = {r["code"]: r for r in rows}
     assert sorted(by) == ["00400A", "2330", "2454"], sorted(by)
     assert by["00400A"]["cash_dividend"] is None and by["00400A"]["stock_rate"] == 0.0 and by["00400A"]["kind"] == "息", "還沒公告的現金股利存空白，不猜"
     assert by["2330"]["event_date"] == ev.isoformat() and by["2330"]["cash_dividend"] == 5.0 and by["2330"]["market"] == "TWSE" and by["2330"]["source"] == "證交所 除權除息預告表"
     assert by["2454"]["kind"] == "權息" and by["2454"]["stock_rate"] == 0.5 and by["2454"]["cash_dividend"] == 10.0
-    lg = [x for x in fetch.LOG if x["source"] == "tw_exright"][0]
+    lg = [x for x in fetch.LOG if x["source"] == "tw_exright:twse"][0]
     assert lg["status"] == "success" and "3 筆除權息預告（略過 7 列）" in lg["detail"] and lg["as_of"] == ev.isoformat()
+
+
+def test_tw_exright_preview_reads_tpex_real_format_independently_of_twse():
+    reset()
+    ev = TODAY + timedelta(days=6)
+    rows_t = [_tpex_exr_row(ev, "8358", "金居", "除息", cash="20.00000000"), _tpex_exr_row(ev, "6488", "環球晶", "除權息", stock="0.30000000", cash="3"),
+              _tpex_exr_row(TODAY - timedelta(days=10), "00789B", "復華公司債A3"),                                          # 已經過了（探測時看到的第一列就是這種）
+              _tpex_exr_row(ev, "3105", "穩懋", "亂寫"), _tpex_exr_row(ev, "xx", "壞代號"),
+              {**_tpex_exr_row(ev, "3293", "鈊象"), "ExRrightsExDividendDate": ""}]
+    with mock.patch.object(fetch, "fetch_json", side_effect=_exr_fetch((None, "HTTP 403"), rows_t)):                      # 證交所壞掉，櫃買照常
+        rows = REAL["tw_exright_preview"]()
+    by = {r["code"]: r for r in rows}
+    assert sorted(by) == ["6488", "8358"] and all(r["market"] == "TPEX" and r["source"] == "櫃買中心 除權除息預告表" for r in rows)
+    assert by["8358"]["kind"] == "息" and by["8358"]["cash_dividend"] == 20.0 and by["6488"]["kind"] == "權息" and by["6488"]["stock_rate"] == 0.3 and by["8358"]["event_date"] == ev.isoformat()
+    st = {x["source"]: x["status"] for x in fetch.LOG}
+    assert st["tw_exright:twse"] == "failure" and st["tw_exright:tpex"] == "success", "兩個市場各自獨立"
+    reset()
+    bad = [{"foo": 1}]
+    with mock.patch.object(fetch, "fetch_json", side_effect=_exr_fetch((None, "x"), bad)):
+        assert REAL["tw_exright_preview"]() == []
+    assert {x["source"]: x["status"] for x in fetch.LOG}["tw_exright:tpex"] == "failure" and "欄位與預期不符" in [x for x in fetch.LOG if x["source"] == "tw_exright:tpex"][0]["detail"]
 
 
 def test_tw_exright_preview_failures_never_write_guesses():
     reset()
     ev = TODAY + timedelta(days=9)
-    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+    def last(src): return [x for x in fetch.LOG if x["source"] == src][-1]
+    with mock.patch.object(fetch, "fetch_json", side_effect=_exr_fetch((None, "HTTP 403"), (None, "HTTP 403"))):
         assert REAL["tw_exright_preview"]() == []
-    assert fetch.LOG[-1]["status"] == "failure"
+    assert last("tw_exright:twse")["status"] == "failure" and last("tw_exright:tpex")["status"] == "failure"
     reset()
-    with mock.patch.object(fetch, "fetch_json", return_value=({"stat": "很抱歉，沒有符合條件的資料!"}, "")):
+    with mock.patch.object(fetch, "fetch_json", side_effect=_exr_fetch({"stat": "很抱歉，沒有符合條件的資料!"}, [])):
         assert REAL["tw_exright_preview"]() == []
-    assert fetch.LOG[-1]["status"] == "no_new_data"
+    assert last("tw_exright:twse")["status"] == "no_new_data"
     reset()
     bad_fields = {"stat": "OK", "fields": ["日期", "代號"], "data": [["115年11月06日", "2330"]]}
-    with mock.patch.object(fetch, "fetch_json", return_value=(bad_fields, "")):
+    with mock.patch.object(fetch, "fetch_json", side_effect=_exr_fetch(bad_fields, [])):
         assert REAL["tw_exright_preview"]() == []
-    assert fetch.LOG[-1]["status"] == "failure" and "欄位與預期不符" in fetch.LOG[-1]["detail"]
+    assert last("tw_exright:twse")["status"] == "failure" and "欄位與預期不符" in last("tw_exright:twse")["detail"]
     reset()
-    with mock.patch.object(fetch, "fetch_json", return_value=({"stat": "OK", "fields": EXR_FIELDS, "data": []}, "")):
+    with mock.patch.object(fetch, "fetch_json", side_effect=_exr_fetch({"stat": "OK", "fields": EXR_FIELDS, "data": []}, [])):
         assert REAL["tw_exright_preview"]() == []
-    assert fetch.LOG[-1]["status"] == "no_new_data"
+    assert last("tw_exright:twse")["status"] == "no_new_data"
+
+
+HIST_FIELDS = ["資料日期", "股票代號", "股票名稱", "除權息前收盤價", "除權息參考價", "權值+息值", "權/息", "漲停價格", "跌停價格", "開盤競價基準", "減除股利參考價", "詳細資料", "最近一次申報資料 季別/日期", "最近一次申報每股 (單位)淨值", "最近一次申報每股 (單位)盈餘"]
+
+
+def hist_row(ev, code, name, prev, ref, kind="息"):
+    return [f"{ev.year - 1911}年{ev.month:02d}月{ev.day:02d}日", code, name, prev, ref, "0.138000", kind, "10.98", "9.00", ref, ref, f"{code},{ev:%Y%m%d}", "", "", ""]
+
+
+def test_exright_hist_parser_checks_reference_price_and_omits_dividend_columns():
+    reset()
+    ev = TODAY - timedelta(days=20)
+    data = {"stat": "OK", "fields": HIST_FIELDS, "data": [
+        hist_row(ev, "00406A", "主動中信台灣收益", "10.13", "9.99"),                      # 正常
+        hist_row(ev, "1101", "台泥", "50.00", "45.46", "權"),                              # 配股：參考價比前收盤低約 9.1%
+        hist_row(ev, "2330", "台積電", "1000", "1100"),                                    # 參考價高過前收盤：不可能
+        hist_row(ev, "2317", "鴻海", "100", "20"),                                         # 低於 30%：不合理
+        hist_row(ev, "2454", "聯發科", "", "9"),                                            # 沒有前收盤
+        hist_row(ev, "2412", "中華電", "100", "99", "股"),                                  # 種類不對
+        hist_row(TODAY - timedelta(days=500), "1216", "太舊", "100", "99"),
+        hist_row(TODAY + timedelta(days=30), "1303", "未來", "100", "99")]}
+    rows, bad, why = fetch.parse_exright_hist_rows(data)
+    assert why is None and sorted(r["code"] for r in rows) == ["00406A", "1101"] and bad == 6
+    r = {x["code"]: x for x in rows}["1101"]
+    assert r["prev_close"] == 50.0 and r["ref_price"] == 45.46 and r["kind"] == "權" and r["market"] == "TWSE" and r["event_date"] == ev.isoformat()
+    assert "cash_dividend" not in r and "stock_rate" not in r, "不帶股利欄位，寫入時才不會把預告表已有的股利清掉"
+    assert fetch.parse_exright_hist_rows({"fields": ["資料日期", "股票代號"], "data": []})[2].startswith("欄位與預期不符")
+
+
+def test_exright_history_first_run_backfills_windows_then_daily_refreshes_two():
+    reset()
+    ev = TODAY - timedelta(days=5)
+    urls = []
+    def fj(url, **k):
+        urls.append(url)
+        return {"stat": "OK", "fields": HIST_FIELDS, "data": [hist_row(ev, "1101", "台泥", "50", "45.46", "權")] if len(urls) == 1 else []}, ""
+    def req(method, path, body=None, **k):
+        assert method == "GET" and path.startswith("tw_exright_events?select=event_date&ref_price=not.is.null")
+        return have[0], ""
+    have = [[]]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req), mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch.time, "sleep") as sl:
+        rows = REAL["tw_exright_history"]()
+    assert len(urls) == 14 and "startDate=" in urls[0] and "endDate=" in urls[0] and urls[-1].endswith(f"endDate={TODAY:%Y%m%d}&response=json"), "400 天分成每 30 天一段：%d 段" % len(urls)
+    assert sl.call_count == 13, "段與段之間要等"
+    assert [r["code"] for r in rows] == ["1101"]
+    lg = [x for x in fetch.LOG if x["source"] == "tw_exright_hist"][0]
+    assert lg["status"] == "success" and "第一次回補：14 段，取得 1 筆" in lg["detail"] and "13 段沒有資料" in lg["detail"]
+    reset(); urls.clear(); have[0] = [{"event_date": "2026-10-05"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req), mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch.time, "sleep"):
+        REAL["tw_exright_history"]()
+    assert len(urls) == 3 and "每日更新最近 60 天" in [x for x in fetch.LOG if x["source"] == "tw_exright_hist"][0]["detail"], "之後每天只重抓最近 60 天"
+
+
+def test_exright_history_stops_on_connection_failure_and_reports_problems():
+    reset()
+    calls = []
+    def fj(url, **k):
+        calls.append(url)
+        return (None, "HTTP 503") if len(calls) == 3 else ({"stat": "OK", "fields": HIST_FIELDS, "data": [hist_row(TODAY - timedelta(days=5), "1101", "台泥", "50", "45")]}, "")
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], "")), mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch.time, "sleep"):
+        rows = REAL["tw_exright_history"]()
+    assert len(calls) == 3 and len(rows) == 2, "連線失敗就整批停止，已經拿到的保留"
+    lgs = [x for x in fetch.LOG if x["source"] == "tw_exright_hist"]
+    assert lgs[0]["status"] == "failure" and "不繼續打請求" in lgs[0]["detail"] and lgs[-1]["status"] == "success" and "中途連線失敗" in lgs[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], "")), mock.patch.object(fetch.time, "sleep"), \
+            mock.patch.object(fetch, "fetch_json", return_value=({"stat": "OK", "fields": ["a", "b"], "data": [["x", "y"]]}, "")):
+        assert REAL["tw_exright_history"]() == []
+    assert [x["status"] for x in fetch.LOG if x["source"] == "tw_exright_hist"] == ["failure"] and "欄位與預期不符" in fetch.LOG[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 400 column ref_price does not exist")):
+        assert REAL["tw_exright_history"]() == []
+    assert "new_tables_v43.sql" in fetch.LOG[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert REAL["tw_exright_history"]() == []
+    assert fetch.LOG[-1]["status"] == "skipped"
+
+
+def test_tw_industry_collect_merges_listed_first_and_validates_codes():
+    reset()
+    L_ = [{"出表日期": "1151101", "公司代號": "2330", "公司名稱": "台灣積體電路製造股份有限公司", "公司簡稱": "台積電", "產業別": "24"}, {"公司代號": "1101", "公司簡稱": "台泥", "產業別": "01"},
+          {"公司代號": "9999", "公司簡稱": "壞產業", "產業別": "半導體"}, {"公司代號": "00878", "公司簡稱": "ETF", "產業別": "24"}, {"公司代號": "ab12", "公司簡稱": "壞代號", "產業別": "24"}]
+    P_ = [{"公司代號": "2330", "公司簡稱": "台積電(重複)", "產業別": "99"}, {"公司代號": "8358", "公司簡稱": "金居", "產業別": "28"}, {"公司代號": "6488", "公司簡稱": "環球晶", "產業別": "24"}]
+    def fj(url, **k):
+        if url.endswith("t187ap03_L"): return L_, ""
+        if url.endswith("t187ap03_P"): return P_, ""
+        raise AssertionError(url)
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        rows = REAL["tw_industry_collect"]()
+    by = {r["code"]: r for r in rows}
+    assert sorted(by) == ["1101", "2330", "6488", "8358"], sorted(by)
+    assert by["2330"]["industry"] == "24" and by["2330"]["name"] == "台積電", "上市的優先，公開發行的只補沒有的"
+    assert by["8358"]["industry"] == "28" and by["8358"]["source"].endswith("（P）") and by["1101"]["source"].endswith("（L）")
+    sts = {x["source"]: x for x in fetch.LOG}
+    assert "新收 2 家（略過產業別不是 2 位數字的 1 列）" in sts["tw_industry:L"]["detail"] and "新收 2 家" in sts["tw_industry:P"]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (L_, "") if u.endswith("_L") else (None, "HTTP 404")):     # 公開發行那份抓不到：上市照收
+        rows = REAL["tw_industry_collect"]()
+    assert sorted(r["code"] for r in rows) == ["1101", "2330"] and {x["source"]: x["status"] for x in fetch.LOG}["tw_industry:P"] == "failure"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=([{"foo": "1"}], "")):                                                       # 欄位認不得：不猜
+        assert REAL["tw_industry_collect"]() == []
+    assert all(x["status"] == "failure" and "找不到公司代號或產業別欄" in x["detail"] for x in fetch.LOG if x["source"].startswith("tw_industry:"))
+
+
+def test_probe_round7_logs_p_coverage_and_pe_sources_without_writing():
+    reset()
+    P_ = [{"公司代號": c, "公司簡稱": "x", "產業別": "24"} for c in ("2330", "8358", "6488", "3105", "00878", "1101")]
+    def fj(url, **k):
+        if url.endswith("t187ap03_P"): return P_, ""
+        if url.endswith("BWIBBU_ALL"): return [{"Date": "1151102", "Code": "2330", "Name": "台積電", "PEratio": "25.1", "DividendYield": "1.5", "PBratio": "7.2"}], ""
+        if url.endswith("tpex_mainboard_peratio_analysis"): return [{"Date": "1151102", "SecuritiesCompanyCode": "8358", "PriceEarningRatio": "12"}], ""
+        raise AssertionError(url)
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round7()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "共 6 列" in by["probe:industry_p"]["detail"] and "常見的上櫃）3 家" in by["probe:industry_p"]["detail"] and "4 位數代號 5 家" in by["probe:industry_p"]["detail"]
+    assert "PEratio" in by["probe:twse_pe"]["detail"] and "PriceEarningRatio" in by["probe:tpex_pe"]["detail"]
+    up.assert_not_called()
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        fetch.probe_round7()
+    assert {x["source"]: x["status"] for x in fetch.LOG} == {"probe:industry_p": "failure", "probe:twse_pe": "failure", "probe:tpex_pe": "failure"}
+
+
+def test_run_job_wires_exright_history_and_industry_modules_with_isolation():
+    reset()
+    ex_hist = [{"market": "TWSE", "code": "1101", "event_date": D(5), "name": "台泥", "kind": "權", "prev_close": 50.0, "ref_price": 45.46, "source": "證交所 除權除息計算結果表"}]
+    ind = [{"code": "2330", "industry": "24", "name": "台積電", "source": "x"}]
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(job, dry, hist=None, indfn=None):
+        got = []
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+                  mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "tw_backfill", return_value={}), mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "tw_crash_check"),
+                  mock.patch.object(fetch, "tw_exright_history", **(hist or {"return_value": ex_hist})), mock.patch.object(fetch, "tw_industry_collect", **(indfn or {"return_value": ind})),
+                  mock.patch.object(fetch, "persist_extra", side_effect=lambda d, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in patches: p_.start()
+        try:
+            fetch.run_job(job, dry_run=dry)
+        finally:
+            for p_ in patches: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go("tw_close", False)
+    assert ("tw_exright_events", ex_hist, "market,code,event_date") in tables and st["module:M16"] == "success", "每天的工作要寫入歷史除權息"
+    assert not any(n == "tw_industry" for n, _, _ in tables), "產業別不在每天的工作裡"
+    reset(); tables, st = go("tw_close", True)
+    assert "module:M16" not in st, "dry-run 不碰歷史回補"
+    reset(); tables, st = go("tw_backfill", False)
+    assert ("tw_industry", ind, "code") in tables and st["module:M17"] == "success", "產業別在夜間的回補工作"
+    reset(); tables, st = go("tw_close", False, hist={"side_effect": RuntimeError("boom")})
+    assert st["module:M16"] == "failure" and st["module:M08"] in ("success", "no_new_data"), "歷史除權息壞了不影響其他模組"
+    reset(); tables, st = go("tw_backfill", False, indfn={"side_effect": RuntimeError("boom")})
+    assert st["module:M17"] == "failure" and "module:M12" in st and "module:M14" in st, "產業別壞了不影響夜間的其他模組"
 
 
 def test_probe_round6_logs_listed_industry_otc_paths_prepost_and_history_without_writing():
