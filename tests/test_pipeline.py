@@ -757,7 +757,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -3650,6 +3650,38 @@ def test_probe_round6_logs_listed_industry_otc_paths_prepost_and_history_without
         fetch.probe_round6()
     st = {x["source"]: x["status"] for x in fetch.LOG}
     assert st["probe:industry_l"] == "failure" and st["probe:exright_twse_hist"] == "no_new_data" and st["probe:exright_tpex_pre"] == "failure" and st["probe:tpex_paths:1"] == "no_new_data"
+
+
+def test_probe_round8_reports_sp500_alternative_sources_without_writing():
+    reset()
+    csv = b"Date,Open,High,Low,Close,Volume\n2026-10-28,7000,7100,6990,7050.5,0\n2026-10-29,7050,7120,7040,7100.1,0\n2026-10-30,7100,7200,7090,7150.2,0\n2026-11-02,7150,7210,7140,7200.9,0\n2026-11-03,7200,7250,7190,7210.0,0\n"
+    yj = json.dumps({"chart": {"result": [{"meta": {"marketState": "CLOSED", "regularMarketTime": 1793000000}, "timestamp": [1792000000 + i * 86400 for i in range(6)],
+                                          "indicators": {"quote": [{"close": [7000.0, 7010.5, None, 7030.25, 7040.0, 7050.75]}]}}]}}).encode()
+    def raw(url, timeout=None, headers=None):
+        if "stooq" in url: return 200, "text/csv", csv, ""
+        if "yahoo" in url: return 200, "application/json", yj, ""
+        raise AssertionError(url)
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round8()
+    by = {x["source"]: x for x in fetch.LOG}
+    s_, y_ = by["probe:sp500_alt:stooq"], by["probe:sp500_alt:yahoo"]
+    assert s_["status"] == "success" and "共 5 個交易日" in s_["detail"] and "('2026-11-03', 7210.0)" in s_["detail"] and "表頭 ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']" in s_["detail"], s_["detail"]
+    assert y_["status"] == "success" and "共 5 個交易日" in y_["detail"] and "7050.75" in y_["detail"] and "marketState=CLOSED" in y_["detail"], y_["detail"]
+    up.assert_not_called()
+    assert all(len(x["detail"]) <= 900 for x in fetch.LOG)
+    reset()
+    def bad(url, timeout=None, headers=None):
+        if "stooq" in url: return 200, "text/html", b"<html>Exceeded the daily hits limit</html>", ""
+        return None, "", b"", "timeout"
+    with mock.patch.object(fetch, "fetch_raw", side_effect=bad):
+        fetch.probe_round8()
+    st = {x["source"]: x for x in fetch.LOG}
+    assert st["probe:sp500_alt:stooq"]["status"] == "no_new_data" and "共 0 個交易日" in st["probe:sp500_alt:stooq"]["detail"] and "Exceeded" in st["probe:sp500_alt:stooq"]["detail"], "被擋或限流要記失敗並留下開頭內容"
+    assert st["probe:sp500_alt:yahoo"]["status"] == "no_new_data" and "連線失敗" in st["probe:sp500_alt:yahoo"]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>login</html>", "")):
+        fetch.probe_round8()
+    assert {x["source"]: x["status"] for x in fetch.LOG}["probe:sp500_alt:yahoo"] == "no_new_data"
 
 
 def test_probe_round4_logs_aaii_clues_and_exright_sources_without_writing():

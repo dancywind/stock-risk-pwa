@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v46"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v47"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3005,6 +3005,45 @@ def probe_round6():
         log("probe:exright_twse_hist", "no_new_data", detail=_clip(f"兩種參數名稱都沒拿到資料：{'；'.join(tried)}"))
 
 
+def probe_round8():
+    """只讀探測第八批：標普 500 指數的備用來源（FRED 比別的指數晚一個交易日，Nasdaq 的 API 沒有提供標普）。
+    候選：1) Stooq 的日線 CSV（^SPX）；2) Yahoo 的 chart API（^GSPC）。只記：連線狀態、內容類型、最近 3 個交易日的日期與收盤、有沒有看起來像盤中的數字。
+    不寫入任何資料表；要不要採用，等看到哪一個真的抓得到再決定。候選來源抓不到是正常的探測結果，所以只記「沒有資料」，不會讓工作變紅。"""
+    ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "*/*"}
+    status, ctype, body, err = fetch_raw("https://stooq.com/q/d/l/?s=%5Espx&i=d", timeout=config.PROBE_TIMEOUT, headers=ua)
+    if status is None:
+        log("probe:sp500_alt:stooq", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+    else:
+        text = body.decode("utf-8", errors="replace")
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        head = lines[0].split(",") if lines else []
+        rows = []
+        if "Date" in head and "Close" in head:
+            di, ci = head.index("Date"), head.index("Close")
+            for l in lines[1:]:
+                c = l.split(",")
+                if len(c) > max(di, ci):
+                    v = parse_number(c[ci])
+                    if v is not None:
+                        rows.append((c[di], v))
+        ok = status == 200 and len(rows) >= 5
+        log("probe:sp500_alt:stooq", "success" if ok else "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜{len(body)} 位元組｜表頭 {head[:6]}｜共 {len(rows)} 個交易日｜最近 3 筆 {rows[-3:]}｜開頭 {text[:120]!r}"))
+    status, ctype, body, err = fetch_raw("https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1mo&interval=1d", timeout=config.PROBE_TIMEOUT, headers=ua)
+    if status is None:
+        log("probe:sp500_alt:yahoo", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+    else:
+        try:
+            res = ((json.loads(body.decode("utf-8-sig")).get("chart") or {}).get("result") or [None])[0] or {}
+            ts = res.get("timestamp") or []
+            closes = (((res.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+            pts = [(datetime.fromtimestamp(t_, timezone.utc).date().isoformat(), c) for t_, c in zip(ts, closes) if c is not None]
+            meta = res.get("meta") or {}
+            log("probe:sp500_alt:yahoo", "success" if status == 200 and len(pts) >= 5 else "no_new_data",
+                detail=_clip(f"HTTP {status}｜{ctype}｜共 {len(pts)} 個交易日｜最近 3 筆 {[(d_, round(c, 2)) for d_, c in pts[-3:]]}｜marketState={meta.get('marketState')}｜regularMarketTime={meta.get('regularMarketTime')}"))
+        except (ValueError, UnicodeDecodeError, AttributeError, TypeError, KeyError):
+            log("probe:sp500_alt:yahoo", "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜不是預期的 JSON｜開頭 {body[:120]!r}"))
+
+
 def probe_us_pressure():
     """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
     1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
@@ -3273,6 +3312,7 @@ def run_job(job, dry_run=False):
         probe_round5()
         probe_round6()
         probe_round7()
+        probe_round8()
     inst_hist, pc_rows = [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
