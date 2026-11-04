@@ -16,6 +16,7 @@
 """
 import argparse
 from collections import Counter
+import gzip
 import json
 import os
 import re
@@ -44,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v50"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v51"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -92,6 +93,27 @@ def validate_value(raw, low, high):
 _JSON_CACHE = {}
 
 
+def _with_gzip(headers):
+    """請求標頭一律加上 Accept-Encoding: gzip（呼叫端沒寫才加）。櫃買中心的收盤價回應有 5 MB 以上，不壓縮時曾經傳到一半被切斷（IncompleteRead）。"""
+    h = dict(headers or {})
+    if not any(k.lower() == "accept-encoding" for k in h):
+        h["Accept-Encoding"] = "gzip"
+    return h
+
+
+def _read_body(resp):
+    """讀回應內容；伺服器說是 gzip 就解壓縮（標頭說是 gzip 但其實不是，就當作沒壓縮）。"""
+    raw = resp.read()
+    hdrs = getattr(resp, "headers", None)
+    enc = (hdrs.get("Content-Encoding", "") if hdrs is not None else "") or ""
+    if enc.lower() == "gzip":
+        try:
+            return gzip.decompress(raw)
+        except (OSError, EOFError):
+            return raw
+    return raw
+
+
 def fetch_json(url, headers=None, timeout=None):
     """帶重試的抓取。失敗回傳 (None, 原因)，不拋出。
     被對方擋下（HTTP 403、429、503）時等得比較久（BLOCK_BACKOFF_SECONDS 起跳）：這類多半是暫時的限流，馬上再試只會繼續被擋。"""
@@ -99,9 +121,9 @@ def fetch_json(url, headers=None, timeout=None):
     for attempt in range(1, config.RETRIES + 1):
         blocked = False
         try:
-            req = urllib.request.Request(url, headers=headers or {"User-Agent": "risk-pwa/1.0", "Accept": "application/json"})
+            req = urllib.request.Request(url, headers=_with_gzip(headers or {"User-Agent": "risk-pwa/1.0", "Accept": "application/json"}))
             with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
-                return json.loads(resp.read().decode("utf-8-sig").lstrip("\ufeff")), ""  # 期交所回傳開頭帶 BOM（連續多個也處理）
+                return json.loads(_read_body(resp).decode("utf-8-sig").lstrip("\ufeff")), ""  # 期交所回傳開頭帶 BOM（連續多個也處理）
         except urllib.error.HTTPError as e:
             last_err = _scrub(e)
             blocked = e.code in (403, 429, 503)
@@ -124,11 +146,11 @@ def fetch_swagger(url):
 
 def fetch_raw(url, timeout=None, headers=None):
     """診斷用：不解析 JSON，只回傳 (HTTP 狀態, Content-Type, 原始位元組, 錯誤)。"""
-    headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"}
+    headers = _with_gzip(headers or {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
-            return resp.status, resp.headers.get("Content-Type", ""), resp.read(), ""
+            return resp.status, resp.headers.get("Content-Type", ""), _read_body(resp), ""
     except urllib.error.HTTPError as e:
         ctype = e.headers.get("Content-Type", "") if e.headers else ""
         return e.code, ctype, e.read()[:2000], f"HTTP {e.code}"

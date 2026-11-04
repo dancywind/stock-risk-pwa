@@ -3409,6 +3409,64 @@ def test_run_job_daily_persists_margin_ratio_estimate_and_isolates_m21():
     assert st["module:M21"] == "failure" and "module:M08" in st
 
 
+def test_http_helpers_ask_for_gzip_decompress_it_and_survive_truncated_downloads():
+    import gzip as _gz, http.client
+    reset()
+    payload = json.dumps({"ok": 1, "x": "中文"}).encode("utf-8")
+    seen = []
+    class Hdr(dict):
+        def get(self, k, d=None): return super().get(k, d)
+    class Resp:
+        status = 200
+        def __init__(self, body, enc=None, ctype="application/json"):
+            self._b = body; self.headers = Hdr({"Content-Type": ctype, **({"Content-Encoding": enc} if enc else {})})
+        def read(self): return self._b
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def opener(resp):
+        def f(req, timeout=None):
+            seen.append(req)
+            return resp
+        return f
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=opener(Resp(_gz.compress(payload), "gzip"))):
+        assert fetch.fetch_json("https://x/y") == ({"ok": 1, "x": "中文"}, "")
+    assert seen[-1].get_header("Accept-encoding") == "gzip", "一定要求 gzip（大檔案才不會傳到一半被切斷）"
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=opener(Resp(payload))):                       # 沒壓縮的照樣可以
+        assert fetch.fetch_json("https://x/y")[0] == {"ok": 1, "x": "中文"}
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=opener(Resp(payload, "gzip"))):               # 標頭說 gzip 但其實不是：當作沒壓縮
+        assert fetch.fetch_json("https://x/y")[0] == {"ok": 1, "x": "中文"}
+    class NoHdr:                                                                                                      # 舊測試用的簡化回應（沒有 headers 屬性）也要能讀
+        def read(self): return payload
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=opener(NoHdr())):
+        assert fetch.fetch_json("https://x/y")[0] == {"ok": 1, "x": "中文"}
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=opener(Resp(_gz.compress(payload), "gzip"))):
+        st, ct, body, err = fetch.fetch_raw("https://x/y", headers={"User-Agent": "u"})
+    assert st == 200 and body == payload and err == "" and seen[-1].get_header("Accept-encoding") == "gzip" and seen[-1].get_header("User-agent") == "u", "fetch_raw：自訂標頭保留、再補上 gzip、回傳的是解壓縮後的內容"
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=opener(Resp(payload))):
+        fetch.fetch_raw("https://x/y", headers={"Accept-Encoding": "identity"})
+    assert seen[-1].get_header("Accept-encoding") == "identity", "呼叫端自己指定的不覆蓋"
+    # 傳到一半被切斷（IncompleteRead）：重試，之後成功就成功
+    calls = {"n": 0}
+    def flaky(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            class Cut:
+                headers = Hdr()
+                def read(self): raise http.client.IncompleteRead(b"x" * 10, 100)
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            return Cut()
+        return Resp(_gz.compress(payload), "gzip")
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=flaky), mock.patch.object(fetch.time, "sleep") as sl:
+        assert fetch.fetch_json("https://x/y")[0] == {"ok": 1, "x": "中文"}
+    assert calls["n"] == 3 and [c.args[0] for c in sl.call_args_list] == [config.BACKOFF_SECONDS, config.BACKOFF_SECONDS * 2], "被切斷用一般等待重試"
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=lambda req, timeout=None: (_ for _ in ()).throw(http.client.IncompleteRead(b"x", 5))), mock.patch.object(fetch.time, "sleep"):
+        data, err = fetch.fetch_json("https://x/y")
+    assert data is None and "IncompleteRead" in err, "三次都被切斷：回傳失敗與原因，不拋例外"
+
+
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
     reset()
     calls = []
