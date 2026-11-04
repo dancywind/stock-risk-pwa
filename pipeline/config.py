@@ -4,6 +4,7 @@ import os
 TIMEOUT_SECONDS = 60
 RETRIES = 3
 BACKOFF_SECONDS = 5
+OPTIONS_TIMEOUT = 90                  # Cboe 的選擇權鏈檔案很大（SPX 約 3 萬檔合約），逾時要放寬
 BLOCK_BACKOFF_SECONDS = 20            # 被擋下（HTTP 403、429、503）時等比較久再試：20 秒、40 秒
 
 FRED_SERIES_URL = "https://api.stlouisfed.org/fred/series/observations"
@@ -65,6 +66,7 @@ TWSE_MI_INDEX_MS = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?type=MS
 # 已用真實回傳驗證過格式：三大法人買賣金額(BFI82U)、信用交易統計(MI_MARGN)
 TWSE_BFI82U = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&response=json"
 TWSE_MI_MARGN = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectType=MS&response=json"
+TWSE_MI_MARGN_ALL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?selectType=ALL&response=json"   # 含逐檔融資（只能取最新一天）
 PROBE_URLS = {"BFI82U": TWSE_BFI82U, "MI_MARGN": TWSE_MI_MARGN}
 # 期交所開放資料說明文件（網址依 data.gov.tw 官方資料集頁面；先前的 /v1/swagger.json 回傳非 JSON）
 TAIFEX_SWAGGER = "https://openapi.taifex.com.tw/swagger.json"
@@ -156,7 +158,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v49"
+PIPELINE_VERSION = "v50"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -164,7 +166,7 @@ EARNINGS_MAX_AHEAD_DAYS = 200      # 財報日比今天晚超過這麼多天，�
 # 模組開關：改成 False 就整個關掉（排程不抓、網站顯示未啟用）。任何一個模組壞掉，不會影響其他模組。
 FEATURES = {"M01_fred_extra": True, "M02_us_quotes": True, "M03_sector_rs": True, "M04_tw_leaders": True,
             "M05_tw_index_history": True, "M06_fred_history": True, "M07_tw_fin": True, "M08_us_crash": True,
-            "M09_aaii": True, "M10_us_leaders": True, "M11_tw_events": True, "M12_inst_history": True, "M13_breadth_hist": True, "M14_pc_history": True, "M15_tw_exright": True, "M16_exright_hist": True, "M17_tw_industry": True, "M18_us_index": True, "M19_margin_hist": True}
+            "M09_aaii": True, "M10_us_leaders": True, "M11_tw_events": True, "M12_inst_history": True, "M13_breadth_hist": True, "M14_pc_history": True, "M15_tw_exright": True, "M16_exright_hist": True, "M17_tw_industry": True, "M18_us_index": True, "M19_margin_hist": True, "M20_us_options": True, "M21_margin_ratio": True}
 # 模組 M02：美股其他行情（Nasdaq 報價，只採用已收盤的價格）。QQQ 只存漲跌幅，不存價格（規格 §13）。
 US_QUOTES = (
     ("SPY", "標普 500 ETF（SPY）", "etf", ("etf",), 50.0, 3000.0, True),
@@ -198,7 +200,7 @@ EXRIGHT_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT48U?response=json"
 EXRIGHT_HIST_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT49U?{pa}={a}&{pb}={b}&response=json"   # 除權除息計算結果表（歷史）；參數名稱探測中
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
-JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill", "tw_events")
+JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill", "tw_events", "us_options")
 
 
 def fred_key():

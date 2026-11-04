@@ -44,7 +44,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v49"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v50"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3428,6 +3428,188 @@ def sb_upsert_plain(table, rows):
 
 
 # ---------------------------------------------------------------- 主流程
+def parse_margin_stock_table(data):
+    """證交所 MI_MARGN（selectType=ALL）的逐檔融資表 → ({代號: 融資今日餘額（張）}, 錯誤原因)。
+    欄位名稱有重複（融資與融券各有買進、賣出、前日餘額、今日餘額），所以用位置：代號、名稱、買進、賣出、現金償還、前日餘額、今日餘額…，
+    並且逐列驗證「前日餘額＋買進－賣出－償還＝今日餘額」，通過的列要在 98% 以上，否則整份不採用（代表欄位位置和我們以為的不一樣）。"""
+    tabs = [t for t in (data.get("tables") or []) if t.get("fields") and t.get("data")]
+    if not tabs:
+        return None, "找不到逐檔融資表"
+    big = max(tabs, key=lambda t: len(t["data"]))
+    f = [str(x).strip() for x in big["fields"]]
+    if f[:7] != ["代號", "名稱", "買進", "賣出", "現金償還", "前日餘額", "今日餘額"] or f.count("今日餘額") < 2:
+        return None, f"逐檔融資表欄位與預期不符：{f[:9]}"
+    out, ok_n, n = {}, 0, 0
+    for r in big["data"]:
+        try:
+            code = str(r[0]).strip()
+            buy, sell, rep, prev, today = (parse_number(r[i]) for i in (2, 3, 4, 5, 6))
+        except (IndexError, TypeError):
+            continue
+        if None in (buy, sell, rep, prev, today) or not code:
+            continue
+        n += 1
+        if abs(prev + buy - sell - rep - today) <= 1:
+            ok_n += 1
+        if today > 0:
+            out[code] = today
+    if n < 100 or ok_n / n < 0.98:
+        return None, f"逐檔融資表有 {n} 列可解析，其中只有 {ok_n} 列通過「前日＋買進－賣出－償還＝今日」，不採用"
+    return out, None
+
+
+def tw_margin_ratio_est():
+    """模組 M21：自行估算上市的融資維持率（總量推估，和民間軟體同一類算法）＝ Σ（逐檔融資餘額 × 1000 × 收盤價）÷ 融資金額。
+    這不是證交所公布的「整戶擔保維持率」（官方是融資加融券合併、按每個帳戶算，數字通常高出約 30 個百分點）；畫面上一律標「估算」。
+    日期必須一致：融資表的日期、全部上市股票收盤價的日期、都要等於同一天，否則不算（不拿昨天的價格配今天的餘額）。
+    收盤價查不到的融資股票超過 5% 就不採用。只能從啟用那天起每天累積：證交所逐檔融資不能指定日期取得歷史。"""
+    data, err = fetch_json(config.TWSE_MI_MARGN_ALL)
+    if data is None:
+        log("tw_margin_ratio", "failure", detail=_clip(f"逐檔融資抓取失敗: {err}"))
+        return []
+    if not isinstance(data, dict) or data.get("stat") != "OK":
+        log("tw_margin_ratio", "no_new_data", detail=f"證交所回覆 stat={data.get('stat') if isinstance(data, dict) else '非預期格式'}")
+        return []
+    as_of = twse_ymd_to_iso(data.get("date"))
+    ok, why = validate_close_date(as_of)
+    if not ok:
+        log("tw_margin_ratio", "failure", as_of=as_of, detail=f"資料日期異常: {why}")
+        return []
+    units, perr = parse_margin_stock_table(data)
+    total, lerr = _parse_margin(data)
+    if perr or lerr:
+        log("tw_margin_ratio", "failure", as_of=as_of, detail=_clip(perr or lerr))
+        return []
+    px, err = fetch_json(config.TWSE_OPENAPI_BASE + "/exchangeReport/STOCK_DAY_ALL")
+    if not (isinstance(px, list) and px and isinstance(px[0], dict)):
+        log("tw_margin_ratio", "failure", as_of=as_of, detail=_clip(f"全部上市股票收盤價抓取失敗或格式非預期: {err or str(px)[:80]}"))
+        return []
+    dates = Counter(roc_to_iso(r.get("Date")) for r in px if isinstance(r, dict))
+    px_date = dates.most_common(1)[0][0] if dates else None
+    if px_date != as_of:
+        log("tw_margin_ratio", "no_new_data", as_of=as_of, detail=f"收盤價的日期是 {px_date}，融資表是 {as_of}，兩天不一致，不估算（不拿別天的價格配這天的餘額）")
+        return []
+    close = {}
+    for r in px:
+        c = parse_number(r.get("ClosingPrice"))
+        if isinstance(r, dict) and c and c > 0:
+            close[str(r.get("Code", "")).strip()] = c
+    value, missing = 0.0, 0
+    for code, u in units.items():
+        if code in close:
+            value += u * 1000 * close[code]
+        else:
+            missing += 1
+    if not units or missing / len(units) > 0.05:
+        log("tw_margin_ratio", "failure", as_of=as_of, detail=f"有融資餘額的 {len(units)} 檔裡，{missing} 檔查不到收盤價（超過 5%），不估算")
+        return []
+    ratio = value / total["margin_balance"] * 100
+    if not (80 <= ratio <= 400):
+        log("tw_margin_ratio", "failure", as_of=as_of, detail=f"估算值 {ratio:.1f}% 不在合理範圍 80–400%，拒收")
+        return []
+    log("tw_margin_ratio", "success", as_of=as_of, detail=f"估算維持率 {ratio:.1f}%（{len(units) - missing} 檔、融資金額 {total['margin_balance'] / 1e8:,.0f} 億元、融資股票市值 {value / 1e8:,.0f} 億元；{missing} 檔查不到收盤價）")
+    return [{"as_of": as_of, "est_ratio": round(ratio, 2), "margin_value": round(value), "margin_loan": round(total["margin_balance"]), "n_stocks": len(units) - missing, "n_missing": missing,
+             "source": "自行估算（證交所逐檔融資餘額 × 收盤價 ÷ 融資金額；不是官方整戶擔保維持率）"}]
+
+
+_OPT_RE = re.compile(r"^([A-Z]{1,6}\d?)(\d{6})([CP])(\d{8})$")
+_OPT_SPOT_RANGE = {"SPX": (1000, 20000), "SPY": (100, 2000), "QQQ": (100, 1500)}
+
+
+def parse_options_chain(j, underlying, today=None, near_days=45, band=0.15):
+    """Cboe 延遲選擇權鏈 → ({摘要}, [履約價列], 錯誤原因)。
+    資料日用標的最後成交時間（last_trade_time）的日期；必須是平日，且在今天往前 5 天內。現價必須在合理範圍。
+    履約價列：只收到期日在 near_days 天內、履約價在現價 ±band 內的合約，同一履約價把各到期日的買權、賣權未平倉量加總；
+    摘要的買權、賣權總量則包含所有到期日。IV30 是標的的 30 天隱含波動率（0.145 這種小數會換成 14.5；超出 3–200 就當作查不到）。
+    OI 是前一個交易日收盤後公布的數字，所以快照要等到美東早上（OCC 更新之後）再抓。"""
+    today = today or date.today()
+    d_ = (j or {}).get("data") or {}
+    opts = d_.get("options") or []
+    spot = parse_number(d_.get("current_price"))
+    lo, hi = _OPT_SPOT_RANGE[underlying]
+    if spot is None or not (lo <= spot <= hi):
+        return None, [], f"現價 {spot} 不在合理範圍 {lo}–{hi}"
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(d_.get("last_trade_time", "")))
+    if not m:
+        return None, [], f"看不懂標的的最後成交時間 {d_.get('last_trade_time')!r}，不採用"
+    try:
+        as_of = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None, [], f"最後成交時間的日期不合法 {d_.get('last_trade_time')!r}"
+    if as_of.weekday() >= 5 or not (today - timedelta(days=5) <= as_of <= today):
+        return None, [], f"資料日 {as_of} 不是最近 5 天內的平日，不採用"
+    if len(opts) < 100:
+        return None, [], f"選擇權合約只有 {len(opts)} 檔，不採用"
+    call_tot = put_tot = n = 0
+    strikes = {}
+    for o in opts:
+        mm = _OPT_RE.match(str(o.get("option", "")))
+        oi = parse_number(o.get("open_interest"))
+        if not mm or oi is None or oi < 0:
+            continue
+        try:
+            exp = date(2000 + int(mm.group(2)[:2]), int(mm.group(2)[2:4]), int(mm.group(2)[4:]))
+        except ValueError:
+            continue
+        n += 1
+        k, oi = int(mm.group(4)) / 1000, int(oi)
+        if mm.group(3) == "C":
+            call_tot += oi
+        else:
+            put_tot += oi
+        if as_of <= exp <= as_of + timedelta(days=near_days) and abs(k / spot - 1) <= band and oi > 0:
+            row = strikes.setdefault(k, {"underlying": underlying, "as_of": as_of.isoformat(), "strike": k, "call_oi": 0, "put_oi": 0})
+            row["call_oi" if mm.group(3) == "C" else "put_oi"] += oi
+    if n < 100 or call_tot + put_tot <= 0:
+        return None, [], f"能解析的合約只有 {n} 檔，不採用"
+    iv = parse_number(d_.get("iv30"))
+    if iv is not None and iv < 3:
+        iv *= 100
+    if iv is not None and not (3 <= iv <= 200):
+        iv = None
+    chg = parse_number(d_.get("iv30_change"))
+    summary = {"underlying": underlying, "as_of": as_of.isoformat(), "spot": spot, "iv30": round(iv, 2) if iv is not None else None, "iv30_change": chg,
+               "call_oi": call_tot, "put_oi": put_tot, "n_contracts": n, "source": "Cboe 延遲選擇權鏈"}
+    return summary, sorted(strikes.values(), key=lambda r: r["strike"]), None
+
+
+def us_options_snapshot():
+    """模組 M20：美股選擇權快照（Cboe 延遲選擇權鏈）：標普 500 指數（SPX，核心）、SPY 與 QQQ（選用，抓不到只記沒有資料）。
+    每天存一份摘要（現價、IV30、買賣權總未平倉量）與履約價未平倉量，靠每天快照比較 OI 變動。
+    在台北時間 20:45 抓（美東早上，OCC 已經更新前一天的 OI、標的價格是前一個交易日的收盤）。"""
+    ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"}
+    out = []
+    for sym, und, optional in (("_SPX", "SPX", False), ("SPY", "SPY", True), ("QQQ", "QQQ", True)):
+        status, ctype, body, err = fetch_raw(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{sym}.json", timeout=config.OPTIONS_TIMEOUT, headers=ua)
+        tag, bad = f"us_options:{und}", ("no_new_data" if optional else "failure")
+        if status != 200:
+            log(tag, bad, detail=_clip(f"抓取失敗：HTTP {status} {err}"))
+            time.sleep(1)
+            continue
+        try:
+            j = json.loads(body.decode("utf-8-sig"))
+        except (ValueError, UnicodeDecodeError):
+            log(tag, bad, detail=_clip(f"不是 JSON（{ctype}）：{body[:80]!r}"))
+            continue
+        summary, strikes, perr = parse_options_chain(j, und)
+        if perr:
+            log(tag, bad, detail=_clip(perr))
+        else:
+            pcr = summary["put_oi"] / summary["call_oi"] if summary["call_oi"] else None
+            log(tag, "success", as_of=summary["as_of"], detail=f"現價 {summary['spot']}｜IV30 {summary['iv30']}｜買權 OI {summary['call_oi']:,}、賣權 OI {summary['put_oi']:,}（PCR {pcr:.2f}）｜履約價 {len(strikes)} 檔｜合約 {summary['n_contracts']:,} 檔")
+            out.append({"summary": summary, "strikes": strikes})
+        time.sleep(1)
+    return out
+
+
+def us_options_job(dry_run=False):
+    """美股選擇權專用工作（台北時間週二到週六 20:45）：只跑 M20，把摘要與履約價未平倉量寫進資料庫。"""
+    res = _run_module("M20", "美股選擇權快照（Cboe）", us_options_snapshot) or []
+    persist_extra(dry_run, [("us_options_summary", [r["summary"] for r in res], "underlying,as_of"),
+                            ("us_options_strikes", [row for r in res for row in r["strikes"]], "underlying,as_of,strike")])
+    return {"job": "us_options", "underlyings": [r["summary"]["underlying"] for r in res]}
+
+
 def tw_events_job(dry_run=False):
     """傍晚專用工作：只跑台股法說會（M11）。
     原因：證交所、櫃買中心的「每日重大訊息」只放當天的公告，而公司常在收盤後才發法說會公告（例如 15:22）。
@@ -3459,6 +3641,8 @@ def run_job(job, dry_run=False):
     CURRENT_JOB = job
     if job == "tw_events":                                        # 傍晚專用：只查法說會，不碰其他資料
         return tw_events_job(dry_run)
+    if job == "us_options":                                       # 美股選擇權快照專用
+        return us_options_job(dry_run)
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
     inst_rows = margin_rows = futures_rows = basis_rows = price_rows = cot_rows = putcall_rows = earnings_rows = None
 
@@ -3535,6 +3719,7 @@ def run_job(job, dry_run=False):
         extra.append(("tw_exright_events", _run_module("M15", "台股除權息預告（上市、上櫃）", tw_exright_preview) or [], "market,code,event_date"))
         if not dry_run:
             extra.append(("tw_exright_events", _run_module("M16", "歷史除權息（含參考價）", tw_exright_history) or [], "market,code,event_date"))
+            extra.append(("tw_margin_ratio", _run_module("M21", "上市融資維持率估算", tw_margin_ratio_est) or [], "as_of"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
     if job == "tw_backfill":

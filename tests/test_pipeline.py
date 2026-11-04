@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -3034,9 +3034,9 @@ def test_workflow_schedules_evening_events_job_and_every_cron_maps_to_a_job():
     import re
     y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
     crons = re.findall(r'- cron: "([^"]+)"', y)
-    mapped = dict(re.findall(r'"([0-9*/ ]+)"\)\s+echo "job=(\w+)"', y))
+    mapped = dict(re.findall(r'"([0-9*/ ,\-]+)"\)\s+echo "job=(\w+)"', y))
     assert set(crons) == set(mapped), f"每個排程都要有對應的工作：{set(crons) ^ set(mapped)}"
-    assert mapped["30 12 * * *"] == "tw_events" and mapped["15 15 * * *"] == "tw_events"
+    assert mapped["30 12 * * *"] == "tw_events" and mapped["15 15 * * *"] == "tw_events" and mapped["45 12 * * 2-6"] == "us_options", "美股選擇權快照：週二到週六 20:45（台北時間）"
     assert "tw_events" in re.search(r"options: \[([^\]]+)\]", y).group(1)
     assert all(j in config.JOBS for j in mapped.values()) and len(crons) == len(set(crons))
 
@@ -3203,6 +3203,210 @@ def test_workflow_uses_node24_action_versions():
     y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
     uses = dict(__import__("re").findall(r"uses: (actions/[\w-]+)@v(\d+)", y))
     assert int(uses["actions/checkout"]) >= 6 and int(uses["actions/setup-python"]) >= 6 and int(uses["actions/upload-artifact"]) >= 6, uses
+
+
+STOCK_FIELDS = ["代號", "名稱", "買進", "賣出", "現金償還", "前日餘額", "今日餘額", "次一營業日限額", "買進", "賣出", "現券償還", "前日餘額", "今日餘額", "次一營業日限額", "資券互抵", "註記"]
+
+
+def stock_margin_rows(n=200, units=50000, bad_identity=0):
+    rows = []
+    for i in range(n):
+        today = units + (7 if i < bad_identity else 0)                                              # 故意讓一部分列的「前日＋買進－賣出－償還＝今日」對不上
+        rows.append([f"{1100 + i}", f"股{i}", "2,000", "1,000", "0", f"{units - 1000:,}", f"{today:,}", "999,999", "0", "0", "0", "0", "0", "999,999", "0", " "])
+    return rows
+
+
+def margin_all_payload(stock_rows=None, summary_rows=None, date_str=None, stat="OK"):
+    return {"stat": stat, "date": date_str or ymd(), "tables": [{"title": "信用交易統計", "fields": MARGIN_FIELDS, "data": summary_rows or MARGIN_ROWS},
+                                                              {"title": "融資融券彙總", "fields": STOCK_FIELDS, "data": stock_rows if stock_rows is not None else stock_margin_rows()}]}
+
+
+def day_all_payload(n=200, price=140.0, date_str=None, drop=0):
+    d = date_str or ymd()
+    roc = f"{int(d[:4]) - 1911}{d[4:]}"
+    return [{"Date": roc, "Code": f"{1100 + i}", "Name": f"股{i}", "ClosingPrice": ("" if i < drop else f"{price}")} for i in range(n)]
+
+
+def _ratio_env(margin, px):
+    def fj(url, **k):
+        if "MI_MARGN" in url and "selectType=ALL" in url: return margin
+        if url.endswith("STOCK_DAY_ALL"): return px
+        raise AssertionError(url)
+    return mock.patch.object(fetch, "fetch_json", side_effect=fj)
+
+
+def test_margin_ratio_est_computes_market_value_over_loan_with_matching_dates():
+    reset()
+    with _ratio_env((margin_all_payload(), ""), (day_all_payload(), "")):
+        rows = REAL["tw_margin_ratio_est"]()
+    loan = 633910848 * 1000
+    exp = 200 * 50000 * 1000 * 140.0 / loan * 100
+    assert len(rows) == 1 and rows[0]["as_of"] == twse_iso(ymd()) and abs(rows[0]["est_ratio"] - round(exp, 2)) < 0.011, (rows, exp)
+    assert rows[0]["n_stocks"] == 200 and rows[0]["n_missing"] == 0 and rows[0]["margin_loan"] == loan and "不是官方整戶擔保維持率" in rows[0]["source"]
+    lg = [x for x in fetch.LOG if x["source"] == "tw_margin_ratio"][0]
+    assert lg["status"] == "success" and "估算維持率" in lg["detail"]
+
+
+def twse_iso(ymd_s): return f"{ymd_s[:4]}-{ymd_s[4:6]}-{ymd_s[6:]}"
+
+
+def test_margin_ratio_est_refuses_mismatched_dates_missing_prices_and_bad_tables():
+    def last(): return [x for x in fetch.LOG if x["source"] == "tw_margin_ratio"][-1]
+    reset()
+    with _ratio_env((margin_all_payload(), ""), (day_all_payload(date_str=ymd(-1)), "")):                      # 收盤價是昨天的
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "no_new_data" and "兩天不一致" in last()["detail"]
+    reset()
+    with _ratio_env((margin_all_payload(), ""), (day_all_payload(drop=20), "")):                                # 10% 的股票查不到收盤價
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "failure" and "超過 5%" in last()["detail"]
+    reset()
+    with _ratio_env((margin_all_payload(), ""), (day_all_payload(drop=8), "")):                                 # 4% 在容許範圍內
+        rows = REAL["tw_margin_ratio_est"]()
+    assert rows and rows[0]["n_missing"] == 8 and rows[0]["n_stocks"] == 192
+    reset()
+    with _ratio_env((margin_all_payload(stock_margin_rows(bad_identity=60)), ""), (day_all_payload(), "")):    # 30% 的列對不上：欄位位置可能不對
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "failure" and "通過" in last()["detail"]
+    reset()
+    bad_summary = [list(x) for x in MARGIN_ROWS]; bad_summary[2][5] = "700,000,000"
+    with _ratio_env((margin_all_payload(summary_rows=bad_summary), ""), (day_all_payload(), "")):
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "failure" and "對不上" in last()["detail"]
+    reset()
+    with _ratio_env((margin_all_payload(), ""), (day_all_payload(price=9000.0), "")):                           # 估出來 14,000% 之類：拒收
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "failure" and "不在合理範圍" in last()["detail"]
+    reset()
+    with _ratio_env(({"stat": "很抱歉，沒有符合條件的資料"}, ""), ([], "")):
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "no_new_data"
+    reset()
+    with _ratio_env((None, "HTTP 403"), ([], "")):
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "failure"
+    reset()
+    with _ratio_env((margin_all_payload(), ""), (None, "HTTP 500")):
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert last()["status"] == "failure" and "收盤價抓取失敗" in last()["detail"]
+    reset()
+    wrong = margin_all_payload(); wrong["tables"][1]["fields"] = ["代號", "名稱", "x"] + STOCK_FIELDS[3:]
+    with _ratio_env((wrong, ""), (day_all_payload(), "")):
+        assert REAL["tw_margin_ratio_est"]() == []
+    assert "欄位與預期不符" in last()["detail"]
+
+
+def _chain(as_of, spot=7500.0, iv30=0.145, extra_fillers=120, last_trade=None):
+    e = lambda n: (as_of + timedelta(days=n)).strftime("%y%m%d")
+    mk = lambda root, exp, cp, k, oi: {"option": f"{root}{exp}{cp}{int(k * 1000):08d}", "iv": 0.2, "open_interest": oi, "volume": 0, "bid": 1, "ask": 2}
+    opts = [mk("SPXW", e(7), "C", 7400, 100), mk("SPXW", e(7), "P", 7400, 900), mk("SPXW", e(7), "C", 7500, 500), mk("SPXW", e(7), "P", 7500, 600), mk("SPXW", e(7), "C", 7600, 700), mk("SPXW", e(7), "P", 7600, 50),
+            mk("SPX", e(40), "C", 7500, 1000), mk("SPX", e(40), "P", 7500, 2000),                      # 40 天內：和上面同一履約價的要加總
+            mk("SPX", e(90), "P", 7400, 5000),                                                          # 90 天後：不進履約價列，但算進總量
+            mk("SPX", e(7), "C", 9000, 10)]                                                             # 超出 ±15%：不進履約價列，但算進總量
+    opts += [mk("SPX", e(90), "C", 9100 + i * 5, 1) for i in range(extra_fillers)]
+    lt = last_trade or f"{as_of.isoformat()}T16:00:00"
+    return {"timestamp": "2026-11-03 13:03:16", "symbol": "_SPX", "data": {"current_price": spot, "iv30": iv30, "iv30_change": -0.12, "last_trade_time": lt, "options": opts}}
+
+
+def _last_weekday(d):
+    while d.weekday() >= 5: d -= timedelta(days=1)
+    return d
+
+
+def test_parse_options_chain_aggregates_strikes_within_45_days_and_band_and_all_expiries_for_totals():
+    as_of = _last_weekday(TODAY - timedelta(days=1))
+    summ, strikes, err = fetch.parse_options_chain(_chain(as_of), "SPX", today=TODAY)
+    assert err is None and summ["as_of"] == as_of.isoformat() and summ["spot"] == 7500.0 and summ["iv30"] == 14.5 and summ["iv30_change"] == -0.12
+    assert summ["call_oi"] == 100 + 500 + 700 + 1000 + 10 + 120 and summ["put_oi"] == 900 + 600 + 50 + 2000 + 5000, "總量包含所有到期日、所有履約價"
+    assert summ["n_contracts"] == 10 + 120 and summ["source"] == "Cboe 延遲選擇權鏈"
+    by = {r["strike"]: r for r in strikes}
+    assert sorted(by) == [7400.0, 7500.0, 7600.0], "只收 45 天內到期、現價 ±15% 的履約價"
+    assert (by[7500.0]["call_oi"], by[7500.0]["put_oi"]) == (500 + 1000, 600 + 2000), "同一履約價把各到期日加總"
+    assert (by[7400.0]["call_oi"], by[7400.0]["put_oi"]) == (100, 900), "90 天後的 5000 不能算進來"
+    assert all(r["underlying"] == "SPX" and r["as_of"] == as_of.isoformat() for r in strikes)
+    for raw, exp in ((14.5, 14.5), (0.145, 14.5), (0.5, 50.0), (0.01, None), (500, None), (None, None), ("abc", None)):
+        sm, _, e = fetch.parse_options_chain(_chain(as_of, iv30=raw), "SPX", today=TODAY)
+        assert e is None and sm["iv30"] == exp, (raw, sm["iv30"])
+
+
+def test_parse_options_chain_rejects_bad_dates_prices_and_thin_chains():
+    as_of = _last_weekday(TODAY - timedelta(days=1))
+    sat = as_of
+    while sat.weekday() != 5: sat += timedelta(days=1)
+    for chain, today, frag in ((_chain(sat), sat, "不是最近 5 天內的平日"), (_chain(as_of - timedelta(days=10)), TODAY, "不是最近 5 天內的平日"), (_chain(as_of, spot=50.0), TODAY, "不在合理範圍"),
+                               (_chain(as_of, last_trade="昨天"), TODAY, "看不懂"), (_chain(as_of, extra_fillers=0), TODAY, "只有 10 檔"), ({"data": {}}, TODAY, "不在合理範圍"),
+                               (_chain(as_of, last_trade="2026-13-45T00:00:00"), TODAY, "不合法")):
+        summ, strikes, err = fetch.parse_options_chain(chain, "SPX", today=today)
+        assert summ is None and strikes == [] and frag in err, (frag, err)
+
+
+def test_us_options_snapshot_core_failure_optional_quiet_and_job_persists_both_tables():
+    reset()
+    as_of = _last_weekday(date.today() - timedelta(days=1))
+    good = json.dumps(_chain(as_of)).encode()
+    spy = json.dumps(_chain(as_of, spot=750.0)).encode()
+    def raw(url, timeout=None, headers=None):
+        assert timeout == config.OPTIONS_TIMEOUT
+        if "_SPX" in url: return 200, "application/json", good, ""
+        if "SPY" in url: return 200, "application/json", spy, ""
+        return 403, "text/html", b"blocked", "HTTP 403"                                              # QQQ 被擋
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        res = REAL["us_options_snapshot"]()
+    assert [r["summary"]["underlying"] for r in res] == ["SPX", "SPY"] and len(res[0]["strikes"]) == 3
+    st = {x["source"]: x for x in fetch.LOG}
+    assert st["us_options:SPX"]["status"] == "success" and "PCR" in st["us_options:SPX"]["detail"] and st["us_options:SPY"]["status"] == "success"
+    assert st["us_options:QQQ"]["status"] == "no_new_data" and "HTTP 403" in st["us_options:QQQ"]["detail"], "選用的標的被擋只記沒有資料"
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["us_options_snapshot"]() == []
+    st = {x["source"]: x["status"] for x in fetch.LOG}
+    assert st["us_options:SPX"] == "failure" and st["us_options:SPY"] == "no_new_data" and st["us_options:QQQ"] == "no_new_data", "核心來源失敗要記失敗；選用的不能讓工作變紅"
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>nope</html>", "")), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["us_options_snapshot"]() == []
+    assert "不是 JSON" in [x for x in fetch.LOG if x["source"] == "us_options:SPX"][0]["detail"]
+
+
+def test_run_job_us_options_writes_summary_and_strikes_and_isolates_failure():
+    reset()
+    res = [{"summary": {"underlying": "SPX", "as_of": D(1), "spot": 7500.0}, "strikes": [{"underlying": "SPX", "as_of": D(1), "strike": 7400.0, "call_oi": 1, "put_oi": 2}, {"underlying": "SPX", "as_of": D(1), "strike": 7500.0, "call_oi": 3, "put_oi": 4}]}]
+    got = []
+    with mock.patch.object(fetch, "us_options_snapshot", return_value=res), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append((d_, [(n, r, c) for n, r, c in tables]))), \
+            mock.patch.object(fetch, "persist") as pr, mock.patch.object(fetch, "twse_market") as tm:
+        out = fetch.run_job("us_options", dry_run=False)
+        pr.assert_not_called(); tm.assert_not_called()
+    assert out == {"job": "us_options", "underlyings": ["SPX"]}
+    assert got[0][0] is False and got[0][1][0] == ("us_options_summary", [res[0]["summary"]], "underlying,as_of") and got[0][1][1] == ("us_options_strikes", res[0]["strikes"], "underlying,as_of,strike")
+    assert {x["source"]: x["status"] for x in fetch.LOG}["module:M20"] == "success"
+    reset(); got.clear()
+    with mock.patch.object(fetch, "us_options_snapshot", side_effect=RuntimeError("boom")), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append(tables)):
+        out = fetch.run_job("us_options", dry_run=True)
+    assert out["underlyings"] == [] and {x["source"]: x["status"] for x in fetch.LOG}["module:M20"] == "failure" and all(r == [] for _, r, _ in got[0]), "壞了不寫任何東西"
+    assert "us_options" in config.JOBS
+
+
+def test_run_job_daily_persists_margin_ratio_estimate_and_isolates_m21():
+    reset()
+    row = {"as_of": D(1), "est_ratio": 148.2, "margin_value": 9.4e11, "margin_loan": 6.3e11, "n_stocks": 1100, "n_missing": 3, "source": "自行估算"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(job, dry, **kw):
+        got = []
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+                  mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "tw_margin_ratio_est", **(kw or {"return_value": [row]})),
+                  mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in patches: p_.start()
+        try:
+            fetch.run_job(job, dry_run=dry)
+        finally:
+            for p_ in patches: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    for job in ("tw_close", "full"):
+        reset(); tables, st = go(job, False)
+        assert ("tw_margin_ratio", [row], "as_of") in tables and st["module:M21"] == "success", job
+    reset(); tables, st = go("tw_close", True)
+    assert "module:M21" not in st
+    reset(); tables, st = go("tw_close", False, side_effect=RuntimeError("boom"))
+    assert st["module:M21"] == "failure" and "module:M08" in st
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
