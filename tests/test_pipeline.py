@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -3465,6 +3465,144 @@ def test_http_helpers_ask_for_gzip_decompress_it_and_survive_truncated_downloads
     with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=lambda req, timeout=None: (_ for _ in ()).throw(http.client.IncompleteRead(b"x", 5))), mock.patch.object(fetch.time, "sleep"):
         data, err = fetch.fetch_json("https://x/y")
     assert data is None and "IncompleteRead" in err, "三次都被切斷：回傳失敗與原因，不拋例外"
+
+
+def _txo(ds, cm, strike, cp, oi, session="一般", contract="TXO"):
+    return {"Date": ds, "Contract": contract, "ContractMonth(Week)": cm, "StrikePrice": str(strike), "CallPut": cp, "Open": "-", "High": "-", "Low": "-", "Close": "-", "Volume": "0",
+            "SettlementPrice": "100", "OpenInterest": str(oi), "BestBid": "-", "BestAsk": "-", "TradingSession": session}
+
+
+def _tx(ds, cm, settle, oi, session="一般", contract="TX"):
+    return {"Date": ds, "Contract": contract, "ContractMonth(Week)": cm, "Open": "1", "High": "1", "Low": "1", "Last": "1", "Volume": "10", "SettlementPrice": str(settle), "OpenInterest": str(oi), "TradingSession": session}
+
+
+def _tw_chain(ad):
+    ds, ym = ad.strftime("%Y%m%d"), ad.strftime("%Y%m")
+    nxt = f"{ad.year + (ad.month == 12)}{(ad.month % 12) + 1:02d}"
+    far = f"{ad.year + (ad.month + 3 > 12)}{((ad.month + 2) % 12) + 1:02d}"
+    opt, exp_call, exp_put = [], 0, 0
+    def add(cm, k, cp, oi, **kw):
+        nonlocal exp_call, exp_put
+        opt.append(_txo(ds, cm, k, cp, oi, **kw))
+        if kw.get("session", "一般") == "一般" and kw.get("contract", "TXO") == "TXO":
+            if cp == "買權": exp_call += oi
+            else: exp_put += oi
+    for k in (40000, 40500, 41000, 41500, 42000):                                          # 本月、±20% 內
+        add(ym, k, "買權", 100 + k // 1000); add(ym, k, "賣權", 200 + k // 1000)
+    add(ym + "W2", 41000, "買權", 50); add(ym + "F1", 41000, "賣權", 70)                      # 週選：同一履約價加總
+    add(nxt, 41000, "買權", 1000); add(nxt, 41000, "賣權", 2000)                              # 下個月：也算
+    add(far, 41000, "買權", 9000); add(far, 41000, "賣權", 8000)                              # 更遠的月份：只進總量
+    add(ym, 55000, "買權", 700)                                                              # 超出 ±20%：只進總量
+    for i in range(210): add(far, 10000 + i * 100, "賣權" if i % 2 else "買權", 5)             # 湊足 200 列以上（只進總量）
+    opt += [_txo(ds, ym, 41000, "買權", 999999, session="盤後"), _txo(ds, ym, 41000, "買權", 888, contract="TEO"), _txo(ds, ym, "-", "買權", 5), _txo(ds, ym, 41000, "亂寫", 5), _txo(ds, ym, 41000, "買權", "-")]
+    fut = [_tx(ds, ym, 41000, 80000), _tx(ds, nxt, 41100, 20000), _tx(ds, far, 41300, 5000), _tx(ds, f"{ym}/{nxt}", 100, 7777), _tx(ds, ym, 40900, 1, session="盤後"), _tx(ds, ym, 123, 55555, contract="MTX")]
+    return opt, fut, exp_call, exp_put
+
+
+def test_parse_taifex_snapshot_aggregates_regular_session_txo_and_tx_only():
+    ad = _last_weekday(TODAY - timedelta(days=1))
+    opt, fut, exp_call, exp_put = _tw_chain(ad)
+    summ, strikes, err = fetch.parse_taifex_snapshot(opt, fut, today=TODAY)
+    assert err is None and summ["as_of"] == ad.isoformat() and summ["fut_settle"] == 41000 and summ["fut_oi"] == 80000 + 20000 + 5000, "近月結算價；未平倉量合計各月份，不含價差、盤後、小台"
+    assert summ["call_oi"] == exp_call and summ["put_oi"] == exp_put
+    by = {r["strike"]: r for r in strikes}
+    assert sorted(by) == [40000, 40500, 41000, 41500, 42000], "只收本月與下月、現價 ±20% 內的履約價"
+    assert by[41000]["call_oi"] == (100 + 41) + 50 + 1000 and by[41000]["put_oi"] == (200 + 41) + 70 + 2000, "週選與下個月的同一履約價要加總：" + str(by[41000])
+    assert 9000 not in [r["call_oi"] for r in strikes] and all(r["as_of"] == ad.isoformat() for r in strikes), "更遠月份、超出範圍的不進履約價列"
+    assert summ["n_rows"] == len([r for r in opt if r["TradingSession"] == "一般" and r["Contract"] == "TXO" and r["StrikePrice"] != "-" and r["CallPut"] in ("買權", "賣權") and r["OpenInterest"] != "-"])
+
+
+def test_parse_taifex_snapshot_rejects_mismatched_stale_thin_and_malformed_data():
+    ad = _last_weekday(TODAY - timedelta(days=1))
+    opt, fut, _, _ = _tw_chain(ad)
+    def err(o, f, today=TODAY): return fetch.parse_taifex_snapshot(o, f, today=today)[2]
+    other = ad - timedelta(days=1)
+    assert "對不上" in err(opt, [dict(r, Date=other.strftime("%Y%m%d")) for r in fut])
+    sat = ad
+    while sat.weekday() != 5: sat += timedelta(days=1)
+    o2, f2, _, _ = _tw_chain(sat)
+    assert "不是最近 5 天內的平日" in err(o2, f2, today=sat)
+    o3, f3, _, _ = _tw_chain(ad - timedelta(days=12))
+    assert "不是最近 5 天內的平日" in err(o3, f3)
+    assert "只有" in err(opt[:12], fut) and "格式非預期" in err([], fut) and "格式非預期" in err(opt, None)
+    assert "欄位與預期不符" in err([{"Date": "x"}], fut) and "欄位與預期不符" in err(opt, [{"Date": "x", "Contract": "TX"}])
+    assert "找不到台指選擇權" in err([r for r in opt if r["Contract"] != "TXO"], fut) and "找不到台指選擇權" in err(opt, [r for r in fut if r["Contract"] != "TX"])
+    assert "不合理" in err(opt, [dict(r, SettlementPrice="12") if r["Contract"] == "TX" else r for r in fut])
+    assert "不合理" in err(opt, [dict(r, OpenInterest="0") if r["Contract"] == "TX" else r for r in fut])
+    assert "找不到近月台指期" in err(opt, [_tx(ad.strftime("%Y%m%d"), "200001", 41000, 5)]), "只剩已經過期的月份：沒有近月可用"
+
+def test_tw_options_snapshot_module_success_and_failures():
+    reset()
+    ad = _last_weekday(date.today() - timedelta(days=1))
+    opt, fut, _, _ = _tw_chain(ad)
+    def fj(url, **k):
+        if url == config.TAIFEX_OPT_URL: return opt, ""
+        if url == config.TAIFEX_DAILY_URL: return fut, ""
+        raise AssertionError(url)
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        res = REAL["tw_options_snapshot"]()
+    assert len(res) == 1 and res[0]["summary"]["fut_settle"] == 41000 and len(res[0]["strikes"]) == 5
+    lg = [x for x in fetch.LOG if x["source"] == "tw_options"][0]
+    assert lg["status"] == "success" and "近月台指期結算價 41,000" in lg["detail"] and "PCR" in lg["detail"] and lg["as_of"] == ad.isoformat()
+    reset()
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda url, **k: (None, "HTTP 403") if url == config.TAIFEX_OPT_URL else (fut, "")):
+        assert REAL["tw_options_snapshot"]() == []
+    assert fetch.LOG[-1]["status"] == "failure" and "選擇權 HTTP 403" in fetch.LOG[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda url, **k: ([{"x": 1}], "")):
+        assert REAL["tw_options_snapshot"]() == []
+    assert fetch.LOG[-1]["status"] == "failure" and "欄位與預期不符" in fetch.LOG[-1]["detail"]
+
+
+def test_tw_pcr_official_parses_validates_ratios_and_reports_failures():
+    reset()
+    d = lambda n: (date.today() - timedelta(days=n)).strftime("%Y%m%d")
+    good = {"Date": d(1), "PutVolume": "148092", "CallVolume": "157966", "PutCallVolumeRatio%": "93.75", "PutOI": "69770", "CallOI": "113305", "PutCallOIRatio%": "61.58"}
+    rows = [good, dict(good, Date=d(2), PutCallOIRatio="x", **{"PutCallOIRatio%": "99.99"}),                  # 比率和自己的數字對不上
+            dict(good, Date="亂碼"), dict(good, Date=d(3), CallVolume="0"), dict(good, Date=d(400)), dict(good, Date=d(4), PutOI="-"), "壞列", dict(good, Date=d(5), PutVolume="150000", **{"PutCallVolumeRatio%": "94.95"})]
+    with mock.patch.object(fetch, "fetch_json", return_value=(rows, "")):
+        out = REAL["tw_pcr_official"]()
+    assert [r["as_of"] for r in out] == [(date.today() - timedelta(days=1)).isoformat(), (date.today() - timedelta(days=5)).isoformat()], [r["as_of"] for r in out]
+    assert out[0]["pcr_oi"] == 61.58 and out[0]["pcr_vol"] == 93.75 and out[0]["put_oi"] == 69770 and out[0]["call_vol"] == 157966 and out[0]["source"].startswith("期交所")
+    lg = [x for x in fetch.LOG if x["source"] == "tw_pcr"][0]
+    assert lg["status"] == "success" and "2 天（略過 5 列）" in lg["detail"] and "61.58%" in lg["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")):
+        assert REAL["tw_pcr_official"]() == []
+    assert fetch.LOG[-1]["status"] == "failure"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=([{"foo": 1}], "")):
+        assert REAL["tw_pcr_official"]() == []
+    assert fetch.LOG[-1]["status"] == "failure" and "沒有通過驗證" in fetch.LOG[-1]["detail"]
+
+
+def test_run_job_daily_persists_tw_options_and_pcr_and_isolates_them():
+    reset()
+    res = [{"summary": {"as_of": D(1), "fut_settle": 41000, "fut_oi": 100000, "call_oi": 5, "put_oi": 4, "n_rows": 300, "source": "x"}, "strikes": [{"as_of": D(1), "strike": 41000, "call_oi": 3, "put_oi": 2}, {"as_of": D(1), "strike": 41500, "call_oi": 1, "put_oi": 1}]}]
+    pcr = [{"as_of": D(1), "put_vol": 1, "call_vol": 2, "pcr_vol": 50.0, "put_oi": 3, "call_oi": 4, "pcr_oi": 75.0, "source": "x"}]
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(job, dry, **kw):
+        got = []
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+                  mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "tw_options_snapshot", **(kw.get("opt") or {"return_value": res})),
+                  mock.patch.object(fetch, "tw_pcr_official", **(kw.get("pcr") or {"return_value": pcr})),
+                  mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append({n: (r, c) for n, r, c in tables}))]
+        for p_ in patches: p_.start()
+        try:
+            fetch.run_job(job, dry_run=dry)
+        finally:
+            for p_ in patches: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    for job in ("tw_close", "full"):
+        reset(); tables, st = go(job, False)
+        assert tables["tw_options_summary"] == ([res[0]["summary"]], "as_of") and tables["tw_options_strikes"] == (res[0]["strikes"], "as_of,strike") and tables["tw_pcr_official"] == (pcr, "as_of"), job
+        assert st["module:M22"] == "success" and st["module:M23"] == "success"
+    reset(); tables, st = go("tw_close", True)
+    assert "module:M22" not in st and "module:M23" not in st, "dry-run 不碰"
+    reset(); tables, st = go("tw_close", False, opt={"side_effect": RuntimeError("boom")})
+    assert st["module:M22"] == "failure" and st["module:M23"] == "success" and tables["tw_options_summary"][0] == [] and tables["tw_pcr_official"][0] == pcr, "選擇權壞了不影響官方 PCR"
+    reset(); tables, st = go("tw_close", False, pcr={"side_effect": RuntimeError("boom")})
+    assert st["module:M23"] == "failure" and st["module:M22"] == "success" and "module:M08" in st
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v51"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v52"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2778,6 +2778,136 @@ def tw_exright_preview():
     return out
 
 
+_TXO_CM = re.compile(r"^(\d{6})(?:[A-Z]\d)?$")
+
+
+def _taifex_date(v):
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", str(v or "").strip())
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def parse_taifex_snapshot(opt_rows, fut_rows, today=None, band=0.20):
+    """期交所 OpenAPI 的選擇權每日行情（DailyMarketReportOpt）與期貨每日行情（DailyMarketReportFut）→ ({摘要}, [履約價列], 錯誤原因)。
+    只用「一般」交易時段的列（盤後的列不重複計算）。選擇權只看台指選擇權（TXO），期貨只看大台（TX）的單一月份（價差組合不算）。
+    資料日：兩份資料最多的日期必須相同，而且是最近 5 天內的平日。
+    摘要：近月台指期結算價、台指期各月份未平倉量合計、台指選擇權買權與賣權未平倉量（所有到期日）。
+    履約價列：只收『本月與下個月』到期（含週選）的合約、履約價在近月台指期結算價 ±band 內，同一履約價把買權、賣權未平倉量各自加總。
+    （週選的實際到期日不在這份資料裡，所以用月份分組，不另外推算到期日。）"""
+    today = today or date.today()
+    for name, rows, need in (("選擇權", opt_rows, ("Date", "Contract", "ContractMonth(Week)", "StrikePrice", "CallPut", "OpenInterest")),
+                             ("期貨", fut_rows, ("Date", "Contract", "ContractMonth(Week)", "SettlementPrice", "OpenInterest"))):
+        if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+            return None, [], f"{name}每日行情格式非預期"
+        miss = [k for k in need if k not in rows[0]]
+        if miss:
+            return None, [], f"{name}每日行情欄位與預期不符：缺 {miss}"
+    regular = lambda r: str(r.get("TradingSession", "")).strip() in ("一般", "")
+    opt = [r for r in opt_rows if str(r.get("Contract", "")).strip() == "TXO" and regular(r)]
+    tx = [r for r in fut_rows if str(r.get("Contract", "")).strip() == "TX" and regular(r) and re.fullmatch(r"\d{6}", str(r.get("ContractMonth(Week)", "")).strip())]
+    if not opt or not tx:
+        return None, [], f"找不到台指選擇權（{len(opt)} 列）或台指期（{len(tx)} 列）的一般時段資料"
+    d1 = Counter(str(r.get("Date", "")).strip() for r in opt).most_common(1)[0][0]
+    d2 = Counter(str(r.get("Date", "")).strip() for r in tx).most_common(1)[0][0]
+    if d1 != d2:
+        return None, [], f"選擇權的資料日是 {d1}，期貨是 {d2}，兩份對不上，不採用"
+    as_of = _taifex_date(d1)
+    if as_of is None or as_of.weekday() >= 5 or not (today - timedelta(days=5) <= as_of <= today):
+        return None, [], f"資料日 {d1} 不是最近 5 天內的平日，不採用"
+    ym = as_of.strftime("%Y%m")
+    nxt = f"{as_of.year + (as_of.month == 12)}{(as_of.month % 12) + 1:02d}"
+    fut_pts, fut_oi = [], 0
+    for r in tx:
+        m_, settle, oi = str(r["ContractMonth(Week)"]).strip(), parse_number(r.get("SettlementPrice")), parse_number(r.get("OpenInterest"))
+        if oi is not None and oi >= 0:
+            fut_oi += int(oi)
+        if settle and settle > 0:
+            fut_pts.append((m_, settle))
+    near = sorted(p for p in fut_pts if p[0] >= ym)
+    if not near:
+        return None, [], "找不到近月台指期的結算價"
+    fut_settle = near[0][1]
+    if not (5000 <= fut_settle <= 100000) or fut_oi <= 0:
+        return None, [], f"台指期結算價 {fut_settle} 或未平倉量 {fut_oi} 不合理"
+    call_tot = put_tot = n = 0
+    strikes = {}
+    for r in opt:
+        k, cp, oi = parse_number(r.get("StrikePrice")), str(r.get("CallPut", "")).strip(), parse_number(r.get("OpenInterest"))
+        cm = _TXO_CM.match(str(r.get("ContractMonth(Week)", "")).strip())
+        if not k or k <= 0 or cp not in ("買權", "賣權") or oi is None or oi < 0 or not cm:
+            continue
+        n += 1
+        oi = int(oi)
+        if cp == "買權":
+            call_tot += oi
+        else:
+            put_tot += oi
+        if cm.group(1) in (ym, nxt) and abs(k / fut_settle - 1) <= band and oi > 0:
+            row = strikes.setdefault(k, {"as_of": as_of.isoformat(), "strike": k, "call_oi": 0, "put_oi": 0})
+            row["call_oi" if cp == "買權" else "put_oi"] += oi
+    if n < 200 or call_tot <= 0 or put_tot <= 0:
+        return None, [], f"能解析的台指選擇權只有 {n} 列、買權 OI {call_tot}、賣權 OI {put_tot}，不採用"
+    summary = {"as_of": as_of.isoformat(), "fut_settle": fut_settle, "fut_oi": fut_oi, "call_oi": call_tot, "put_oi": put_tot, "n_rows": n, "source": "期交所 OpenAPI（選擇權與期貨每日行情，一般時段）"}
+    return summary, sorted(strikes.values(), key=lambda r: r["strike"]), None
+
+
+def tw_options_snapshot():
+    """模組 M22：台指選擇權（TXO）與台指期（TX）的每日快照（期交所 OpenAPI）。每天存摘要與履約價未平倉量，靠每天快照比較 OI 變動。
+    期交所的每日行情在收盤後更新，跟台指期基差同一個時間點（tw_close）抓。"""
+    opt, e1 = fetch_json(config.TAIFEX_OPT_URL)
+    fut, e2 = fetch_json(config.TAIFEX_DAILY_URL)
+    if opt is None or fut is None:
+        log("tw_options", "failure", detail=_clip(f"抓取失敗：選擇權 {e1 or '好'}；期貨 {e2 or '好'}"))
+        return []
+    summary, strikes, err = parse_taifex_snapshot(opt, fut)
+    if err:
+        log("tw_options", "failure", detail=_clip(err))
+        return []
+    pcr = summary["put_oi"] / summary["call_oi"] * 100
+    log("tw_options", "success", as_of=summary["as_of"], detail=f"近月台指期結算價 {summary['fut_settle']:,.0f}｜台指期未平倉量合計 {summary['fut_oi']:,}｜選擇權買權 OI {summary['call_oi']:,}、賣權 OI {summary['put_oi']:,}（PCR {pcr:.1f}%）｜履約價 {len(strikes)} 檔（本月與下月、±20%）")
+    return [{"summary": summary, "strikes": strikes}]
+
+
+def parse_taifex_pcr(rows, today=None):
+    """期交所臺指選擇權 Put/Call 比 → [列]。官方一次給約 18 天（成交量比與未平倉量比，單位 %）。
+    每列驗證：比率必須和自己的賣權、買權數字對得上（誤差 1 個百分點內），否則略過那一列（代表欄位意思和我們以為的不同）。"""
+    today = today or date.today()
+    out, bad = [], 0
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        d_ = _taifex_date(r.get("Date"))
+        pv, cv, po, co = (parse_number(r.get(k)) for k in ("PutVolume", "CallVolume", "PutOI", "CallOI"))
+        rv, ro = parse_number(r.get("PutCallVolumeRatio%")), parse_number(r.get("PutCallOIRatio%"))
+        if d_ is None or None in (pv, cv, po, co, rv, ro) or not (today - timedelta(days=200) <= d_ <= today) or not cv or not co:
+            bad += 1
+            continue
+        if abs(pv / cv * 100 - rv) > 1.0 or abs(po / co * 100 - ro) > 1.0 or not (0 <= rv <= 2000 and 0 <= ro <= 2000):
+            bad += 1
+            continue
+        out.append({"as_of": d_.isoformat(), "put_vol": int(pv), "call_vol": int(cv), "pcr_vol": rv, "put_oi": int(po), "call_oi": int(co), "pcr_oi": ro, "source": "期交所 OpenAPI（臺指選擇權 Put/Call 比）"})
+    return out, bad
+
+
+def tw_pcr_official():
+    """模組 M23：期交所公布的臺指選擇權 Put/Call 比（官方一次給約 18 天，所以一開始就有歷史可以比）。"""
+    rows, err = fetch_json(config.TAIFEX_PCR_URL)
+    if rows is None:
+        log("tw_pcr", "failure", detail=_clip(f"抓取失敗：{err}"))
+        return []
+    out, bad = parse_taifex_pcr(rows)
+    if not out:
+        log("tw_pcr", "failure", detail=_clip(f"{len(rows) if isinstance(rows, list) else 0} 列裡沒有通過驗證的（略過 {bad} 列）；回傳開頭 {str(rows)[:100]}"))
+        return []
+    last = max(out, key=lambda r: r["as_of"])
+    log("tw_pcr", "success", as_of=last["as_of"], detail=f"{len(out)} 天（略過 {bad} 列）；最新 PCR 未平倉量比 {last['pcr_oi']}%、成交量比 {last['pcr_vol']}%")
+    return out
+
+
 _EXR_HIST_FIELDS = {"date": "資料日期", "code": "股票代號", "name": "股票名稱", "prev": "除權息前收盤價", "ref": "除權息參考價", "kind": "權/息"}
 
 
@@ -3742,6 +3872,10 @@ def run_job(job, dry_run=False):
         if not dry_run:
             extra.append(("tw_exright_events", _run_module("M16", "歷史除權息（含參考價）", tw_exright_history) or [], "market,code,event_date"))
             extra.append(("tw_margin_ratio", _run_module("M21", "上市融資維持率估算", tw_margin_ratio_est) or [], "as_of"))
+            twopt = _run_module("M22", "台指選擇權與台指期快照", tw_options_snapshot) or []
+            extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
+            extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
+            extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
     if job == "tw_backfill":
