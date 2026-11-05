@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v52"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v53"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2396,6 +2396,50 @@ def tw_index_history():
     return out
 
 
+def tw_index_long_history(max_months=None):
+    """模組 M24：回補更早的加權指數歷史（收盤與成交金額，證交所 FMTQIK 每月一次，間隔 HIST_SLEEP 秒），最多回到 INDEX_LONG_YEARS 年前。
+    為什麼要：「下跌放量要放多少量才算止跌的可能」需要足夠多的大跌日當樣本，一年資料只有幾個，十年才有 2020、2022、2025 這幾次大跌。
+    做法：從資料庫裡最早的一天往前，每次最多 INDEX_LONG_BATCH 個月；某個月證交所沒有資料就略過；連線失敗就整批停止；
+    資料庫裡還沒有任何歷史（M05 還沒跑過）就先不做。每個月的驗證和 M05 完全一樣（日期、價格範圍、成交金額）。"""
+    max_months = max_months or config.INDEX_LONG_BATCH
+    if not sb_ready():
+        log("tw_index_long", "skipped", detail="未設定 Supabase，無法知道最早補到哪一天，不回補")
+        return []
+    got, err = sb_request("GET", "market_stats?select=as_of&source=eq.TWSE%20FMTQIK&order=as_of.asc&limit=1")
+    if got is None:
+        log("tw_index_long", "failure", detail=_clip(f"讀取最早的一天失敗：{err}"))
+        return []
+    if not got:
+        log("tw_index_long", "no_new_data", detail="資料庫裡還沒有加權指數歷史（要先跑一次 tw_close 讓 M05 寫入），先不回補")
+        return []
+    earliest = date.fromisoformat(got[0]["as_of"])
+    target = date.today().replace(day=1) - timedelta(days=int(config.INDEX_LONG_YEARS * 365))
+    y, m = earliest.year, earliest.month
+    m -= 1
+    if m == 0:
+        y, m = y - 1, 12
+    out, empty, done = [], 0, 0
+    while done < max_months and date(y, m, 1) >= target.replace(day=1):
+        rows, why = _twse_month_rows(f"{config.TWSE_FMTQIK}?response=json&date={y}{m:02d}01")
+        time.sleep(config.HIST_SLEEP)
+        if rows is None:
+            log("tw_index_long", "failure", as_of=f"{y}-{m:02d}-01", detail=_clip(f"{y}-{m:02d}：{why}；已停止本次回補，不繼續打請求"))
+            break
+        if not rows:
+            empty += 1
+        out.extend(rows)
+        done += 1
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    if out or empty or done:
+        reached = min((r["as_of"] for r in out), default=None)
+        left = max(0, (date(y, m, 1).year - target.year) * 12 + date(y, m, 1).month - target.month + 1) if date(y, m, 1) >= target.replace(day=1) else 0
+        log("tw_index_long", "success" if out else "no_new_data", as_of=reached,
+            detail=_clip(f"本次回補 {done} 個月，取得 {len(out)} 個交易日" + (f"（最早到 {reached}）" if reached else "") + (f"；{empty} 個月證交所沒有資料" if empty else "") + (f"；還有約 {left} 個月下次繼續" if left else "；已經補到目標年數")))
+    return out
+
+
 def persist_extra(dry_run, tables):
     """寫入模組產出的資料表：tables = [(表名, 列, on_conflict)]。每張表獨立，一張寫失敗不影響其他。"""
     for table, rows, conflict in tables:
@@ -3385,6 +3429,33 @@ def probe_round10():
         log("probe:twse_day_all", "no_new_data", detail=_clip(f"STOCK_DAY_ALL 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
 
 
+def probe_round11():
+    """只讀探測第十一批：1) 三率歷史的備用來源（FinMind 的財報資料：證交所開放資料只放「已公布的最新一季」，上一季會被換掉）；
+    2) Nasdaq 的公司簡介（有沒有產業 Sector／Industry，給美股持股分類用）；3) 證交所 FMTQIK 能不能取得十年前的月份。不寫入任何資料表。"""
+    rows, e = fetch_json("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockFinancialStatements&data_id=2330&start_date=2025-01-01")
+    if isinstance(rows, dict) and isinstance(rows.get("data"), list) and rows["data"]:
+        d = rows["data"]
+        types = sorted({str(r.get("type")) for r in d if isinstance(r, dict)})[:14]
+        log("probe:finmind_fin", "success", detail=_clip(f"status={rows.get('status')}｜{len(d)} 列｜日期 {min(str(r.get('date')) for r in d)} 到 {max(str(r.get('date')) for r in d)}｜欄位 {list(d[0].keys())}｜type 種類 {types}｜前 2 列 {d[:2]}"))
+    else:
+        log("probe:finmind_fin", "no_new_data", detail=_clip(f"FinMind 抓取失敗或格式非預期: {e or str(rows)[:140]}"))
+    ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "application/json"}
+    for sym in ("ORCL", "ARM"):
+        status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/company/{sym}/company-profile", timeout=config.PROBE_TIMEOUT, headers=ua)
+        if status is None:
+            log(f"probe:nasdaq_profile:{sym}", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+            continue
+        try:
+            j = json.loads(body.decode("utf-8-sig"))
+            d_ = j.get("data") or {}
+            log(f"probe:nasdaq_profile:{sym}", "success" if status == 200 and d_ else "no_new_data", detail=_clip(f"HTTP {status}｜data 欄位 {list(d_.keys())[:14] if isinstance(d_, dict) else type(d_).__name__}｜前 600 字 {json.dumps(d_, ensure_ascii=False)[:600]}"))
+        except (ValueError, UnicodeDecodeError, AttributeError, TypeError):
+            log(f"probe:nasdaq_profile:{sym}", "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜不是預期的 JSON｜開頭 {body[:100]!r}"))
+    old_month = f"{date.today().year - 10}{date.today().month:02d}01"
+    rows, why = _twse_month_rows(f"{config.TWSE_FMTQIK}?response=json&date={old_month}")
+    log("probe:fmtqik_old", "success" if rows else "no_new_data", detail=_clip(f"{old_month[:6]}：{len(rows) if rows is not None else '抓取失敗'} 個交易日｜{why or ''}｜" + (f"首尾 {rows[0]['as_of']} 收 {rows[0]['close']}、{rows[-1]['as_of']} 收 {rows[-1]['close']}" if rows else "")))
+
+
 def probe_us_pressure():
     """只讀探測：美股資金壓力三項的來源，只記錄結構與資料日期，不寫任何資料表。
     1) CFTC COT（Traders in Financial Futures，標普 500）；2) FINRA 融資統計頁面；3) CBOE Put/Call 候選網址。"""
@@ -3840,7 +3911,8 @@ def run_job(job, dry_run=False):
         probe_round8()
         probe_round9()
         probe_round10()
-    inst_hist, pc_rows, margin_hist = [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
+        probe_round11()
+    inst_hist, pc_rows, margin_hist, index_long = [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
@@ -3850,6 +3922,7 @@ def run_job(job, dry_run=False):
             inst_hist = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
             pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
             margin_hist = _run_module("M19", "上市融資餘額歷史回補", tw_margin_backfill) or []
+            index_long = _run_module("M24", "加權指數長期歷史回補", tw_index_long_history) or []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
@@ -3882,6 +3955,7 @@ def run_job(job, dry_run=False):
         extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))
         extra.append(("tw_margin", margin_hist, "as_of,source"))
+        extra.append(("market_stats", index_long, "market,as_of,source"))
         if not dry_run:
             extra.append(("tw_industry", _run_module("M17", "台股產業別", tw_industry_collect) or [], "code"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
