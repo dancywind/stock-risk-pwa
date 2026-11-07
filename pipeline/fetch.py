@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v54"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v55"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -114,6 +114,14 @@ def _read_body(resp):
     return raw
 
 
+EMPTY_RESPONSE_MSG = "空的回應（連線成功，但沒有任何內容）"
+
+
+def is_empty_response(err):
+    """抓取失敗的原因是不是「對方回傳空內容」。這通常是暫時的（正在更新資料、或沒有資料），和被擋、HTML 錯誤頁不同。"""
+    return EMPTY_RESPONSE_MSG in str(err or "")
+
+
 def fetch_json(url, headers=None, timeout=None):
     """帶重試的抓取。失敗回傳 (None, 原因)，不拋出。
     被對方擋下（HTTP 403、429、503）時等得比較久（BLOCK_BACKOFF_SECONDS 起跳）：這類多半是暫時的限流，馬上再試只會繼續被擋。"""
@@ -123,7 +131,15 @@ def fetch_json(url, headers=None, timeout=None):
         try:
             req = urllib.request.Request(url, headers=_with_gzip(headers or {"User-Agent": "risk-pwa/1.0", "Accept": "application/json"}))
             with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
-                return json.loads(_read_body(resp).decode("utf-8-sig").lstrip("\ufeff")), ""  # 期交所回傳開頭帶 BOM（連續多個也處理）
+                raw = _read_body(resp)
+                text = raw.decode("utf-8-sig", errors="replace").lstrip("\ufeff")                # 期交所回傳開頭帶 BOM（連續多個也處理）
+                if not text.replace("\ufeff", "").strip():
+                    raise ValueError(EMPTY_RESPONSE_MSG)                                           # 連線成功但沒有任何內容：對方在更新資料或暫時沒有資料
+                try:
+                    return json.loads(text), ""
+                except ValueError:
+                    head = re.sub(r"\s+", " ", text[:60]).strip()
+                    raise ValueError(f"不是 JSON（{len(raw)} 位元組；開頭是 {head!r}）")           # 讓你一眼看出收到的是 HTML 錯誤頁還是別的東西
         except urllib.error.HTTPError as e:
             last_err = _scrub(e)
             blocked = e.code in (403, 429, 503)
@@ -2905,6 +2921,10 @@ def tw_options_snapshot():
     opt, e1 = fetch_json(config.TAIFEX_OPT_URL)
     fut, e2 = fetch_json(config.TAIFEX_DAILY_URL)
     if opt is None or fut is None:
+        real = [e for e, d in ((e1, opt), (e2, fut)) if d is None and not is_empty_response(e)]
+        if not real:                                                                                  # 只有「空的回應」：對方暫時沒內容，不當成失敗
+            log("tw_options", "no_new_data", detail=_clip(f"期交所回傳空內容（選擇權：{e1 or '好'}；期貨：{e2 or '好'}）：多半是對方正在更新資料或今天沒有資料，這次先不存快照，下次再抓"))
+            return []
         log("tw_options", "failure", detail=_clip(f"抓取失敗：選擇權 {e1 or '好'}；期貨 {e2 or '好'}"))
         return []
     summary, strikes, err = parse_taifex_snapshot(opt, fut)
@@ -2941,7 +2961,7 @@ def tw_pcr_official():
     """模組 M23：期交所公布的臺指選擇權 Put/Call 比（官方一次給約 18 天，所以一開始就有歷史可以比）。"""
     rows, err = fetch_json(config.TAIFEX_PCR_URL)
     if rows is None:
-        log("tw_pcr", "failure", detail=_clip(f"抓取失敗：{err}"))
+        log("tw_pcr", "no_new_data" if is_empty_response(err) else "failure", detail=_clip(f"抓取失敗：{err}" + ("（對方回傳空內容，多半是暫時的）" if is_empty_response(err) else "")))
         return []
     out, bad = parse_taifex_pcr(rows)
     if not out:

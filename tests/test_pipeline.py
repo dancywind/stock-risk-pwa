@@ -3909,6 +3909,64 @@ def test_run_job_daily_persists_us_sector_and_finmind_tables_and_isolates_them()
     assert st["module:M25"] == "failure" and st["module:M26"] == "success" and "module:M07" in st, "FinMind 壞了不影響官方三率與其他模組"
 
 
+def test_fetch_json_reports_what_it_received_for_empty_and_non_json_bodies():
+    import gzip as _gz
+    reset()
+    class Hdr(dict): pass
+    class Resp:
+        def __init__(self, body, enc=None): self._b = body; self.headers = Hdr({"Content-Encoding": enc} if enc else {})
+        def read(self): return self._b
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def run(body, enc=None):
+        calls = []
+        def op(req, timeout=None):
+            calls.append(1); return Resp(body, enc)
+        with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=op), mock.patch.object(fetch.time, "sleep") as sl:
+            res = fetch.fetch_json("https://x/y")
+        return res, len(calls), [c.args[0] for c in sl.call_args_list]
+    (data, err), n, sleeps = run(b"")
+    assert data is None and err == fetch.EMPTY_RESPONSE_MSG and fetch.is_empty_response(err) and n == config.RETRIES and sleeps == [config.BACKOFF_SECONDS, config.BACKOFF_SECONDS * 2], "空的回應：重試後回傳明確原因"
+    (data, err), n, _ = run("  \n\ufeff ".encode("utf-8"))
+    assert data is None and fetch.is_empty_response(err), "只有空白或 BOM 也算空的"
+    (data, err), n, _ = run(_gz.compress(b""), "gzip")
+    assert data is None and fetch.is_empty_response(err), "壓縮後是空的也算空的"
+    (data, err), n, _ = run("<html><body>Service Unavailable</body></html>".encode())
+    assert data is None and not fetch.is_empty_response(err) and "不是 JSON（" in err and "位元組" in err and "<html><body>Service Unavailable</body>" in err, err
+    (data, err), n, _ = run(b"\xef\xbb\xbf" + b'{"ok": 1}')
+    assert data == {"ok": 1} and err == "" and n == 1, "有 BOM 的正常 JSON 照常"
+    long_html = ("<html>" + "x" * 500).encode()
+    assert len(run(long_html)[0][1]) < 150, "錯誤訊息裡的開頭只截 60 個字，不會把整頁貼進去"
+    assert not fetch.is_empty_response(None) and not fetch.is_empty_response("HTTP 403") and fetch.is_empty_response("抓取失敗：" + fetch.EMPTY_RESPONSE_MSG)
+
+
+def test_taifex_modules_treat_empty_responses_as_no_data_but_real_errors_as_failures():
+    ad = _last_weekday(date.today() - timedelta(days=1))
+    opt, fut, _, _ = _tw_chain(ad)
+    E, H = fetch.EMPTY_RESPONSE_MSG, "不是 JSON（120 位元組；開頭是 '<html>'）"
+    def go(e_opt, e_fut):
+        reset()
+        def fj(url, **k):
+            if url == config.TAIFEX_OPT_URL: return (None, e_opt) if e_opt else (opt, "")
+            if url == config.TAIFEX_DAILY_URL: return (None, e_fut) if e_fut else (fut, "")
+        with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+            res = REAL["tw_options_snapshot"]()
+        return res, [x for x in fetch.LOG if x["source"] == "tw_options"][-1]
+    res, lg = go(E, None); assert res == [] and lg["status"] == "no_new_data" and "空內容" in lg["detail"] and "下次再抓" in lg["detail"], lg
+    res, lg = go(E, E); assert res == [] and lg["status"] == "no_new_data"
+    res, lg = go(H, None); assert res == [] and lg["status"] == "failure" and "不是 JSON" in lg["detail"], "HTML 錯誤頁是真的錯誤，要標失敗"
+    res, lg = go(E, "HTTP 403"); assert res == [] and lg["status"] == "failure", "一個空、一個被擋：有真的錯誤，要標失敗"
+    res, lg = go(None, None); assert len(res) == 1 and lg["status"] == "success"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, E)):
+        assert REAL["tw_pcr_official"]() == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "暫時" in fetch.LOG[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, H)):
+        assert REAL["tw_pcr_official"]() == []
+    assert fetch.LOG[-1]["status"] == "failure"
+
+
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
     reset()
     calls = []
