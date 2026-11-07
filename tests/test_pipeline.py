@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -758,7 +758,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -2444,10 +2444,10 @@ def test_fred_history_backfill_collects_all_configured_series():
     reset()
     def fj(url, **k):                                                            # 每個序列要給它合理範圍內的數字（VIX 不可能是 6000）
         sid = url.split("series_id=")[1].split("&")[0]
-        return {"observations": [{"date": D(3), "value": "20" if sid == "VIXCLS" else "6000"}]}, ""
+        return {"observations": [{"date": D(3), "value": "20" if sid in ("VIXCLS", "VXNCLS") else "6000"}]}, ""
     with with_key(), mock.patch.object(fetch, "fetch_json", side_effect=fj):
         rows = REAL["fred_history_backfill"]()
-    assert {r["series_id"] for r in rows} == set(config.FRED_HISTORY) == {"SP500", "NASDAQCOM", "DJIA", "VIXCLS"}
+    assert {r["series_id"] for r in rows} == set(config.FRED_HISTORY) == {"SP500", "NASDAQCOM", "DJIA", "VIXCLS", "VXNCLS"}
     assert [r["value"] for r in rows if r["series_id"] == "VIXCLS"] == [20.0]
     reset()
     with with_key(), mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": D(3), "value": "6000"}]}, "")):      # 用錯單位的 VIX 要被拒收，不能被寫進去
@@ -3965,6 +3965,96 @@ def test_taifex_modules_treat_empty_responses_as_no_data_but_real_errors_as_fail
     with mock.patch.object(fetch, "fetch_json", return_value=(None, H)):
         assert REAL["tw_pcr_official"]() == []
     assert fetch.LOG[-1]["status"] == "failure"
+
+
+def _yh_json(days_vals, off=0, hour_utc=16):
+    """days_vals: [(日期字串, 收盤價或 None)] → Yahoo chart 格式"""
+    ts = [int(datetime(int(d[:4]), int(d[5:7]), int(d[8:]), hour_utc, tzinfo=timezone.utc).timestamp()) - off for d, v in days_vals]
+    return {"chart": {"result": [{"meta": {"gmtoffset": off}, "timestamp": ts, "indicators": {"quote": [{"close": [v for d, v in days_vals]}]}}], "error": None}}
+
+
+def test_parse_yahoo_chart_converts_exchange_local_dates_and_skips_nulls():
+    rows = fetch.parse_yahoo_chart(_yh_json([("2026-11-03", 7500.5), ("2026-11-04", None), ("2026-11-05", 7600.0)]))
+    assert rows == [("2026-11-03", 7500.5), ("2026-11-05", 7600.0)]
+    j = _yh_json([("2026-11-03", 7500.0)], off=-18000, hour_utc=21)                       # 美東：UTC 21:00 ＝ 當地 16:00，同一天
+    assert fetch.parse_yahoo_chart(j) == [("2026-11-03", 7500.0)]
+    for bad in (None, {}, {"chart": {"result": None}}, {"chart": {"result": [{}]}}, _yh_json([("2026-11-03", None)]), "x"):
+        assert fetch.parse_yahoo_chart(bad) is None, bad
+
+
+def _yh_env(fred_rows, yahoo_by_sym, status=200):
+    def req(method, path, *a, **k):
+        sid = path.split("series_id=eq.")[1].split("&")[0]
+        return fred_rows.get(sid, []), ""
+    def raw(url, timeout=None, headers=None):
+        sym = urllib_unquote(url.split("/chart/")[1].split("?")[0])
+        if status != 200: return status, "text/html", b"limited", f"HTTP {status}"
+        return 200, "application/json", json.dumps(yahoo_by_sym[sym]).encode(), ""
+    return [mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req), mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep")]
+
+
+def urllib_unquote(s):
+    import urllib.parse as up
+    return up.unquote(s)
+
+
+def test_yahoo_fill_adds_only_newer_days_after_cross_checking_against_fred():
+    today = fetch._now_et().date()
+    dd = lambda n: (today - timedelta(days=n)).isoformat()
+    fred = {"SP500": [{"as_of": dd(n), "value": 7000.0 + n} for n in (10, 9, 8, 7, 6)], "DCOILWTICO": [{"as_of": dd(n), "value": 60.0} for n in (10, 9, 8, 7, 6)], "DCOILBRENTEU": []}
+    sp = [(dd(n), 7000.0 + n) for n in (10, 9, 8, 7, 6)] + [(dd(5), 7100.0), (dd(3), 7110.0), (dd(1), 7120.0), (today.isoformat(), 7130.0)]       # 今天的不收
+    cl = [(dd(n), 60.5) for n in (10, 9, 8, 7, 6)] + [(dd(2), 61.0), (dd(1), 400.0)]                                                              # 400 超出合理範圍
+    reset()
+    ps = _yh_env(fred, {"^GSPC": _yh_json(sp), "CL=F": _yh_json(cl), "BZ=F": _yh_json(cl)})
+    rows = _with(ps, lambda: REAL["yahoo_fill"]())
+    by = {}
+    for r in rows: by.setdefault(r["series_id"], []).append(r)
+    assert [r["as_of"] for r in by["SP500"]] == [dd(5), dd(3), dd(1)] and all(r["source"].startswith("Yahoo Finance（非官方") and r["value"] > 7000 for r in by["SP500"]), "只補比 FRED 更新的日子，今天的不收"
+    assert [r["as_of"] for r in by["DCOILWTICO"]] == [dd(2)], "超出合理範圍的 400 被拒"
+    assert "DCOILBRENTEU" not in by, "資料庫沒有 Brent 的 FRED 資料可比對：不補"
+    lg = [x for x in fetch.LOG if x["source"] == "yahoo_fill"][0]
+    assert lg["status"] == "success" and "SP500：補 3 天" in lg["detail"] and "DCOILBRENTEU（資料庫沒有 FRED 資料可比對" in lg["detail"], lg["detail"]
+    # 重疊日子差太多（口徑不同）→ 整批不用
+    reset()
+    bad = [(dd(n), 7000.0 + n + 200) for n in (10, 9, 8, 7, 6)] + [(dd(1), 7300.0)]
+    rows = _with(_yh_env(fred, {"^GSPC": _yh_json(bad), "CL=F": _yh_json(cl), "BZ=F": _yh_json(cl)}), lambda: REAL["yahoo_fill"]())
+    assert not [r for r in rows if r["series_id"] == "SP500"] and "口徑不同，不用" in fetch.LOG[-1]["detail"]
+    # 沒有重疊 → 不用；FRED 已最新 → 不需要補
+    reset()
+    rows = _with(_yh_env(fred, {"^GSPC": _yh_json([(dd(1), 7100.0)]), "CL=F": _yh_json([(dd(1), 60.0)]), "BZ=F": _yh_json([(dd(1), 60.0)])}), lambda: REAL["yahoo_fill"]())
+    assert rows == [] and "沒有重疊的日子" in fetch.LOG[-1]["detail"]
+    reset()
+    fresh = {"SP500": [{"as_of": dd(1), "value": 7100.0}], "DCOILWTICO": [], "DCOILBRENTEU": []}
+    rows = _with(_yh_env(fresh, {"^GSPC": _yh_json([(dd(2), 7050.0), (dd(1), 7100.0)]), "CL=F": _yh_json([]), "BZ=F": _yh_json([])}), lambda: REAL["yahoo_fill"]())
+    assert rows == [] and "FRED 已經是最新" in fetch.LOG[-1]["detail"]
+
+
+def test_yahoo_fill_never_turns_the_job_red_when_blocked_or_unconfigured():
+    reset()
+    rows = _with(_yh_env({"SP500": [{"as_of": "2026-11-01", "value": 7000.0}]}, {}, status=429), lambda: REAL["yahoo_fill"]())
+    assert rows == [] and fetch.LOG[-1]["status"] == "no_new_data" and "HTTP 429" in fetch.LOG[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert REAL["yahoo_fill"]() == []
+    assert fetch.LOG[-1]["status"] == "skipped"
+    assert not [x for x in fetch.LOG if x["status"] == "failure"]
+
+
+def test_probe_round12_reports_tpex_margin_summary_candidates_without_writing():
+    reset()
+    page = json.dumps({"aaData": [["融資金額(仟元)", "123"]], "reportDate": "115/11/06"}, ensure_ascii=False).encode()
+    sw = json.dumps({"paths": {"/tpex_mainboard_margin_balance": {}, "/tpex_other": {}, "/credit_x": {}}}).encode()
+    def raw(url, timeout=None, headers=None):
+        return (200, "application/json", sw, "") if "swagger" in url else (200, "application/json", page, "")
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_upsert") as up, mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round12()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert by["probe:tpex_margin_summary"]["status"] == "success" and "融資金額" in by["probe:tpex_margin_summary"]["detail"] and by["probe:tpex_openapi_list"]["status"] == "success" and "/tpex_mainboard_margin_balance" in by["probe:tpex_openapi_list"]["detail"]
+    up.assert_not_called()
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(404, "text/html", b"<html>", "")), mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round12()
+    assert not [x for x in fetch.LOG if x["status"] == "failure"], "探測被擋或找不到是正常結果，不能讓工作變紅"
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

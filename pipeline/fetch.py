@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v55"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v56"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3612,6 +3612,95 @@ def probe_round10():
         log("probe:twse_day_all", "no_new_data", detail=_clip(f"STOCK_DAY_ALL 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
 
 
+def parse_yahoo_chart(j):
+    """Yahoo 圖表 API（v8/finance/chart）→ [(日期, 收盤價)]，由舊到新。日期用交易所自己的時區（meta.gmtoffset）換算；收盤是空值的日子略過。"""
+    try:
+        r = j["chart"]["result"][0]
+        ts, cl = r["timestamp"], r["indicators"]["quote"][0]["close"]
+        off = int((r.get("meta") or {}).get("gmtoffset") or 0)
+    except (KeyError, IndexError, TypeError):
+        return None
+    out = []
+    for t_, c_ in zip(ts, cl):
+        v = parse_number(c_)
+        if v is None or not isinstance(t_, (int, float)):
+            continue
+        out.append((datetime.fromtimestamp(t_ + off, tz=timezone.utc).date().isoformat(), v))
+    return out or None
+
+
+def yahoo_fill():
+    """模組 M27：用 Yahoo Finance（非官方）補 FRED 落後的天數：標普 500（^GSPC）、WTI 與 Brent 原油期貨。FRED 的這幾個常落後 3 到 5 天。
+    安全做法：1) 只補「比 FRED 最新一天更新」的日子，不動已有的；2) 先拿重疊的日子和 FRED 的數字比，差太多就整批不用（價格口徑不同）；
+    3) 價格要在合理範圍；4) 今天還沒收盤的不收；5) 抓不到只記「沒有資料」，不讓工作變紅。來源欄位明寫「非官方」，之後 FRED 補上同一天會蓋回官方值。"""
+    if not sb_ready():
+        log("yahoo_fill", "skipped", detail="未設定 Supabase，無法比對 FRED 的最新資料，不補")
+        return []
+    ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"}
+    out, notes = [], []
+    for sym, sid, tol in config.YAHOO_FILL:
+        label, low, high = config.FRED_MACRO[sid]
+        have, err = sb_request("GET", f"macro_series?select=as_of,value&series_id=eq.{sid}&order=as_of.desc&limit=12")
+        if not have:
+            notes.append(f"{sid}（資料庫沒有 FRED 資料可比對：{err or '空的'}）")
+            continue
+        status, ctype, body, e2 = fetch_raw(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?range=1mo&interval=1d", timeout=config.PROBE_TIMEOUT, headers=ua)
+        time.sleep(1)
+        if status != 200:
+            notes.append(f"{sym}（HTTP {status} {e2}）".strip())
+            continue
+        try:
+            pts = parse_yahoo_chart(json.loads(body.decode("utf-8-sig")))
+        except (ValueError, UnicodeDecodeError):
+            pts = None
+        if not pts:
+            notes.append(f"{sym}（不是預期的格式）")
+            continue
+        fred = {str(r["as_of"]): float(r["value"]) for r in have if parse_number(r.get("value")) is not None}
+        newest = max(fred)
+        overlap = [(d_, v, fred[d_]) for d_, v in pts if d_ in fred]
+        if not overlap:
+            notes.append(f"{sym}（和 FRED 沒有重疊的日子，沒辦法核對，不用）")
+            continue
+        worst = max(abs(v / f - 1) for _d, v, f in overlap)
+        if worst > tol:
+            notes.append(f"{sym}（和 FRED 重疊的 {len(overlap)} 天最大差 {worst * 100:.2f}%，超過 {tol * 100:.1f}%，口徑不同，不用）")
+            continue
+        today_et = _now_et().date()
+        got = [{"series_id": sid, "label": label, "as_of": d_, "value": round(v, 4), "source": "Yahoo Finance（非官方，補 FRED 落後的天數）"}
+               for d_, v in pts if d_ > newest and d_ < today_et.isoformat() and low <= v <= high]
+        if got:
+            out.extend(got)
+            notes.append(f"{sid}：補 {len(got)} 天（{got[0]['as_of']} 到 {got[-1]['as_of']}），和 FRED 重疊 {len(overlap)} 天最大差 {worst * 100:.2f}%")
+        else:
+            notes.append(f"{sid}：FRED 已經是最新（{newest}），不需要補")
+    log("yahoo_fill", "success" if out else "no_new_data", detail=_clip("；".join(notes) or "沒有項目"))
+    return out
+
+
+def probe_round12():
+    """只讀探測第十二批：櫃買中心的「融資融券餘額彙總」（要有上櫃融資『金額』才能算上櫃維持率；開放資料的逐檔表只有張數）。不寫入任何資料表。"""
+    ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "application/json"}
+    roc = f"{date.today().year - 1911}/{date.today().month:02d}/{date.today().day:02d}"
+    for tag, url in (("tpex_margin_summary", f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={roc}"),
+                     ("tpex_margin_summary2", "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json"),
+                     ("tpex_openapi_list", "https://www.tpex.org.tw/openapi/v1/swagger.json")):
+        status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=ua)
+        time.sleep(1)
+        if status is None:
+            log(f"probe:{tag}", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+            continue
+        txt = body.decode("utf-8", errors="replace")
+        if tag == "tpex_openapi_list":
+            try:
+                paths = [p for p in (json.loads(txt).get("paths") or {}) if "margin" in p.lower() or "credit" in p.lower()]
+                log(f"probe:{tag}", "success" if paths else "no_new_data", detail=_clip(f"HTTP {status}｜名稱含 margin 或 credit 的端點 {len(paths)} 個：{paths[:14]}"))
+            except (ValueError, AttributeError):
+                log(f"probe:{tag}", "no_new_data", detail=_clip(f"HTTP {status}｜不是 JSON｜開頭 {txt[:80]!r}"))
+            continue
+        log(f"probe:{tag}", "success" if status == 200 and txt.strip().startswith("{") else "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜{len(body)} 位元組｜開頭 {re.sub(chr(10), ' ', txt[:700])}"))
+
+
 def probe_round11():
     """只讀探測第十一批：1) 三率歷史的備用來源（FinMind 的財報資料：證交所開放資料只放「已公布的最新一季」，上一季會被換掉）；
     2) Nasdaq 的公司簡介（有沒有產業 Sector／Industry，給美股持股分類用）；3) 證交所 FMTQIK 能不能取得十年前的月份。不寫入任何資料表。"""
@@ -4095,6 +4184,7 @@ def run_job(job, dry_run=False):
         probe_round9()
         probe_round10()
         probe_round11()
+        probe_round12()
     inst_hist, pc_rows, margin_hist, index_long = [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
@@ -4132,6 +4222,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
+            extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
             extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, hold or []) or [], "symbol"))
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
