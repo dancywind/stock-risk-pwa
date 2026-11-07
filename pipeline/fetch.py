@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v56"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v57"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2915,11 +2915,49 @@ def parse_taifex_snapshot(opt_rows, fut_rows, today=None, band=0.20):
     return summary, sorted(strikes.values(), key=lambda r: r["strike"]), None
 
 
+TAIFEX_CSV_COLS = {"日期": "Date", "契約": "Contract", "到期月份(週別)": "ContractMonth(Week)", "履約價": "StrikePrice", "買賣權": "CallPut", "開盤價": "Open", "最高價": "High", "最低價": "Low",
+                   "最後成交價": "Close", "成交量": "Volume", "結算價": "SettlementPrice", "未沖銷契約量": "OpenInterest", "最後最佳買價": "BestBid", "最後最佳賣價": "BestAsk",
+                   "歷史最高價": "HistoricalHigh", "歷史最低價": "HistoricalLow", "是否因訊息面暫停交易": "TradingHalt", "交易時段": "TradingSession", "漲跌價": "Change",
+                   "賣權成交量": "PutVolume", "買權成交量": "CallVolume", "買賣權成交量比率%": "PutCallVolumeRatio%", "賣權未平倉量": "PutOI", "買權未平倉量": "CallOI", "買賣權未平倉量比率%": "PutCallOIRatio%"}
+
+
+def parse_taifex_csv(text):
+    """期交所開放資料有時回傳 CSV（中文欄位名）而不是 JSON（英文欄位名）。轉成和 JSON 一樣的 [dict]：中文欄位名換成英文、日期 2026/11/06 換成 20261106，其他欄位原樣保留。
+    沒有「日期」欄位、或不到 2 欄，就不是我們要的表格，回傳 None。"""
+    import csv, io
+    rd = csv.reader(io.StringIO(text.replace("\ufeff", "")))
+    try:
+        head = [h.strip() for h in next(rd)]
+    except StopIteration:
+        return None
+    if len(head) < 2 or "日期" not in head:
+        return None
+    keys = [TAIFEX_CSV_COLS.get(h, h) for h in head]
+    out = []
+    for row in rd:
+        if not row or all(not c.strip() for c in row):
+            continue
+        d = {k: (row[i].strip() if i < len(row) else "") for i, k in enumerate(keys)}
+        d["Date"] = re.sub(r"[/\-]", "", d.get("Date", ""))
+        out.append(d)
+    return out or None
+
+
+def fetch_taifex(url):
+    """抓期交所開放資料：先當 JSON；回傳的不是 JSON（例如 CSV 表格）就改讀 CSV。回傳 (列表, 錯誤原因)。"""
+    data, err = fetch_json(url)
+    if data is not None or not str(err).startswith("不是 JSON"):
+        return data, err
+    status, ctype, body, e2 = fetch_raw(url, timeout=config.OPTIONS_TIMEOUT, headers={"User-Agent": "risk-pwa/1.0", "Accept": "*/*"})
+    rows = parse_taifex_csv(body.decode("utf-8-sig", errors="replace")) if status == 200 and body else None
+    return (rows, "") if rows else (None, err)
+
+
 def tw_options_snapshot():
     """模組 M22：台指選擇權（TXO）與台指期（TX）的每日快照（期交所 OpenAPI）。每天存摘要與履約價未平倉量，靠每天快照比較 OI 變動。
     期交所的每日行情在收盤後更新，跟台指期基差同一個時間點（tw_close）抓。"""
-    opt, e1 = fetch_json(config.TAIFEX_OPT_URL)
-    fut, e2 = fetch_json(config.TAIFEX_DAILY_URL)
+    opt, e1 = fetch_taifex(config.TAIFEX_OPT_URL)
+    fut, e2 = fetch_taifex(config.TAIFEX_DAILY_URL)
     if opt is None or fut is None:
         real = [e for e, d in ((e1, opt), (e2, fut)) if d is None and not is_empty_response(e)]
         if not real:                                                                                  # 只有「空的回應」：對方暫時沒內容，不當成失敗
@@ -2959,7 +2997,7 @@ def parse_taifex_pcr(rows, today=None):
 
 def tw_pcr_official():
     """模組 M23：期交所公布的臺指選擇權 Put/Call 比（官方一次給約 18 天，所以一開始就有歷史可以比）。"""
-    rows, err = fetch_json(config.TAIFEX_PCR_URL)
+    rows, err = fetch_taifex(config.TAIFEX_PCR_URL)
     if rows is None:
         log("tw_pcr", "no_new_data" if is_empty_response(err) else "failure", detail=_clip(f"抓取失敗：{err}" + ("（對方回傳空內容，多半是暫時的）" if is_empty_response(err) else "")))
         return []

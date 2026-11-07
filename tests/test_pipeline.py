@@ -3949,7 +3949,7 @@ def test_taifex_modules_treat_empty_responses_as_no_data_but_real_errors_as_fail
         def fj(url, **k):
             if url == config.TAIFEX_OPT_URL: return (None, e_opt) if e_opt else (opt, "")
             if url == config.TAIFEX_DAILY_URL: return (None, e_fut) if e_fut else (fut, "")
-        with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>error</html>", "")):    # HTML 錯誤頁：CSV 後備也讀不了
             res = REAL["tw_options_snapshot"]()
         return res, [x for x in fetch.LOG if x["source"] == "tw_options"][-1]
     res, lg = go(E, None); assert res == [] and lg["status"] == "no_new_data" and "空內容" in lg["detail"] and "下次再抓" in lg["detail"], lg
@@ -3962,7 +3962,7 @@ def test_taifex_modules_treat_empty_responses_as_no_data_but_real_errors_as_fail
         assert REAL["tw_pcr_official"]() == []
     assert fetch.LOG[-1]["status"] == "no_new_data" and "暫時" in fetch.LOG[-1]["detail"]
     reset()
-    with mock.patch.object(fetch, "fetch_json", return_value=(None, H)):
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, H)), mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html>error</html>", "")):
         assert REAL["tw_pcr_official"]() == []
     assert fetch.LOG[-1]["status"] == "failure"
 
@@ -4055,6 +4055,64 @@ def test_probe_round12_reports_tpex_margin_summary_candidates_without_writing():
     with mock.patch.object(fetch, "fetch_raw", return_value=(404, "text/html", b"<html>", "")), mock.patch.object(fetch.time, "sleep"):
         fetch.probe_round12()
     assert not [x for x in fetch.LOG if x["status"] == "failure"], "探測被擋或找不到是正常結果，不能讓工作變紅"
+
+
+def _to_csv(rows, cols_en2zh, date_slash=False):
+    import csv, io
+    keys = [k for k in rows[0].keys() if k in cols_en2zh]
+    buf = io.StringIO(); w = csv.writer(buf); w.writerow([cols_en2zh[k] for k in keys])
+    for r in rows:
+        w.writerow([(f"{r[k][:4]}/{r[k][4:6]}/{r[k][6:]}" if date_slash and k == "Date" and len(r[k]) == 8 else r[k]) for k in keys])
+    return buf.getvalue()
+
+
+def test_taifex_csv_is_parsed_into_the_same_rows_as_json_and_gives_identical_results():
+    zh = {v: k for k, v in fetch.TAIFEX_CSV_COLS.items()}
+    ad = _last_weekday(date.today() - timedelta(days=1))
+    opt, fut, _, _ = _tw_chain(ad)
+    for slash in (False, True):
+        o2 = fetch.parse_taifex_csv(_to_csv(opt, zh, slash)); f2 = fetch.parse_taifex_csv("\ufeff" + _to_csv(fut, zh, slash))
+        assert o2 and f2 and o2[0]["Date"] == ad.strftime("%Y%m%d") and o2[0]["CallPut"] in ("買權", "賣權") and "ContractMonth(Week)" in o2[0] and "OpenInterest" in o2[0], "中文欄位換成英文、日期換成 8 位數"
+        a = fetch.parse_taifex_snapshot(opt, fut, today=date.today()); b = fetch.parse_taifex_snapshot(o2, f2, today=date.today())
+        assert a[2] is None and b[2] is None and a[0] == b[0] and a[1] == b[1], ("CSV 與 JSON 結果要完全一樣", a[2], b[2])
+    pcr_zh = "日期,賣權成交量,買權成交量,買賣權成交量比率%,賣權未平倉量,買權未平倉量,買賣權未平倉量比率%\n" + (date.today() - timedelta(days=1)).strftime("%Y/%m/%d") + ",148092,157966,93.75,69770,113305,61.58\n"
+    rows = fetch.parse_taifex_csv(pcr_zh); out, bad = fetch.parse_taifex_pcr(rows)
+    assert len(out) == 1 and out[0]["pcr_oi"] == 61.58 and out[0]["pcr_vol"] == 93.75 and bad == 0
+    for junk in ("", "\n", "只有一欄\n1\n", "A,B\n1,2\n", "日期,契約\n"):
+        assert fetch.parse_taifex_csv(junk) is None, repr(junk)
+    assert fetch.parse_taifex_csv("日期,契約,未知欄位\n20261106,TXO,x\n,,\n")[0]["未知欄位"] == "x", "不認得的欄位原樣保留，空列略過"
+    assert fetch.parse_taifex_csv("日期,契約,成交量\n20261106,TXO\n")[0]["Volume"] == "", "列比欄位少：補空字串，不報錯"
+
+
+def test_fetch_taifex_falls_back_to_csv_only_when_the_body_is_not_json():
+    zh = {v: k for k, v in fetch.TAIFEX_CSV_COLS.items()}
+    ad = _last_weekday(date.today() - timedelta(days=1))
+    opt, _, _, _ = _tw_chain(ad)
+    csvb = _to_csv(opt, zh, True).encode("utf-8-sig")
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "不是 JSON（890797 位元組；開頭是 '日期,契約'）")), mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/csv", csvb, "")):
+        rows, err = fetch.fetch_taifex("https://x/opt")
+    assert err == "" and len(rows) == len(opt) and rows[0]["Contract"] == "TXO"
+    with mock.patch.object(fetch, "fetch_json", return_value=([{"Date": "20261106"}], "")), mock.patch.object(fetch, "fetch_raw", side_effect=AssertionError("JSON 成功時不能再抓一次")):
+        assert fetch.fetch_taifex("https://x/opt")[0] == [{"Date": "20261106"}]
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403: Forbidden")), mock.patch.object(fetch, "fetch_raw", side_effect=AssertionError("被擋時不改抓")):
+        assert fetch.fetch_taifex("https://x/opt") == (None, "HTTP Error 403: Forbidden")
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, fetch.EMPTY_RESPONSE_MSG)), mock.patch.object(fetch, "fetch_raw", side_effect=AssertionError("空的回應不改抓")):
+        assert fetch.is_empty_response(fetch.fetch_taifex("https://x/opt")[1])
+    err0 = "不是 JSON（120 位元組；開頭是 '<html>'）"
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, err0)), mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/html", b"<html><body>error</body></html>", "")):
+        assert fetch.fetch_taifex("https://x/opt") == (None, err0), "HTML 錯誤頁不是 CSV：維持原本的錯誤原因"
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, err0)), mock.patch.object(fetch, "fetch_raw", return_value=(500, "", b"", "HTTP 500")):
+        assert fetch.fetch_taifex("https://x/opt") == (None, err0)
+    # 整條流程：選擇權是 CSV、期貨是 JSON → 照樣存得到快照
+    opt2, fut2, _, _ = _tw_chain(ad)
+    def fj(url, **k):
+        if url == config.TAIFEX_OPT_URL: return None, "不是 JSON（890797 位元組；開頭是 '日期,契約'）"
+        return fut2, ""
+    reset()
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/csv", csvb, "")):
+        res = REAL["tw_options_snapshot"]()
+    assert len(res) == 1 and res[0]["summary"]["fut_settle"] == 41000 and [x for x in fetch.LOG if x["source"] == "tw_options"][0]["status"] == "success"
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
