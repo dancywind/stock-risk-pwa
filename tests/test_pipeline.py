@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -3705,6 +3705,208 @@ def test_probe_round11_reports_finmind_nasdaq_profile_and_old_month_without_writ
     with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"<html>", "")), mock.patch.object(fetch, "_twse_month_rows", return_value=(None, "x")):
         fetch.probe_round11()
     assert not [x for x in fetch.LOG if x["status"] == "failure"], "候選來源被擋是正常的探測結果，不能讓工作變紅"
+
+
+def _fm_rows(code, series, extra_types=True):
+    """series: {(年, 季): (營收, 毛利, 營業利益, 稅後淨利)} → FinMind 一列一個項目的格式"""
+    qd = {1: "03-31", 2: "06-30", 3: "09-30", 4: "12-31"}
+    out = []
+    for (y, q), (rev, gp, op, ni) in series.items():
+        for typ, v in (("Revenue", rev), ("GrossProfit", gp), ("OperatingIncome", op), ("IncomeAfterTaxes", ni)):
+            out.append({"date": f"{y}-{qd[q]}", "stock_id": code, "type": typ, "value": v, "origin_name": typ})
+        if extra_types:
+            out.append({"date": f"{y}-{qd[q]}", "stock_id": code, "type": "EPS", "value": 5.5, "origin_name": "基本每股盈餘"})
+    return out
+
+
+def _single_series(scale=1.0):
+    """兩年八季的單季值：營收小幅波動（第 4 季 ÷ 第 1 季約 1.1～1.3），毛利率 50%、營益率 40%、淨利率 30%"""
+    revs = [100, 110, 105, 120, 118, 125, 122, 130]
+    return {(2024 + i // 4, i % 4 + 1): (r * scale * 1e9, r * scale * 5e8, r * scale * 4e8, r * scale * 3e8) for i, r in enumerate(revs)}
+
+
+def _cumulative_of(series):
+    out, run = {}, None
+    for (y, q) in sorted(series):
+        v = series[(y, q)]
+        run = tuple(a + b for a, b in zip(run, v)) if q > 1 and run else v
+        out[(y, q)] = run
+    return out
+
+
+def test_parse_finmind_statements_requires_quarter_end_dates_and_all_four_items():
+    rows = _fm_rows("2330", {(2025, 1): (100, 50, 40, 30), (2025, 2): (110, 55, 44, 33)})
+    rows += [{"date": "2025-09-30", "type": "Revenue", "value": 100}, {"date": "2025-09-30", "type": "GrossProfit", "value": 50}]      # 缺營業利益與淨利：整季不收
+    rows += [{"date": "2025-05-15", "type": "Revenue", "value": 1}, {"date": "壞", "type": "Revenue", "value": 1}, "壞列", {"date": "2025-12-31", "type": "Revenue", "value": "x"}]
+    got = fetch.parse_finmind_statements(rows)
+    assert sorted(got) == [(2025, 1), (2025, 2)] and got[(2025, 2)] == {"revenue": 110, "gross_profit": 55, "op_income": 44, "net_income": 33}
+    rows2 = rows + [{"date": "2025-03-31", "type": "Revenue", "value": 999}]
+    assert fetch.parse_finmind_statements(rows2)[(2025, 1)]["revenue"] == 999, "同一季重複取最後一列"
+    assert fetch.parse_finmind_statements(None) == {} and fetch.parse_finmind_statements([]) == {}
+
+
+def test_detect_finmind_basis_single_cumulative_and_undecidable():
+    single = {f"{2330 + i}": fetch.parse_finmind_statements(_fm_rows(str(2330 + i), _single_series(1 + i * 0.2))) for i in range(3)}
+    b, st = fetch.detect_finmind_basis(single)
+    assert b == "single" and st["n"] == 6 and st["high"] == 0, (b, st)
+    cum = {k: fetch.parse_finmind_statements(_fm_rows(k, _cumulative_of(_single_series(1 + i * 0.2)))) for i, k in enumerate(("2330", "2317", "2454"))}
+    b, st = fetch.detect_finmind_basis(cum)
+    assert b == "cumulative" and st["n"] == 6 and st["high"] == 6 and 3.5 < st["median"] < 4.5, (b, st)
+    b, st = fetch.detect_finmind_basis({"2330": fetch.parse_finmind_statements(_fm_rows("2330", _single_series()))})
+    assert b is None and st["n"] == 2, "公司年度不到 4 個：不判斷"
+    mixed = {"a": fetch.parse_finmind_statements(_fm_rows("a", _single_series())), "b": fetch.parse_finmind_statements(_fm_rows("b", _single_series())),
+             "c": fetch.parse_finmind_statements(_fm_rows("c", _cumulative_of(_single_series()))), "d": fetch.parse_finmind_statements(_fm_rows("d", _cumulative_of(_single_series())))}
+    assert fetch.detect_finmind_basis(mixed)[0] is None, "一半單季一半累計：結果不一致，不判斷"
+    assert fetch.detect_finmind_basis({})[0] is None
+    partial = {k: fetch.parse_finmind_statements(_fm_rows(k, {(2025, q): v for (y, q), v in _single_series().items() if y == 2025 and q < 4})) for k in "abcde"}
+    assert fetch.detect_finmind_basis(partial)[0] is None, "沒有四季都齊的年度就沒有依據"
+
+
+def test_finmind_to_single_converts_cumulative_and_skips_gaps():
+    ser = fetch.parse_finmind_statements(_fm_rows("x", _cumulative_of(_single_series())))
+    single = fetch.finmind_to_single(ser, "cumulative"), _single_series()
+    for yq, v in single[1].items():
+        got = single[0][yq]
+        assert [round(got[k]) for k in ("revenue", "gross_profit", "op_income", "net_income")] == [round(x) for x in v], yq
+    assert fetch.finmind_to_single(ser, "single") == ser
+    gap = {k: v for k, v in ser.items() if k != (2024, 2)}
+    out = fetch.finmind_to_single(gap, "cumulative")
+    assert (2024, 2) not in out and (2024, 3) not in out and (2024, 1) in out and (2024, 4) in out, "缺第 2 季：第 2 季和第 3 季換算不出來要略過，第 4 季（有第 3 季）還是可以"
+
+
+def _fm_env(per_code, bad=None):
+    calls = []
+    def fj(url, **k):
+        calls.append(url)
+        code = url.split("data_id=")[1].split("&")[0]
+        if bad and code in bad: return bad[code]
+        return {"msg": "success", "status": 200, "data": per_code.get(code, [])}, ""
+    return mock.patch.object(fetch, "fetch_json", side_effect=fj), calls
+
+
+def test_finmind_fin_history_writes_single_quarter_rows_for_single_or_cumulative_sources():
+    prices = [{"market": "TW", "code": c, "name": n} for c, n in (("2330", "台積電"), ("2317", "鴻海"), ("2454", "聯發科"), ("2882", "國泰金"), ("00878", "ETF"))] + [{"market": "US", "code": "ORCL", "name": "x"}]
+    ser = {c: _single_series(1 + i * 0.3) for i, c in enumerate(("2330", "2317", "2454"))}
+    for mode in ("single", "cumulative"):
+        reset()
+        per = {c: _fm_rows(c, s if mode == "single" else _cumulative_of(s)) for c, s in ser.items()}
+        per["2882"] = [{"date": "2025-03-31", "stock_id": "2882", "type": "Revenue", "value": 1e9}]           # 金融業：沒有一般業項目
+        p, calls = _fm_env(per)
+        with p, mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch.time, "sleep"):
+            rows = REAL["finmind_fin_history"](prices)
+        assert len(calls) == 5 and all("TaiwanStockFinancialStatements" in u and "start_date=" in u for u in calls) and not any("ORCL" in u for u in calls), "台股 5 個代號各查一次（00878 也會查但沒資料），美股不查: %s" % calls
+        by = {(r["code"], r["year"], r["quarter"]): r for r in rows}
+        assert len(rows) == 3 * config.FINMIND_QUARTERS and all(r["source"] == "FinMind（第三方，非官方）" for r in rows)
+        r = by[("2330", 2025, 4)]
+        assert round(r["revenue"]) == round(_single_series()[(2025, 4)][0]) and r["gross_margin"] == 50.0 and r["op_margin"] == 40.0 and r["net_margin"] == 30.0, (mode, r)
+        assert r["basis"] == ("single" if mode == "single" else "converted") and r["name"] == "台積電"
+        assert sorted({(y, q) for (c, y, q) in by if c == "2330"}, reverse=True)[0] == (2025, 4) and len({(y, q) for (c, y, q) in by if c == "2330"}) == config.FINMIND_QUARTERS, "每檔只存最近幾季"
+        lg = [x for x in fetch.LOG if x["source"] == "finmind_fin"][0]
+        assert lg["status"] == "success" and ("單季值" if mode == "single" else "累計值（已換算成單季）") in lg["detail"] and "2882 國泰金（沒有一般業損益項目" in lg["detail"], lg["detail"]
+
+
+def test_finmind_fin_history_refuses_undecidable_data_and_stops_when_rate_limited():
+    prices = [{"market": "TW", "code": c, "name": c} for c in ("2330", "2317")]
+    reset()
+    p, calls = _fm_env({"2330": _fm_rows("2330", _single_series())})
+    with p, mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["finmind_fin_history"]([{"market": "TW", "code": "2330", "name": "台積電"}]) == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "不寫入" in fetch.LOG[-1]["detail"] and "至少 4 個" in fetch.LOG[-1]["detail"]
+    reset()
+    codes = ["2330", "2317", "2454", "2412"]
+    p, calls = _fm_env({}, bad={"2330": (None, "HTTP Error 402: Payment Required")})              # 代號排序後 2317 先、2330 第二個被擋、其後不再查
+    with p, mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["finmind_fin_history"]([{"market": "TW", "code": c, "name": c} for c in codes]) == []
+    assert len(calls) == 2 and "疑似被限流，停止本次" in fetch.LOG[-1]["detail"] and fetch.LOG[-1]["status"] == "no_new_data", "402 之後不再繼續打：%s" % calls
+    reset()
+    p, calls = _fm_env({}, bad={"2330": ({"status": 400, "msg": "bad"}, ""), "2317": ({"data": "x"}, "")})
+    with p, mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["finmind_fin_history"]([{"market": "TW", "code": c, "name": c} for c in ("2330", "2317")]) == []
+    assert "2330（回傳" in fetch.LOG[-1]["detail"] and "2317（回傳" in fetch.LOG[-1]["detail"]
+    reset()
+    assert REAL["finmind_fin_history"]([{"market": "US", "code": "ORCL"}]) == [] and fetch.LOG[-1]["status"] == "skipped"
+
+
+def test_finmind_fin_history_lets_official_data_win_in_its_own_table_flow():
+    # 官方資料在 tw_fin_q，FinMind 在獨立的 tw_fin_q_ext：兩邊互不覆蓋，網頁決定用哪個
+    reset()
+    ser = {c: _single_series(1 + i * 0.3) for i, c in enumerate(("2330", "2317", "2454"))}
+    p, calls = _fm_env({c: _fm_rows(c, s) for c, s in ser.items()})
+    with p, mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([{"code": "2330", "year": 2026, "quarter": 3}], "")), mock.patch.object(fetch.time, "sleep"):
+        rows = REAL["finmind_fin_history"]([{"market": "TW", "code": c, "name": c} for c in ser])
+    assert len(rows) == 3 * config.FINMIND_QUARTERS, "官方已經有的季度，FinMind 照樣存在自己的表（網頁決定要不要用）"
+
+
+def test_parse_nasdaq_profile_maps_sectors_and_refuses_guesses():
+    prof = lambda sym, sec, ind="Semiconductors": {"data": {"CompanyName": {"value": "x"}, "Symbol": {"label": "Symbol", "value": sym}, "Industry": {"label": "Industry", "value": ind}, "Sector": {"label": "Sector", "value": sec}}}
+    row, why = fetch.parse_nasdaq_profile(prof("ARM", "Technology"), "arm")
+    assert why is None and row == {"symbol": "ARM", "sector_en": "Technology", "industry_en": "Semiconductors", "sector": "資訊科技", "source": "Nasdaq 公司簡介（分類和 GICS 不完全相同）"}
+    for en, zh in (("Health Care", "醫療保健"), ("Finance", "金融"), ("Consumer Discretionary", "非必需消費"), ("Consumer Staples", "必需消費"), ("Industrials", "工業"), ("Energy", "能源"),
+                   ("Utilities", "公用事業"), ("Basic Materials", "原物料"), ("Real Estate", "不動產"), ("Telecommunications", "通訊服務"), ("Miscellaneous", "其他／ETF")):
+        assert fetch.parse_nasdaq_profile(prof("X", en), "X")[0]["sector"] == zh, en
+    assert fetch.parse_nasdaq_profile(prof("X", "Technology", ""), "X")[0]["industry_en"] is None
+    assert "不在對照表" in fetch.parse_nasdaq_profile(prof("X", "Crypto Things"), "X")[1] and fetch.parse_nasdaq_profile(prof("X", "Crypto Things"), "X")[0] is None
+    assert "不是 AAPL" in fetch.parse_nasdaq_profile(prof("MSFT", "Technology"), "AAPL")[1]
+    assert "沒有 Sector" in fetch.parse_nasdaq_profile({"data": {"Symbol": {"value": "X"}, "Sector": {"value": None}}}, "X")[1]
+    for bad in (None, {}, {"data": None}, {"data": {}}, {"data": "x"}, []):
+        assert fetch.parse_nasdaq_profile(bad, "X")[0] is None and "沒有公司簡介" in fetch.parse_nasdaq_profile(bad, "X")[1], bad
+    sm = set(fetch.NASDAQ_SECTOR_ZH.values()); assert sm == {"資訊科技", "通訊服務", "非必需消費", "必需消費", "醫療保健", "金融", "工業", "能源", "公用事業", "原物料", "不動產", "其他／ETF"}
+
+
+def test_us_sector_lookup_skips_fresh_handles_etfs_and_never_turns_red():
+    reset()
+    hold = [{"market": "US", "symbol": "orcl", "name": "甲骨文"}, {"market": "US", "symbol": "ORCL", "name": "dup"}, {"market": "US", "symbol": "ARM", "name": "ARM"}, {"market": "US", "symbol": "MUU", "name": "槓桿"},
+            {"market": "US", "symbol": "XYZ", "name": "擋"}, {"market": "TW", "symbol": None, "name": "台積電"}, {"market": "US", "symbol": None, "name": "沒代號"}]
+    body = lambda sym, sec: json.dumps({"data": {"Symbol": {"value": sym}, "Industry": {"value": "Ind"}, "Sector": {"value": sec}}}).encode()
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        sym = url.split("/company/")[1].split("/")[0]; seen.append(sym)
+        if sym == "ARM": return 200, "application/json", body("ARM", "Technology"), ""
+        if sym == "MUU": return 200, "application/json", json.dumps({"data": None}).encode(), ""
+        if sym == "XYZ": return 403, "text/html", b"blocked", "HTTP 403"
+        return 200, "application/json", body(sym, "Technology"), ""
+    recent = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([{"symbol": "ORCL", "fetched_at": recent}], "")), mock.patch.object(fetch.time, "sleep"):
+        rows = REAL["us_sector_lookup"](hold)
+    assert sorted(seen) == ["ARM", "MUU", "XYZ"], "ORCL 3 天前查過，不重查；台股與沒代號的不查；重複的只算一次: %s" % seen
+    assert [r["symbol"] for r in rows] == ["ARM"] and rows[0]["sector"] == "資訊科技"
+    lg = [x for x in fetch.LOG if x["source"] == "us_sector"][0]
+    assert lg["status"] == "success" and "新查到 1 檔" in lg["detail"] and "ARM→Technology" in lg["detail"] and "MUU（沒有公司簡介" in lg["detail"] and "XYZ（HTTP 403" in lg["detail"] and "1 檔 45 天內查過" in lg["detail"], lg["detail"]
+    assert not [x for x in fetch.LOG if x["status"] == "failure"], "查不到的（ETF、被擋）只記沒有資料，不讓工作變紅"
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["us_sector_lookup"]([{"market": "US", "symbol": "ARM"}]) == []
+    assert fetch.LOG[-1]["status"] == "no_new_data"
+    reset()
+    assert REAL["us_sector_lookup"]([]) == [] and fetch.LOG[-1]["status"] == "skipped" and REAL["us_sector_lookup"]([{"market": "TW", "name": "台積電"}]) == []
+
+
+def test_run_job_daily_persists_us_sector_and_finmind_tables_and_isolates_them():
+    reset()
+    sec = [{"symbol": "ARM", "sector_en": "Technology", "industry_en": "Semiconductors", "sector": "資訊科技", "source": "x"}]
+    fin = [{"code": "2330", "name": "台積電", "year": 2026, "quarter": 2, "revenue": 1.0, "gross_profit": 0.5, "op_income": 0.4, "net_income": 0.3, "gross_margin": 50, "op_margin": 40, "net_margin": 30, "basis": "single", "source": "FinMind（第三方，非官方）"}]
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(job, dry, **kw):
+        got = []
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"),
+                  mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "us_sector_lookup", **(kw.get("sec") or {"return_value": sec})),
+                  mock.patch.object(fetch, "finmind_fin_history", **(kw.get("fin") or {"return_value": fin})),
+                  mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append({n: (r, c) for n, r, c in tables}))]
+        for p_ in patches: p_.start()
+        try:
+            fetch.run_job(job, dry_run=dry)
+        finally:
+            for p_ in patches: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    for job in ("tw_close", "full"):
+        reset(); tables, st = go(job, False)
+        assert tables["us_sector_auto"] == (sec, "symbol") and tables["tw_fin_q_ext"] == (fin, "code,year,quarter") and st["module:M26"] == "success" and st["module:M25"] == "success", job
+    reset(); tables, st = go("tw_close", True)
+    assert "module:M25" not in st and "module:M26" not in st, "dry-run 不碰第三方與 Nasdaq"
+    reset(); tables, st = go("tw_close", False, sec={"side_effect": RuntimeError("boom")})
+    assert st["module:M26"] == "failure" and st["module:M25"] == "success" and tables["us_sector_auto"][0] == [] and tables["tw_fin_q_ext"][0] == fin
+    reset(); tables, st = go("tw_close", False, fin={"side_effect": RuntimeError("boom")})
+    assert st["module:M25"] == "failure" and st["module:M26"] == "success" and "module:M07" in st, "FinMind 壞了不影響官方三率與其他模組"
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

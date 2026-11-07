@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v53"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v54"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2952,6 +2952,169 @@ def tw_pcr_official():
     return out
 
 
+NASDAQ_SECTOR_ZH = {"Technology": "資訊科技", "Health Care": "醫療保健", "Finance": "金融", "Consumer Discretionary": "非必需消費", "Consumer Staples": "必需消費", "Industrials": "工業",
+                    "Energy": "能源", "Utilities": "公用事業", "Basic Materials": "原物料", "Real Estate": "不動產", "Telecommunications": "通訊服務", "Miscellaneous": "其他／ETF"}
+
+
+def parse_nasdaq_profile(j, symbol):
+    """Nasdaq 公司簡介（api.nasdaq.com/api/company/{symbol}/company-profile）→ ({產業列}, 原因)。
+    只信 data 裡的 Sector 與 Industry；代號對不上、查不到、產業名稱不在對照表（不猜）就回 None 與原因。分類是 Nasdaq 自己的，和 GICS 不完全相同。"""
+    d = (j or {}).get("data") if isinstance(j, dict) else None
+    if not isinstance(d, dict) or not d:
+        return None, "沒有公司簡介（ETF 或查不到這個代號）"
+    val = lambda k: ((d.get(k) or {}).get("value") if isinstance(d.get(k), dict) else None)
+    sym = str(val("Symbol") or "").strip().upper()
+    if sym and sym != symbol.upper():
+        return None, f"回傳的代號是 {sym}，不是 {symbol}，不採用"
+    sec = str(val("Sector") or "").strip()
+    if not sec:
+        return None, "公司簡介裡沒有 Sector（產業）"
+    zh = NASDAQ_SECTOR_ZH.get(sec)
+    if zh is None:
+        return None, f"Nasdaq 的產業名稱「{sec}」不在對照表（共 {len(NASDAQ_SECTOR_ZH)} 種），不猜，請你自己指定"
+    ind = str(val("Industry") or "").strip() or None
+    return {"symbol": symbol.upper(), "sector_en": sec, "industry_en": ind, "sector": zh, "source": "Nasdaq 公司簡介（分類和 GICS 不完全相同）"}, None
+
+
+def us_sector_lookup(holdings):
+    """模組 M26：美股持股的產業，從 Nasdaq 公司簡介自動帶入（你在網頁自己指定的永遠優先）。已經查過、不到 45 天的不重查；
+    ETF 沒有公司簡介，查不到只記沒有資料（不會讓工作變紅）。每檔之間間隔 1 秒。"""
+    syms = sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol")})
+    if not syms:
+        log("us_sector", "skipped", detail="沒有美股持股代號，不查產業")
+        return []
+    fresh = set()
+    if sb_ready():
+        got, err = sb_request("GET", "us_sector_auto?select=symbol,fetched_at&limit=1000")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        fresh = {r["symbol"] for r in (got or []) if str(r.get("fetched_at", "")) >= cutoff}
+    out, miss = [], []
+    for sym in syms:
+        if sym in fresh:
+            continue
+        status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/company/{sym}/company-profile", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+        time.sleep(1)
+        if status != 200:
+            miss.append(f"{sym}（HTTP {status} {err}）".strip())
+            continue
+        try:
+            row, why = parse_nasdaq_profile(json.loads(body.decode("utf-8-sig")), sym)
+        except (ValueError, UnicodeDecodeError):
+            miss.append(f"{sym}（不是 JSON）")
+            continue
+        if row is None:
+            miss.append(f"{sym}（{why}）")
+        else:
+            out.append(row)
+    log("us_sector", "success" if out else "no_new_data",
+        detail=_clip(f"{len(syms)} 檔美股持股：新查到 {len(out)} 檔（" + "、".join(f"{r['symbol']}→{r['sector_en']}" for r in out[:8]) + f"）；{len(fresh & set(syms))} 檔 45 天內查過" + (f"；查不到：{'、'.join(miss[:6])}" if miss else "")))
+    return out
+
+
+_FM_Q = {"03-31": 1, "06-30": 2, "09-30": 3, "12-31": 4}
+_FM_TYPES = {"Revenue": "revenue", "GrossProfit": "gross_profit", "OperatingIncome": "op_income", "IncomeAfterTaxes": "net_income"}
+
+
+def parse_finmind_statements(rows):
+    """FinMind 綜合損益表（TaiwanStockFinancialStatements，一列一個項目）→ {(年, 季): {revenue, gross_profit, op_income, net_income}}。
+    日期必須是季底（3/31、6/30、9/30、12/31）；四個項目都有才收；同一季重複就取最後一列。是單季值還是累計值，之後再判斷。"""
+    tmp = {}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        d = str(r.get("date", ""))
+        q, k, v = _FM_Q.get(d[5:]), _FM_TYPES.get(r.get("type")), parse_number(r.get("value"))
+        if q is None or k is None or v is None or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            continue
+        tmp.setdefault((int(d[:4]), q), {})[k] = v
+    return {yq: vals for yq, vals in tmp.items() if len(vals) == 4}
+
+
+def detect_finmind_basis(by_code):
+    """判斷 FinMind 給的是「單季值」還是「年初到本季的累計值」：看每一檔每一年（四季都有的）第 4 季營收 ÷ 第 1 季營收。
+    累計值的第 4 季是全年（約第 1 季的 4 倍，幾乎一定 ≥ 2.5）；單季值的第 4 季通常在 0.5 到 2 倍之間。
+    至少要有 4 個「公司年度」才判斷；90% 以上 ≥ 2.5 判為累計、80% 以上 < 2.5 判為單季，其他情況不判斷（回傳 None），寧可不寫也不猜。"""
+    ratios = []
+    for code, ser in by_code.items():
+        for y in sorted({y for (y, q) in ser}):
+            if all((y, q) in ser for q in (1, 2, 3, 4)) and ser[(y, 1)]["revenue"] > 0:
+                ratios.append(ser[(y, 4)]["revenue"] / ser[(y, 1)]["revenue"])
+    n = len(ratios)
+    stats = {"n": n, "median": sorted(ratios)[n // 2] if n else None, "high": sum(1 for x in ratios if x >= 2.5)}
+    if n < 4:
+        return None, stats
+    if stats["high"] / n >= 0.9:
+        return "cumulative", stats
+    if (n - stats["high"]) / n >= 0.8:
+        return "single", stats
+    return None, stats
+
+
+def finmind_to_single(ser, basis):
+    """累計值換成單季（第 1 季本來就是單季；第 q 季＝第 q 季累計 − 第 q−1 季累計，缺任何一季就略過）。回傳 {(年, 季): 單季值}。"""
+    if basis == "single":
+        return dict(ser)
+    out = {}
+    for (y, q), v in ser.items():
+        if q == 1:
+            out[(y, q)] = dict(v)
+        elif (y, q - 1) in ser:
+            out[(y, q)] = {k: v[k] - ser[(y, q - 1)][k] for k in v}
+    return out
+
+
+def finmind_fin_history(price_rows):
+    """模組 M25：台股持股的歷史季度三率（FinMind，第三方、非官方；證交所開放資料只放最新一季，所以前一季查不到）。
+    存進獨立的 tw_fin_q_ext（一律單季值），網頁只在官方查不到或比不了上一季時才用，並標示來源。
+    判斷單季或累計用 detect_finmind_basis；判斷不了就一列都不寫。FinMind 有請求次數限制，被限流或擋掉就停止，記「沒有資料」（不讓工作變紅）。"""
+    wanted = {r["code"]: r.get("name") or r["code"] for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")}
+    if not wanted:
+        log("finmind_fin", "skipped", detail="沒有台股持股代號，不抓 FinMind")
+        return []
+    start = f"{date.today().year - 2}-01-01"
+    by_code, notes = {}, []
+    for code in sorted(wanted)[:config.FINMIND_MAX_CODES]:
+        j, err = fetch_json(f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockFinancialStatements&data_id={code}&start_date={start}")
+        if j is None:
+            notes.append(f"{code}（{err}）")
+            if any(x in str(err) for x in ("402", "429", "403")):
+                notes.append("疑似被限流，停止本次")
+                break
+            continue
+        if not isinstance(j, dict) or j.get("status") != 200 or not isinstance(j.get("data"), list):
+            notes.append(f"{code}（回傳 {str(j)[:50]}）")
+            continue
+        ser = parse_finmind_statements(j["data"])
+        if ser:
+            by_code[code] = ser
+        else:
+            notes.append(f"{code} {wanted[code]}（沒有一般業損益項目，可能是金融業）")
+        time.sleep(config.FINMIND_SLEEP)
+    basis, st = detect_finmind_basis(by_code)
+    if basis is None:
+        log("finmind_fin", "no_new_data", detail=_clip(f"{len(by_code)} 檔有資料，但只有 {st['n']} 個「公司年度」可判斷單季或累計（至少 4 個、且結果要一致），不寫入" + (f"；{'、'.join(notes[:5])}" if notes else "")))
+        return []
+    official = set()
+    if sb_ready():
+        got, e2 = sb_request("GET", "tw_fin_q?select=code,year,quarter&limit=2000")
+        official = {(r["code"], r["year"], r["quarter"]) for r in (got or [])}
+    out, skipped = [], 0
+    for code, ser in by_code.items():
+        singles = finmind_to_single(ser, basis)
+        for (y, q) in sorted(singles, reverse=True)[:config.FINMIND_QUARTERS]:
+            v = singles[(y, q)]
+            if v["revenue"] <= 0:
+                continue
+            gm, om, nm = (round(v[k] / v["revenue"] * 100, 3) for k in ("gross_profit", "op_income", "net_income"))
+            if not (-1000 <= gm <= 100 and -1000 <= om <= 100 and -1000 <= nm <= 200):
+                continue
+            out.append({"code": code, "name": wanted[code], "year": y, "quarter": q, "revenue": v["revenue"], "gross_profit": v["gross_profit"], "op_income": v["op_income"], "net_income": v["net_income"],
+                        "gross_margin": gm, "op_margin": om, "net_margin": nm, "basis": "single" if basis == "single" else "converted", "source": "FinMind（第三方，非官方）"})
+    log("finmind_fin", "success" if out else "no_new_data", detail=_clip(f"{len(by_code)} 檔、{len(out)} 個季度；判斷為{'單季值' if basis == 'single' else '累計值（已換算成單季）'}（{st['n']} 個公司年度，第 4 季 ÷ 第 1 季營收的中位數 {st['median']:.2f}）" +
+                                                                       (f"｜{'、'.join(notes[:5])}" if notes else "")))
+    return out
+
+
 _EXR_HIST_FIELDS = {"date": "資料日期", "code": "股票代號", "name": "股票名稱", "prev": "除權息前收盤價", "ref": "除權息參考價", "kind": "權/息"}
 
 
@@ -3949,6 +4112,8 @@ def run_job(job, dry_run=False):
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
+            extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, hold or []) or [], "symbol"))
+            extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
     if job == "tw_backfill":
