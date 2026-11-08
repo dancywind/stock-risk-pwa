@@ -4240,6 +4240,34 @@ def test_run_job_daily_persists_tpex_margin_and_isolates_m29():
     reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M29"] == "failure" and "module:M07" in st and tables["tpex_margin_daily"][0] == []
 
 
+def test_tw_breadth_update_splits_by_market_when_the_database_times_out():
+    TO = 'HTTP 500: {"code":"57014","message":"canceling statement due to statement timeout"}'
+    days = [{"market": m, "as_of": "2026-11-06"} for m in ("TWSE", "TPEX")]
+    def env(full, per):
+        calls = []
+        def req(method, path, body=None, **k):
+            if method == "GET": return (days, "") if path.startswith("tw_hist_days") else ([], "")
+            calls.append(body)
+            return full if "p_market" not in body else per[body["p_market"]]
+        return [mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req)], calls
+    reset()
+    ps, calls = env((None, TO), {"TWSE": (1, ""), "TPEX": (1, "")})
+    assert _with(ps, lambda: fetch.tw_breadth_update()) == 1
+    assert [c.get("p_market") for c in calls] == [None, "TWSE", "TPEX"] and all(c["d"] == "2026-11-06" for c in calls), "先一次算，逾時就上市、上櫃各算一次"
+    lg = [x for x in fetch.LOG if x["source"] == "tw_breadth"][-1]; assert lg["status"] == "success" and "改成上市、上櫃分開算" in lg["detail"] and "new_tables_v57.sql" in lg["detail"]
+    reset()
+    ps, calls = env((None, TO), {"TWSE": (1, ""), "TPEX": (None, TO)})
+    assert _with(ps, lambda: fetch.tw_breadth_update()) is None
+    lg = [x for x in fetch.LOG if x["source"] == "tw_breadth"][-1]; assert lg["status"] == "failure" and "TPEX 也失敗" in lg["detail"] and "new_tables_v57.sql" in lg["detail"], lg["detail"]
+    reset()
+    ps, calls = env((None, "HTTP 404: function not found"), {})
+    assert _with(ps, lambda: fetch.tw_breadth_update()) is None and len(calls) == 1, "不是逾時的錯誤：不分開重試"
+    assert "new_tables_breadth.sql" in [x for x in fetch.LOG if x["source"] == "tw_breadth"][-1]["detail"]
+    reset()
+    ps, calls = env((1, ""), {})
+    assert _with(ps, lambda: fetch.tw_breadth_update()) == 1 and len(calls) == 1 and "分開算" not in [x for x in fetch.LOG if x["source"] == "tw_breadth"][-1]["detail"], "一次算成功就不用分開"
+
+
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
     reset()
     calls = []

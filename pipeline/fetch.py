@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v59"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v60"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1766,18 +1766,30 @@ def tw_breadth_update(dry_run=False, max_days=10):
         have, err = sb_request("GET", f"tw_breadth_ma?select=as_of&as_of=gte.{(date.today() - timedelta(days=60)).isoformat()}&limit=1000")
         have_set = {r["as_of"] for r in (have or [])}
         todo += [d for d in complete if d != latest and (date.today() - date.fromisoformat(d)).days <= 60 and d not in have_set][:max_days]
-    done = 0
+    done = split = 0
     for d in todo:
         if dry_run:
             log("tw_breadth", "skipped", as_of=d, detail="--dry-run：不計算")
             continue
         res, err = sb_request("POST", "rpc/compute_tw_breadth", {"d": d})
+        if res is None and "57014" in str(err):                                           # 資料庫語句逾時：改成上市、上櫃各算一次（每次工作量約一半）
+            res, err2 = 0, None
+            for mk in ("TWSE", "TPEX"):
+                r2, e2 = sb_request("POST", "rpc/compute_tw_breadth", {"d": d, "p_market": mk})
+                if r2 is None:
+                    res, err2 = None, f"{mk} 也失敗：{e2}"
+                    break
+            if res is None:
+                err = f"{err}；改成上市、上櫃分開算：{err2}"
+            else:
+                split += 1
         if res is None:
-            log("tw_breadth", "failure", as_of=d, detail=_clip(f"呼叫 compute_tw_breadth 失敗：{err}（請先執行 new_tables_breadth.sql）"))
+            hint = "請執行 new_tables_v57.sql（改寫函式並放寬逾時）" if "57014" in str(err) else "請先執行 new_tables_breadth.sql"
+            log("tw_breadth", "failure", as_of=d, detail=_clip(f"呼叫 compute_tw_breadth 失敗：{err}（{hint}）"))
             return None
         done += 1
     if done:
-        log("tw_breadth", "success", as_of=todo[0], detail=f"已計算 {done} 個日期（最新 {latest}，歷史涵蓋 {cover} 天）")
+        log("tw_breadth", "success", as_of=todo[0], detail=f"已計算 {done} 個日期（最新 {latest}，歷史涵蓋 {cover} 天）" + (f"；其中 {split} 個因為一次算逾時，改成上市、上櫃分開算（建議執行 new_tables_v57.sql）" if split else ""))
     return done
 
 
