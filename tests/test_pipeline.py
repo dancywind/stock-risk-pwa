@@ -2707,6 +2707,51 @@ def test_aaii_requires_three_ratios_that_add_up_and_its_own_recent_date():
     assert "HTTP 403" in fetch.LOG[-1]["detail"]
 
 
+def _aaii_hist_html(rows, extra=""):
+    body = "".join(f"<tr><td>{d.strftime('%b')} {d.day}</td><td>{b}%</td><td>{n}%</td><td>{r}%</td></tr>" for d, b, n, r in rows)
+    return ("<html><body><table><tr><td>Historical Average</td><td>37.5%</td><td>31.5%</td><td>31.0%</td></tr></table><table><tr><th>Reported Date</th><th>Bullish</th><th>Neutral</th><th>Bearish</th></tr>" + body + "</table>" + extra + "</body></html>")
+
+
+def test_parse_aaii_history_reads_the_weekly_table_infers_years_and_stops_at_doubtful_rows():
+    real = ("Bullish Neutral Bearish Nov 4 34.1% 17.5% 48.4% Oct 28 37.8% 20.7% 41.4% Oct 21 36.9% 17.3% 45.8% Oct 14 38.7% 19.7% 41.6% Oct 7 40.3% 20.8% 39.0% Sep 30 34.6% 25.0% 40.4%")
+    rows, why = fetch.parse_aaii_history(real, date(2026, 11, 8))                                       # 你的探測結果裡的真實文字
+    assert why == "" and [(r["as_of"], r["bullish"], r["neutral"], r["bearish"]) for r in rows] == [("2026-11-04", 34.1, 17.5, 48.4), ("2026-10-28", 37.8, 20.7, 41.4), ("2026-10-21", 36.9, 17.3, 45.8), ("2026-10-14", 38.7, 19.7, 41.6), ("2026-10-07", 40.3, 20.8, 39.0), ("2026-09-30", 34.6, 25.0, 40.4)]
+    assert "每週歷史表" in rows[0]["source"]
+    wrap = "Bullish Neutral Bearish Jan 7 35.0% 30.0% 35.0% Dec 31 36.0% 30.0% 34.0% Dec 24 33.0% 33.0% 34.0% Dec 17 31.0% 34.0% 35.0%"
+    assert [r["as_of"] for r in fetch.parse_aaii_history(wrap, date(2026, 1, 10))[0]] == ["2026-01-07", "2025-12-31", "2025-12-24", "2025-12-17"], "跨年：月日變大就減一年"
+    assert [r["as_of"] for r in fetch.parse_aaii_history("Bullish Neutral Bearish Dec 31 36.0% 30.0% 34.0% Dec 24 33.0% 33.0% 34.0% Dec 17 31.0% 34.0% 35.0%", date(2026, 1, 3))[0]] == ["2025-12-31", "2025-12-24", "2025-12-17"], "最新一列比今天還晚：算去年"
+    bad_sum = "Bullish Neutral Bearish Nov 4 34.1% 17.5% 48.4% Oct 28 37.8% 20.7% 41.4% Oct 21 50.0% 20.0% 20.0% Oct 14 38.7% 19.7% 41.6%"
+    r2, w2 = fetch.parse_aaii_history(bad_sum, date(2026, 11, 8)); assert r2 == [] and "只讀到 2 週" in w2, "合計不對的那一列：從那裡停（後面的也不要）"
+    gap = "Bullish Neutral Bearish Nov 4 34.1% 17.5% 48.4% Oct 28 37.8% 20.7% 41.4% Oct 14 38.7% 19.7% 41.6% Oct 7 40.3% 20.8% 39.0%"
+    assert fetch.parse_aaii_history(gap, date(2026, 11, 8))[0] == [], "少一週（差 14 天）：年份推算不可靠，從那裡停；只剩 2 列所以整個不用"
+    assert fetch.parse_aaii_history("沒有表格", date(2026, 11, 8))[0] == [] and fetch.parse_aaii_history("", date(2026, 11, 8))[1].startswith("歷史表只讀到 0 週")
+    html, _ = fetch.parse_aaii_history(_aaii_hist_html([(date(2026, 11, 4) - timedelta(days=7 * k), 34.1, 17.5, 48.4) for k in range(4)]), date(2026, 11, 8)); assert len(html) == 4, "HTML 標籤和『歷史平均』那列（沒有日期）不影響"
+
+
+def test_aaii_sentiment_stores_the_history_only_when_two_pages_agree_on_the_latest_week():
+    d = TODAY - timedelta(days=2)
+    fmt = d.strftime("%b ") + str(d.day) + ", " + str(d.year)
+    land = aaii_page(fmt)                                                                                         # 38.5 / 30.2 / 31.3
+    hist = [(d - timedelta(days=7 * k), 38.5 if k == 0 else 36.0, 30.2 if k == 0 else 32.0, 31.3 if k == 0 else 32.0) for k in range(6)]
+    def run(results):
+        def raw(url, timeout=None, headers=None):
+            return (200, "text/html", land, "") if url == config.AAII_URL else results
+        reset()
+        with mock.patch.object(fetch, "fetch_raw", side_effect=raw):
+            return REAL["aaii_sentiment"](), [x for x in fetch.LOG if x["source"] == "aaii"][-1]
+    out, lg = run((200, "text/html", _aaii_hist_html(hist).encode(), ""))
+    assert len(out) == 6 and out[0]["as_of"] == d.isoformat() and out[-1]["as_of"] == (d - timedelta(days=35)).isoformat() and "每週歷史表" in out[0]["source"]
+    assert lg["status"] == "success" and "歷史表 6 週" in lg["detail"] and "核對一致" in lg["detail"], lg["detail"]
+    off = [(hist[0][0], 40.0, 28.7, 31.3)] + hist[1:]                                                              # 最新一週的數字和另一個頁面對不上
+    out, lg = run((200, "text/html", _aaii_hist_html(off).encode(), ""))
+    assert len(out) == 1 and out[0]["source"] == "AAII 散戶情緒調查（aaii.com）" and "歷史表沒採用" in lg["detail"] and "對不上" in lg["detail"], lg["detail"]
+    old = [(d - timedelta(days=7), 38.5, 30.2, 31.3)] + [(d - timedelta(days=14 + 7 * k), 36.0, 32.0, 32.0) for k in range(4)]            # 歷史表最新一列不是同一週
+    out, lg = run((200, "text/html", _aaii_hist_html(old).encode(), ""))
+    assert len(out) == 1 and "對不上" in lg["detail"]
+    out, lg = run((403, "text/html", b"denied", "HTTP 403")); assert len(out) == 1 and "結果頁 HTTP 403" in lg["detail"] and lg["status"] == "success", "結果頁抓不到：只存最新一週，不報錯"
+    out, lg = run((200, "text/html", b"<html>no table</html>", "")); assert len(out) == 1 and "至少 3 週" in lg["detail"]
+
+
 def test_us_leaders_compute_ma_relative_to_spy_and_rejects_mismatch_or_split():
     reset()
     spy = hist_pts(70, 0.001)

@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v66"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v67"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2671,6 +2671,42 @@ def us_crash_screen():
     return out
 
 
+def parse_aaii_history(html, today=None):
+    """AAII 結果頁的「每週歷史表」：每一列是「月 日 看多% 中立% 看空%」（沒有年份），由新到舊。年份用往回走的方式推：最新一列如果比今天還晚就是去年，之後每次月日變大（跨年）就再減一年。
+    驗證每一列：三項合計在 99 到 101；相鄰兩列的日期差剛好 7 天（不是就從那裡停，後面的都不要，因為年份推算已經不可靠）；至少 3 列。回傳 (列表由新到舊, 原因)。"""
+    today = today or date.today()
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+    i = text.find("Bullish Neutral Bearish")
+    seg = text[i + len("Bullish Neutral Bearish"):] if i >= 0 else text
+    found = re.findall(r"\b([A-Z][a-z]{2})\.? (\d{1,2}) (\d{1,3}(?:\.\d+)?)% (\d{1,3}(?:\.\d+)?)% (\d{1,3}(?:\.\d+)?)%", seg)
+    out, year, prev = [], None, None
+    for mon_s, day_s, b, n, r in found:
+        mon = _US_MONTHS.get(mon_s)
+        if not mon:
+            break
+        md = (mon, int(day_s))
+        try:
+            if year is None:
+                year = today.year
+                if date(year, *md) > today:
+                    year -= 1
+            elif md > prev:
+                year -= 1
+            d = date(year, *md)
+        except ValueError:
+            break
+        vals = (float(b), float(n), float(r))
+        if not (99 <= sum(vals) <= 101) or any(v > 100 for v in vals):
+            break
+        if out and (date.fromisoformat(out[-1]["as_of"]) - d).days != 7:
+            break
+        out.append({"as_of": d.isoformat(), "bullish": vals[0], "neutral": vals[1], "bearish": vals[2], "source": "AAII 散戶情緒調查（aaii.com 結果頁的每週歷史表）"})
+        prev = md
+    if len(out) < 3:
+        return [], f"歷史表只讀到 {len(out)} 週（至少 3 週），不用"
+    return out, ""
+
+
 def aaii_sentiment():
     """模組 M09：AAII 散戶情緒（看多、中立、看空）。只在三項都找得到、加起來約 100、而且頁面上有自己的資料日期時才採用。"""
     status, ctype, body, err = fetch_raw(config.AAII_URL, timeout=config.PROBE_TIMEOUT, headers={"User-Agent": config.NASDAQ_UA, "Accept": "text/html"})
@@ -2705,8 +2741,17 @@ def aaii_sentiment():
     if not ok or (today - d).days > 21 or not (98 <= total <= 102):
         log("aaii", "failure", as_of=d.isoformat(), detail=_clip(f"驗證不過：日期 {d}（{why or '距今 ' + str((today - d).days) + ' 天'}）、三項合計 {total}"))
         return []
-    log("aaii", "success", as_of=d.isoformat(), detail=f"看多 {val['bullish']}%、中立 {val['neutral']}%、看空 {val['bearish']}%")
-    return [{"as_of": d.isoformat(), "bullish": val["bullish"], "neutral": val["neutral"], "bearish": val["bearish"], "source": "AAII 散戶情緒調查（aaii.com）"}]
+    latest = {"as_of": d.isoformat(), "bullish": val["bullish"], "neutral": val["neutral"], "bearish": val["bearish"], "source": "AAII 散戶情緒調查（aaii.com）"}
+    base = f"看多 {val['bullish']}%、中立 {val['neutral']}%、看空 {val['bearish']}%"
+    # 結果頁有每週歷史表：讀出來補歷史；但只有「最新一週和上面這個獨立頁面的數字一致」才採用（兩個頁面互相核對），否則只存最新一週
+    st2, _ct2, body2, err2 = fetch_raw(config.AAII_RESULTS_URL, timeout=config.PROBE_TIMEOUT, headers={"User-Agent": config.NASDAQ_UA, "Accept": "text/html", "Referer": "https://www.aaii.com/"})
+    hist, why = parse_aaii_history(body2.decode("utf-8", errors="replace"), today) if st2 == 200 and body2 else ([], f"結果頁 HTTP {st2} {err2}".strip())
+    h0 = hist[0] if hist else None
+    if h0 and h0["as_of"] == latest["as_of"] and all(abs(h0[k] - latest[k]) <= 0.05 for k in ("bullish", "neutral", "bearish")):
+        log("aaii", "success", as_of=latest["as_of"], detail=f"{base}；結果頁歷史表 {len(hist)} 週（{hist[-1]['as_of']} 到 {hist[0]['as_of']}），最新一週和上面的頁面核對一致，一併存入")
+        return hist
+    log("aaii", "success", as_of=latest["as_of"], detail=base + "；歷史表沒採用：" + (why or f"最新一週和另一個頁面對不上（歷史表 {h0['as_of']}，{h0['bullish']}/{h0['neutral']}/{h0['bearish']}）" if h0 else why))
+    return [latest]
 
 
 def us_leaders_compute():

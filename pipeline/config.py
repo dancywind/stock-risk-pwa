@@ -166,7 +166,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v66"
+PIPELINE_VERSION = "v67"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -201,6 +201,7 @@ INDEX_LONG_BATCH = 24                 # 每次最多補幾個月（每個月 1 �
 # 探測第三批（只讀）：三率用的財報資訊、AAII 散戶情緒、Nasdaq-100 名單、SOX 指數報價
 FIN_KEYWORDS = ("財報資訊", "綜合損益")
 AAII_URL = "https://www.aaii.com/sentimentsurvey"
+AAII_RESULTS_URL = "https://www.aaii.com/sentimentsurvey/sent_results"      # 結果頁有每週歷史表（看多、中立、看空）
 NASDAQ100_URL = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
 # v32 模組
 TPEX_FIN_PATH = "/mopsfin_t187ap06_O_ciA"           # 上櫃公司財報資訊（一般業）；上市那邊用說明文件找路徑
