@@ -4198,16 +4198,38 @@ def _otc_px(n=200, price=80.0, date_s=None, drop=0):
     return [{"Date": roc, "SecuritiesCompanyCode": f"{3000 + i}", "CompanyName": f"股{i}", "Close": ("" if i < drop else str(price)), "Change": "0"} for i in range(n)]
 
 
-def _otc_env(margin, px):
-    return mock.patch.object(fetch, "fetch_json", side_effect=lambda url, **k: margin if url == config.TPEX_MARGIN_URL else px)
+def _otc_page(units=2000000, prev_units=2020000, loan_k=100000000, date_s=None, roc=None, ident_ok=True, units_ok=True):
+    d = date_s or ymd(); r = roc or f"{int(d[:4]) - 1911}/{d[4:6]}/{d[6:]}"
+    fields = ["代號", "名稱", "前資餘額(張)", "資買", "資賣", "現償", "資餘額", "資屬證金", "資使用率(%)", "資限額"]
+    sell_k, red_k, buy_k = 16770744, 2860184, 5568509; prev_k = loan_k + sell_k + red_k - buy_k + (0 if ident_ok else 99999)
+    u = lambda v: f"{v:,}"
+    summ = [["", "合計(張)", u(prev_units), "1", "1", "1", u(units if units_ok else units + 50000), "", "", ""], ["", "融資金(仟元)", u(prev_k), u(buy_k), u(sell_k), u(red_k), u(loan_k), "", "", ""]]
+    return json.dumps({"tables": [{"title": "上櫃股票融資融券餘額", "date": r, "fields": fields, "data": [["x"]], "summary": summ, "notes": []}], "stat": "ok"}, ensure_ascii=False).encode()
+
+
+def _otc_env(margin, px, page=None, page_status=200):
+    p = page if page is not None else _otc_page()
+    return _ExitStack([mock.patch.object(fetch, "fetch_json", side_effect=lambda url, **k: margin if url == config.TPEX_MARGIN_URL else px),
+                       mock.patch.object(fetch, "fetch_raw", return_value=(page_status, "application/json", p if page_status == 200 else b"", "" if page_status == 200 else "HTTP"))])
+
+
+class _ExitStack:
+    def __init__(self, ps): self.ps = ps
+    def __enter__(self):
+        for p in self.ps: p.start()
+        return self
+    def __exit__(self, *a):
+        for p in reversed(self.ps): p.stop()
+        return False
 
 
 def test_tpex_margin_daily_sums_units_and_value_with_validation():
     reset()
     with _otc_env((_otc_margin(), ""), (_otc_px(), "")):
         rows = REAL["tpex_margin_daily"]()
-    assert len(rows) == 1 and rows[0]["units"] == 200 * 10000 and rows[0]["prev_units"] == 200 * 10100 and rows[0]["value"] == 200 * 10000 * 1000 * 80 and rows[0]["n_stocks"] == 200 and rows[0]["n_missing"] == 0 and "沒有融資金額" in rows[0]["source"]
-    lg = [x for x in fetch.LOG if x["source"] == "tpex_margin"][0]; assert lg["status"] == "success" and "上櫃融資 2,000,000 張（前日 2,020,000，-0.99%）" in lg["detail"], lg["detail"]
+    assert len(rows) == 1 and rows[0]["units"] == 200 * 10000 and rows[0]["prev_units"] == 200 * 10100 and rows[0]["value"] == 200 * 10000 * 1000 * 80 and rows[0]["n_stocks"] == 200 and rows[0]["n_missing"] == 0 and "融資金額" in rows[0]["source"]
+    assert rows[0]["loan"] == 100000000 * 1000 and rows[0]["est_ratio"] == 160.0 and "維持率是自己估算的" in rows[0]["source"], f"維持率＝市值 1,600 億 ÷ 融資金額 1,000 億 ＝ 160%（算法和上市一樣）: {rows[0]}｜{[x['detail'] for x in fetch.LOG if x['source'] == 'tpex_margin']}"
+    lg = [x for x in fetch.LOG if x["source"] == "tpex_margin"][0]; assert lg["status"] == "success" and "上櫃融資 2,000,000 張（前日 2,020,000，-0.99%）" in lg["detail"] and "維持率估算 160.00%" in lg["detail"], lg["detail"]
     def last(): return [x for x in fetch.LOG if x["source"] == "tpex_margin"][-1]
     for m, p, st, frag in (((_otc_margin(), ""), (_otc_px(date_s=ymd(-1)), ""), "no_new_data", "兩天不一致"), ((_otc_margin(bad=60), ""), (_otc_px(), ""), "failure", "通過"), ((_otc_margin(), ""), (_otc_px(drop=20), ""), "failure", "超過 5%"),
                            ((_otc_margin(units=1), ""), (_otc_px(), ""), "failure", "範圍"), ((None, "HTTP 403"), ([], ""), "failure", "抓取失敗"), ((None, fetch.EMPTY_RESPONSE_MSG), (None, fetch.EMPTY_RESPONSE_MSG), "no_new_data", "抓取失敗"),
@@ -4220,6 +4242,22 @@ def test_tpex_margin_daily_sums_units_and_value_with_validation():
     with _otc_env((_otc_margin(), ""), (_otc_px(drop=8), "")):                                                   # 4% 查不到收盤價：在容許範圍
         r = REAL["tpex_margin_daily"]()
     assert r and r[0]["n_missing"] == 8 and r[0]["n_stocks"] == 192
+
+
+def test_tpex_margin_loan_is_validated_and_a_failure_only_drops_the_ratio():
+    ok = lambda **k: _otc_env((_otc_margin(), ""), (_otc_px(), ""), **k)
+    cases = (("頁面失敗", dict(page=b"", page_status=503), "彙總頁抓取失敗"), ("日期不對", dict(page=_otc_page(roc="115/01/01")), "日期是 115/01/01"), ("張數對不上", dict(page=_otc_page(units_ok=False)), "對不上，不採用"),
+             ("融資金額自己對不上", dict(page=_otc_page(ident_ok=False)), "融資金額自己對不上"), ("維持率離譜", dict(page=_otc_page(loan_k=100000)), "超出合理範圍"), ("格式不對", dict(page=b'{"tables": []}'), "格式非預期"), ("不是 JSON", dict(page=b"<html>"), "格式非預期"))
+    for name, kw, frag in cases:
+        reset()
+        with ok(**kw):
+            rows = REAL["tpex_margin_daily"]()
+        assert len(rows) == 1 and rows[0]["loan"] is None and rows[0]["est_ratio"] is None and rows[0]["units"] == 2000000, (name, rows)
+        lg = [x for x in fetch.LOG if x["source"] == "tpex_margin"][-1]; assert lg["status"] == "success" and "沒有融資金額、不算維持率" in lg["detail"] and frag in lg["detail"], (name, lg["detail"])
+    reset()
+    with ok(page=_otc_page(units=2000001)):                                                                  # 差 1 張（誤差 0.2% 內）：照收
+        r = REAL["tpex_margin_daily"]()
+    assert r[0]["loan"] == 100000000 * 1000
 
 
 def test_run_job_daily_persists_tpex_margin_and_isolates_m29():

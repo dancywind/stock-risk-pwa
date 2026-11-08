@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v62"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v63"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3033,6 +3033,43 @@ def tw_retail_ratio():
     return [row]
 
 
+def _tpex_margin_loan(as_of, units):
+    """櫃買網站「融資融券餘額」頁的合計列：取「融資金(仟元)」的資餘額，換成元。回傳 (融資金額元, 原因)；任何一項驗證不過就回傳 (None, 原因)，不猜。
+    驗證：頁面日期要等於 as_of；合計(張)的資餘額要和我們逐檔加總的張數一致（誤差 0.2% 內）；融資金額自己要對得上「前日＋買進－賣出－現償＝今日」（誤差十萬分之一或 5 仟元）。"""
+    roc = f"{int(as_of[:4]) - 1911}/{as_of[5:7]}/{as_of[8:10]}"
+    status, ctype, body, err = fetch_raw(f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={roc}", headers={"User-Agent": "risk-pwa/1.0", "Accept": "application/json"})
+    if status != 200 or not body:
+        return None, f"彙總頁抓取失敗 HTTP {status} {err}".strip()
+    try:
+        j = json.loads(body.decode("utf-8-sig"))
+        t0 = j["tables"][0]
+        fields = [str(f).strip() for f in t0["fields"]]
+        summary = t0["summary"]
+        ix = {k: fields.index(k) for k in ("前資餘額(張)", "資買", "資賣", "現償", "資餘額")}
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None, "彙總頁格式非預期（找不到 tables、fields 或 summary）"
+    if str(t0.get("date", "")).strip() != roc:
+        return None, f"彙總頁的日期是 {t0.get('date')}，要的是 {roc}，不採用"
+    def row_of(tag):
+        for r in summary if isinstance(summary, list) else []:
+            if isinstance(r, list) and len(r) > 1 and tag in str(r[1]):
+                return r
+        return None
+    unit_row, loan_row = row_of("合計(張)"), row_of("融資金")
+    if unit_row is None or loan_row is None:
+        return None, "彙總頁的合計列裡找不到「合計(張)」或「融資金」"
+    g = lambda r, k: parse_number(r[ix[k]]) if len(r) > ix[k] else None
+    bal_u, loan_k = g(unit_row, "資餘額"), g(loan_row, "資餘額")
+    prev_k, buy_k, sell_k, red_k = (g(loan_row, k) for k in ("前資餘額(張)", "資買", "資賣", "現償"))
+    if None in (bal_u, loan_k, prev_k, buy_k, sell_k, red_k) or loan_k <= 0:
+        return None, "融資金額欄位不是數字"
+    if abs(bal_u - units) > max(1, units * 0.002):
+        return None, f"彙總頁合計 {bal_u:,.0f} 張，和我們逐檔加總的 {units:,} 張對不上，不採用"
+    if abs(prev_k + buy_k - sell_k - red_k - loan_k) > max(5, loan_k * 1e-5):
+        return None, f"融資金額自己對不上：前日 {prev_k:,.0f} ＋ 買 {buy_k:,.0f} － 賣 {sell_k:,.0f} － 償 {red_k:,.0f} ≠ {loan_k:,.0f}（仟元）"
+    return loan_k * 1000, ""
+
+
 def tpex_margin_daily():
     """模組 M29：上櫃融資餘額（張數）每天累積。櫃買中心的開放資料「上櫃股票融資融券餘額」是逐檔表（前日餘額、買進、賣出、償還、今日餘額，單位張），沒有融資金額，
     所以算不出上櫃的融資維持率；這裡只算總張數、前日總張數、融資股票市值（Σ 張數 × 1000 × 收盤價，受股價影響，只當參考）。
@@ -3085,8 +3122,14 @@ def tpex_margin_daily():
     if not (1e5 <= units <= 5e7) or prev <= 0 or held == 0 or missing / held > 0.05:
         log("tpex_margin", "failure", as_of=as_of, detail=_clip(f"總張數 {units:,}（範圍 10 萬到 5,000 萬）、前日 {prev:,}，或有融資的 {held} 檔裡 {missing} 檔查不到收盤價（超過 5%），不採用"))
         return []
-    log("tpex_margin", "success", as_of=as_of, detail=f"上櫃融資 {units:,} 張（前日 {prev:,}，{(units / prev - 1) * 100:+.2f}%）；融資股票市值約 {value / 1e8:,.0f} 億元（{held - missing} 檔，{missing} 檔查不到收盤價）")
-    return [{"as_of": as_of, "units": units, "prev_units": prev, "value": round(value), "n_stocks": held - missing, "n_missing": missing, "source": "櫃買中心開放資料（逐檔融資張數；沒有融資金額，所以沒有維持率）"}]
+    loan, why_loan = _tpex_margin_loan(as_of, units)
+    est = round(value / loan * 100, 2) if loan else None
+    if est is not None and not (50 <= est <= 500):
+        loan, est, why_loan = None, None, f"維持率估算 {value / loan * 100:.1f}% 超出合理範圍（50 到 500），不採用"
+    log("tpex_margin", "success", as_of=as_of, detail=f"上櫃融資 {units:,} 張（前日 {prev:,}，{(units / prev - 1) * 100:+.2f}%）；融資股票市值約 {value / 1e8:,.0f} 億元（{held - missing} 檔，{missing} 檔查不到收盤價）；" +
+        (f"融資金額 {loan / 1e8:,.0f} 億元，維持率估算 {est:.2f}%" if loan else f"沒有融資金額、不算維持率：{why_loan}"))
+    return [{"as_of": as_of, "units": units, "prev_units": prev, "value": round(value), "n_stocks": held - missing, "n_missing": missing, "loan": round(loan) if loan else None, "est_ratio": est,
+             "source": "櫃買中心開放資料（逐檔融資張數）與櫃買網站融資融券餘額頁合計列（融資金額）；維持率是自己估算的"}]
 
 
 def tw_options_snapshot():
