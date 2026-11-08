@@ -4352,9 +4352,15 @@ def test_watch_valuation_validates_ranges_dates_and_source_failures():
     reset()
     ps, _ = _watch_env([]); assert _with(ps, lambda: REAL["watch_valuation"]()) == [] and fetch.LOG[-1]["status"] == "no_new_data" and "清單是空的" in fetch.LOG[-1]["detail"]
     reset()
-    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 404: relation does not exist")):
+    for e in ("HTTP 404: b'{\"code\":\"PGRST205\",\"message\":\"Could not find the table public.private_watchlist in the schema cache\"}'", "HTTP 404: relation does not exist"):
+        reset()
+        with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, e)):
+            assert REAL["watch_valuation"]() == []
+        assert fetch.LOG[-1]["status"] == "no_new_data" and "new_tables_v58.sql" in fetch.LOG[-1]["detail"] and "可以忽略" in fetch.LOG[-1]["detail"], "表不存在：還沒啟用這個功能，不讓工作變紅"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 500: boom")):
         assert REAL["watch_valuation"]() == []
-    assert fetch.LOG[-1]["status"] == "failure" and "new_tables_v58.sql" in fetch.LOG[-1]["detail"]
+    assert fetch.LOG[-1]["status"] == "failure" and "讀取候選股清單失敗" in fetch.LOG[-1]["detail"], "其他錯誤照舊算失敗"
     reset()
     with mock.patch.object(fetch, "sb_ready", return_value=False):
         assert REAL["watch_valuation"]() == []

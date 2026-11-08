@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v63"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v64"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3327,7 +3327,10 @@ def watch_valuation():
         return []
     got, err = sb_request("GET", "private_watchlist?select=code&limit=500")
     if got is None:
-        log("watch", "failure", detail=_clip(f"讀取候選股清單失敗：{err}（請先執行 new_tables_v58.sql）"))
+        if "PGRST205" in str(err) or "HTTP 404" in str(err):                                 # 資料表還不存在＝還沒啟用候選股功能，不是壞掉
+            log("watch", "no_new_data", detail=_clip("候選股清單的資料表還不存在（還沒執行 new_tables_v58.sql）：沒有要用候選股功能的話可以忽略；要用，請執行 new_tables_v58.sql，再重新跑一次。"))
+        else:
+            log("watch", "failure", detail=_clip(f"讀取候選股清單失敗：{err}（如果是資料表不存在，請先執行 new_tables_v58.sql）"))
         return []
     codes = sorted({str(r.get("code", "")).strip() for r in got if isinstance(r, dict) and re.fullmatch(r"\d{4,6}[A-Z]?", str(r.get("code", "")).strip())})
     if not codes:
