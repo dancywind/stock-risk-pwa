@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v57"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v58"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2953,6 +2953,74 @@ def fetch_taifex(url):
     return (rows, "") if rows else (None, err)
 
 
+def compute_retail_ratio(inv_rows, fut_rows, today=None):
+    """小台指散戶多空比 ＝（散戶多單 － 散戶空單）÷ 全市場未平倉量 × 100；散戶部位 ＝ 全市場 － 三大法人（自營商、投信、外資）。
+    法人口數來自期交所「三大法人-區分各期貨契約」，全市場未平倉量來自期貨每日行情的 MTX（只算單一月份、一般時段）。
+    契約名稱不寫死：找名稱含「小型」與「臺指」的那個，找不到就回傳「這份資料有哪些契約」（讓你看得到實際名稱）。三個法人缺一個、日期對不上、數字不合理都不算。回傳 (列, 原因)。"""
+    today = today or date.today()
+    if not (isinstance(inv_rows, list) and inv_rows and isinstance(inv_rows[0], dict) and isinstance(fut_rows, list) and fut_rows):
+        return None, "資料格式非預期"
+    dates = [twse_ymd_to_iso(r.get("Date")) for r in inv_rows if isinstance(r, dict)]
+    as_of = max((d for d in dates if d), default=None)
+    ok, why = validate_close_date(as_of) if as_of else (False, "找不到有效日期")
+    if not ok:
+        return None, f"法人資料日期異常：{why}"
+    today_rows = [r for r in inv_rows if isinstance(r, dict) and twse_ymd_to_iso(r.get("Date")) == as_of]
+    names = sorted({str(r.get("ContractCode", "")).strip() for r in today_rows})
+    mini = [n for n in names if "小型" in n and "臺" in n]
+    if not mini:
+        return None, f"找不到小型臺指期貨（法人資料裡有這些契約：{names[:12]}）"
+    groups = {}
+    for r in today_rows:
+        if str(r.get("ContractCode", "")).strip() != mini[0]:
+            continue
+        item = str(r.get("Item", "")).strip()
+        g = "外資" if item.startswith("外資") else "投信" if item.startswith("投信") else "自營商" if item.startswith("自營商") else None
+        lng, sht = parse_number(r.get("OpenInterest(Long)")), parse_number(r.get("OpenInterest(Short)"))
+        if g is None or lng is None or sht is None or lng < 0 or sht < 0:
+            continue
+        a, b = groups.get(g, (0, 0))
+        groups[g] = (a + lng, b + sht)
+    if set(groups) != {"外資", "投信", "自營商"}:
+        return None, f"{mini[0]} 的法人只找到 {sorted(groups)}，要外資、投信、自營商三個都有才算散戶"
+    inst_long, inst_short = int(sum(v[0] for v in groups.values())), int(sum(v[1] for v in groups.values()))
+    key = as_of.replace("-", "")
+    total = 0
+    for r in fut_rows:
+        if not isinstance(r, dict) or str(r.get("Contract", "")).strip() != "MTX" or not re.fullmatch(r"\d{6}", str(r.get("ContractMonth(Week)", "")).strip()) or str(r.get("TradingSession", "")).strip() not in ("一般", ""):
+            continue
+        if re.sub(r"\D", "", str(r.get("Date", ""))) != key:
+            continue
+        oi = parse_number(r.get("OpenInterest"))
+        if oi is not None and oi >= 0:
+            total += int(oi)
+    if total <= 0:
+        return None, f"期貨每日行情裡找不到 {as_of} 的 MTX 未平倉量（日期對不上或還沒更新）"
+    if inst_long > total * 1.0001 or inst_short > total * 1.0001:
+        return None, f"法人多單 {inst_long} 或空單 {inst_short} 比全市場 {total} 還大，數字不合理，不採用"
+    ratio = round((inst_short - inst_long) / total * 100, 2)
+    return {"as_of": as_of, "contract": mini[0], "inst_long": inst_long, "inst_short": inst_short, "total_oi": total, "ratio": ratio, "source": "期交所三大法人與期貨每日行情推算（不是交易所直接公布的數字）"}, None
+
+
+def tw_retail_ratio():
+    """模組 M28：小台指散戶多空比（每天累積）。"""
+    inv, err = fetch_json(config.TAIFEX_FUTURES_URL)
+    if inv is None:
+        inv, err2 = _taifex_investor_csv(config.TAIFEX_FUTURES_URL)
+        err = f"JSON：{err}｜CSV：{err2}" if inv is None else ""
+    fut, e2 = fetch_taifex(config.TAIFEX_DAILY_URL)
+    if inv is None or fut is None:
+        empty = all(is_empty_response(e) for e in (err, e2) if e)
+        log("tw_retail", "no_new_data" if empty else "failure", detail=_clip(f"抓取失敗：法人 {err or '好'}；期貨行情 {e2 or '好'}"))
+        return []
+    row, why = compute_retail_ratio(inv, fut)
+    if row is None:
+        log("tw_retail", "no_new_data" if ("找不到" in why or "對不上" in why) else "failure", detail=_clip(why))
+        return []
+    log("tw_retail", "success", as_of=row["as_of"], detail=f"{row['contract']} 散戶多空比 {row['ratio']:+.2f}%（法人多單 {row['inst_long']:,}、空單 {row['inst_short']:,}，全市場未平倉 {row['total_oi']:,}）")
+    return [row]
+
+
 def tw_options_snapshot():
     """模組 M22：台指選擇權（TXO）與台指期（TX）的每日快照（期交所 OpenAPI）。每天存摘要與履約價未平倉量，靠每天快照比較 OI 變動。
     期交所的每日行情在收盤後更新，跟台指期基差同一個時間點（tw_close）抓。"""
@@ -4259,6 +4327,7 @@ def run_job(job, dry_run=False):
             twopt = _run_module("M22", "台指選擇權與台指期快照", tw_options_snapshot) or []
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
+            extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
             extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, hold or []) or [], "symbol"))

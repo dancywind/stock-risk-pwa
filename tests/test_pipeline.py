@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -4113,6 +4113,77 @@ def test_fetch_taifex_falls_back_to_csv_only_when_the_body_is_not_json():
     with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/csv", csvb, "")):
         res = REAL["tw_options_snapshot"]()
     assert len(res) == 1 and res[0]["summary"]["fut_settle"] == 41000 and [x for x in fetch.LOG if x["source"] == "tw_options"][0]["status"] == "success"
+
+
+def _inv(ad, name, rows3):
+    ds = ad.strftime("%Y%m%d")
+    return [{"Date": ds, "ContractCode": name, "Item": it, "OpenInterest(Long)": str(l), "OpenInterest(Short)": str(s_), "OpenInterest(Net)": str(l - s_)} for it, l, s_ in rows3]
+
+
+def test_compute_retail_ratio_math_names_and_rejections():
+    ad = _last_weekday(date.today() - timedelta(days=1)); ds = ad.strftime("%Y%m%d")
+    mtx = [_tx(ds, "202611", 41000, 70000, contract="MTX"), _tx(ds, "202612", 41100, 20000, contract="MTX"), _tx(ds, "202611/202612", 1, 999999, contract="MTX"), _tx(ds, "202611", 1, 5, session="盤後", contract="MTX"), _tx(ds, "202611", 1, 555, contract="TX")]
+    inv = _inv(ad, "臺股期貨", [("自營商", 1, 1), ("投信", 1, 1), ("外資及陸資", 1, 1)]) + _inv(ad, "小型臺指期貨", [("自營商", 5000, 12000), ("投信", 100, 300), ("外資及陸資", 20000, 28000)])
+    row, why = fetch.compute_retail_ratio(inv, mtx, today=date.today())
+    assert why is None and row["contract"] == "小型臺指期貨" and row["total_oi"] == 90000 and row["inst_long"] == 25100 and row["inst_short"] == 40300
+    assert row["ratio"] == round((40300 - 25100) / 90000 * 100, 2) == 16.89 and row["as_of"] == ad.isoformat(), "（法人空 − 法人多）÷ 全市場 ＝ 散戶多 − 散戶空"
+    assert "不是交易所直接公布" in row["source"]
+    neg, _ = fetch.compute_retail_ratio(_inv(ad, "小型臺指期貨", [("自營商", 30000, 1000), ("投信", 100, 300), ("外資及陸資", 40000, 2000)]), mtx, today=date.today()); assert neg["ratio"] < 0, "法人大量做多 → 散戶淨空（負數）"
+    def bad(inv_, fut_): return fetch.compute_retail_ratio(inv_, fut_, today=date.today())[1]
+    assert "找不到小型臺指期貨" in bad(_inv(ad, "臺股期貨", [("自營商", 1, 1), ("投信", 1, 1), ("外資及陸資", 1, 1)]), mtx) and "臺股期貨" in bad(_inv(ad, "臺股期貨", [("自營商", 1, 1)]), mtx), "找不到要列出實際有哪些契約"
+    assert "只找到" in bad(_inv(ad, "小型臺指期貨", [("自營商", 5, 5), ("外資及陸資", 5, 5)]), mtx)
+    assert "找不到" in bad(inv, [_tx(ds, "202611", 1, 5, contract="TX")]) and "MTX" in bad(inv, [_tx(ds, "202611", 1, 5, contract="TX")])
+    assert "找不到" in bad(inv, [_tx((ad - timedelta(days=1)).strftime("%Y%m%d"), "202611", 1, 70000, contract="MTX")]), "期貨行情的日期和法人資料對不上"
+    assert "不合理" in bad(_inv(ad, "小型臺指期貨", [("自營商", 90000, 1), ("投信", 100, 300), ("外資及陸資", 20000, 28000)]), mtx)
+    assert fetch.compute_retail_ratio(None, mtx)[1] == "資料格式非預期" and fetch.compute_retail_ratio(inv, [])[1] == "資料格式非預期"
+    stale = _inv(date.today() + timedelta(days=3), "小型臺指期貨", [("自營商", 1, 1), ("投信", 1, 1), ("外資及陸資", 1, 1)]); assert "日期異常" in bad(stale, mtx)
+
+
+def test_tw_retail_ratio_module_json_csv_and_failure_classification():
+    ad = _last_weekday(date.today() - timedelta(days=1)); ds = ad.strftime("%Y%m%d")
+    mtx = [_tx(ds, "202611", 41000, 90000, contract="MTX")]
+    inv = _inv(ad, "小型臺指期貨", [("自營商", 5000, 12000), ("投信", 100, 300), ("外資及陸資", 20000, 28000)])
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(inv, "")), mock.patch.object(fetch, "fetch_taifex", return_value=(mtx, "")):
+        res = REAL["tw_retail_ratio"]()
+    assert len(res) == 1 and res[0]["ratio"] == 16.89 and [x for x in fetch.LOG if x["source"] == "tw_retail"][0]["status"] == "success" and "+16.89%" in fetch.LOG[-1]["detail"]
+    reset()                                                                                                    # 法人資料是 CSV：改走 CSV 後備
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "不是 JSON")), mock.patch.object(fetch, "_taifex_investor_csv", return_value=(inv, "")), mock.patch.object(fetch, "fetch_taifex", return_value=(mtx, "")):
+        assert len(REAL["tw_retail_ratio"]()) == 1
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch, "_taifex_investor_csv", return_value=(None, "CSV 抓取失敗")), mock.patch.object(fetch, "fetch_taifex", return_value=(mtx, "")):
+        assert REAL["tw_retail_ratio"]() == []
+    assert fetch.LOG[-1]["status"] == "failure"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, fetch.EMPTY_RESPONSE_MSG)), mock.patch.object(fetch, "_taifex_investor_csv", return_value=(None, fetch.EMPTY_RESPONSE_MSG)), mock.patch.object(fetch, "fetch_taifex", return_value=(None, fetch.EMPTY_RESPONSE_MSG)):
+        assert REAL["tw_retail_ratio"]() == []
+    assert fetch.LOG[-1]["status"] == "no_new_data", "全是空內容：不當成失敗"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(_inv(ad, "臺股期貨", [("自營商", 1, 1)]), "")), mock.patch.object(fetch, "fetch_taifex", return_value=(mtx, "")):
+        assert REAL["tw_retail_ratio"]() == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "找不到小型臺指期貨" in fetch.LOG[-1]["detail"] and "臺股期貨" in fetch.LOG[-1]["detail"], "名稱不對：記沒有資料並列出實際契約名稱，不讓工作變紅"
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(_inv(ad, "小型臺指期貨", [("自營商", 100000, 1), ("投信", 1, 1), ("外資及陸資", 1, 1)]), "")), mock.patch.object(fetch, "fetch_taifex", return_value=(mtx, "")):
+        assert REAL["tw_retail_ratio"]() == []
+    assert fetch.LOG[-1]["status"] == "failure", "數字不合理才算失敗"
+
+
+def test_run_job_daily_persists_retail_ratio_and_isolates_m28():
+    reset()
+    row = {"as_of": D(1), "contract": "小型臺指期貨", "inst_long": 1, "inst_short": 2, "total_oi": 10, "ratio": 10.0, "source": "x"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(dry, **kw):
+        got = []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "tw_retail_ratio", **(kw or {"return_value": [row]})), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append({n: (r, c) for n, r, c in tables}))]
+        for p_ in ps: p_.start()
+        try: fetch.run_job("tw_close", dry_run=dry)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(False); assert tables["tw_retail_ratio"] == ([row], "as_of") and st["module:M28"] == "success"
+    reset(); tables, st = go(True); assert "module:M28" not in st
+    reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M28"] == "failure" and "module:M07" in st and tables["tw_retail_ratio"][0] == []
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
