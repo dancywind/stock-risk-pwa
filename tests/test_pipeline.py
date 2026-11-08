@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -758,7 +758,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round14"), mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -4446,6 +4446,98 @@ def test_probe_round13_walks_back_to_the_latest_weekday_with_data_and_never_writ
     with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch.time, "sleep"):
         fetch.probe_round13()
     assert not [x for x in fetch.LOG if x["status"] == "failure"], "探測連不上也不能讓工作變紅"
+
+
+def _dxy_env(vals, fred=None, status=200):
+    today = fetch._now_et().date()
+    n = len(vals)
+    pts = [((today - timedelta(days=n - i)).isoformat(), v) for i, v in enumerate(vals)]
+    def req(method, path, *a, **k):
+        return (fred if fred is not None else [], "")
+    return [mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req),
+            mock.patch.object(fetch, "fetch_raw", return_value=(status, "application/json", json.dumps(_yh_json(pts)).encode() if status == 200 else b"", "" if status == 200 else "HTTP")), mock.patch.object(fetch.time, "sleep")], pts
+
+
+def _walk(n, seed=3):
+    import random
+    r = random.Random(seed); v, out = 100.0, []
+    for _ in range(n):
+        v *= 1 + r.uniform(-0.006, 0.006); out.append(round(v, 3))
+    return out
+
+
+def test_yahoo_dxy_validates_and_cross_checks_against_the_fed_broad_index():
+    vals = _walk(160)
+    ps, pts = _dxy_env(vals)
+    corr_fred = [{"as_of": d_, "value": round(v * 1.2 + 3, 3)} for d_, v in pts[-120:]]                                  # 和 DXY 同向的廣義指數
+    ps, pts = _dxy_env(vals, corr_fred); reset()
+    rows = _with(ps, lambda: REAL["yahoo_dxy"]())
+    assert len(rows) == 160 and rows[0]["series_id"] == "DXY" and rows[-1]["value"] == vals[-1] and "非官方" in rows[0]["source"] and "DXY" in rows[0]["label"] and rows[0]["as_of"] < rows[-1]["as_of"]
+    lg = [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]; assert lg["status"] == "success" and "相關係數 1.00" in lg["detail"] and "160 天" in lg["detail"], lg["detail"]
+    anti = [{"as_of": d_, "value": round(200 - v, 3)} for d_, v in pts[-120:]]                                              # 反向：可能抓到別的東西
+    ps, _ = _dxy_env(vals, anti); reset()
+    assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "failure" and "相關係數只有" in fetch.LOG[-1]["detail"] and "整批不用" in fetch.LOG[-1]["detail"]
+    ps, _ = _dxy_env(vals, corr_fred[:5]); reset()                                                                           # 重疊太少：照收，但寫明沒核對
+    rows = _with(ps, lambda: REAL["yahoo_dxy"]()); assert len(rows) == 160 and "沒有核對" in [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]["detail"]
+    ps, _ = _dxy_env(_walk(160)[:99] if False else _walk(99)); reset()
+    assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "no_new_data" and "至少 100" in fetch.LOG[-1]["detail"]
+    ps, _ = _dxy_env([v * 2 for v in vals]); reset()                                                                          # 數值超出 70 到 130
+    assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "failure" and "超出 70 到 130" in fetch.LOG[-1]["detail"]
+    ps, _ = _dxy_env(vals, status=429); reset()
+    assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "no_new_data" and "HTTP 429" in fetch.LOG[-1]["detail"], "被擋：只記沒有資料，不讓工作變紅"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert REAL["yahoo_dxy"]() == []
+    assert fetch.LOG[-1]["status"] == "skipped"
+    # 今天的資料（還沒收盤）不收
+    today = fetch._now_et().date().isoformat()
+    pts2 = [((fetch._now_et().date() - timedelta(days=130 - i)).isoformat(), v) for i, v in enumerate(_walk(130))] + [(today, 101.0)]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], "")), mock.patch.object(fetch.time, "sleep"), \
+         mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", json.dumps(_yh_json(pts2)).encode(), "")):
+        rows = REAL["yahoo_dxy"]()
+    assert rows and all(r["as_of"] < today for r in rows) and len(rows) == 130
+
+
+def test_run_job_daily_persists_dxy_and_isolates_m31():
+    reset()
+    row = {"series_id": "DXY", "label": "x", "as_of": D(1), "value": 99.5, "source": "x"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(dry, **kw):
+        got = []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "yahoo_dxy", **(kw or {"return_value": [row]})), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in ps: p_.start()
+        try: fetch.run_job("tw_close", dry_run=dry)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(False); assert ("macro_series", [row], "series_id,as_of") in tables and st["module:M31"] == "success"
+    reset(); tables, st = go(True); assert "module:M31" not in st
+    reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M31"] == "failure" and "module:M07" in st
+
+
+def test_probe_round14_logs_each_candidate_source_and_never_writes_or_turns_red():
+    pages = {"finra.org": (200, "text/html", b'<html><a href="/sites/default/files/margin-statistics.xlsx">x</a><table><tr><td>Sep-26</td><td>1,234,567</td></tr></table></html>', ""),
+             "sent_results": (200, "text/html", b"<html><body><div>Bullish</div><div>38.5%</div></body></html>", ""), "sentiment.xls": (200, "application/vnd.ms-excel", b"\xd0\xcf\x11\xe0rest", ""),
+             "data.nasdaq.com": (403, "application/json", b'{"quandl_error":"QECx02"}', "HTTP 403"), "stooq.com": (200, "text/csv", b"Date,Open,High,Low,Close\n2026-11-06,99,100,98,99.5\n", "")}
+    def raw(url, timeout=None, headers=None):
+        for k, v in pages.items():
+            if k in url: return v
+        return (None, "", b"", "unexpected")
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_upsert") as up, mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round14()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert set(by) == {"probe:finra_page", "probe:aaii_results", "probe:aaii_xls", "probe:nasdaq_aaii", "probe:stooq_dxy"}
+    assert by["probe:finra_page"]["status"] == "success" and "margin-statistics.xlsx" in by["probe:finra_page"]["detail"] and "Sep-26" in by["probe:finra_page"]["detail"] and "1,234,567" in by["probe:finra_page"]["detail"]
+    assert "Bullish 附近" in by["probe:aaii_results"]["detail"] and "38.5%" in by["probe:aaii_results"]["detail"] and "magic d0cf11e0" in by["probe:aaii_xls"]["detail"]
+    assert by["probe:nasdaq_aaii"]["status"] == "no_new_data" and "HTTP 403" in by["probe:nasdaq_aaii"]["detail"] and "前 3 行" in by["probe:stooq_dxy"]["detail"]
+    up.assert_not_called()
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round14()
+    assert not [x for x in fetch.LOG if x["status"] == "failure"] and len(fetch.LOG) == 5, "連不上也不能讓工作變紅"
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

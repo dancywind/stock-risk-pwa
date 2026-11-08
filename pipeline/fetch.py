@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v64"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v65"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3980,6 +3980,81 @@ def yahoo_fill():
     return out
 
 
+def yahoo_dxy():
+    """模組 M31：美元指數 DXY（ICE 的那個，不是聯準會的廣義美元指數），用 Yahoo Finance（非官方）的 DX-Y.NYB，近 2 年日資料存進 macro_series（series_id = DXY）。
+    驗證：筆數夠（至少 100）、數值在 70 到 130、日期由舊到新且不含今天（還沒收盤）；再拿「和 FRED 廣義美元指數的日變動」算相關係數核對（兩個指數不同但高度相關，
+    相關係數低於 0.5 代表可能抓到別的東西，整批不用；FRED 資料不夠核對時照收，並在紀錄裡寫明沒核對）。抓不到只記「沒有資料」，不讓工作變紅。"""
+    if not sb_ready():
+        log("yahoo_dxy", "skipped", detail="未設定 Supabase，不補 DXY")
+        return []
+    sym, sid, (lo, hi) = config.YAHOO_DXY
+    status, ctype, body, err = fetch_raw(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?range=2y&interval=1d", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
+    if status != 200:
+        log("yahoo_dxy", "no_new_data", detail=_clip(f"{sym} HTTP {status} {err}".strip()))
+        return []
+    try:
+        pts = parse_yahoo_chart(json.loads(body.decode("utf-8-sig")))
+    except (ValueError, UnicodeDecodeError):
+        pts = None
+    today = _now_et().date().isoformat()
+    pts = [(d_, v) for d_, v in (pts or []) if d_ < today]
+    if len(pts) < 100:
+        log("yahoo_dxy", "no_new_data", detail=_clip(f"{sym} 只有 {len(pts)} 筆可用（至少 100），不用"))
+        return []
+    if [d_ for d_, _v in pts] != sorted({d_ for d_, _v in pts}) or not all(lo <= v <= hi for _d, v in pts):
+        log("yahoo_dxy", "failure", detail=_clip(f"{sym} 的日期不是由舊到新、有重複，或數值超出 {lo:g} 到 {hi:g}，不用"))
+        return []
+    fred, _e = sb_request("GET", "macro_series?select=as_of,value&series_id=eq.DTWEXBGS&order=as_of.desc&limit=150")
+    fmap = {str(r["as_of"]): float(r["value"]) for r in (fred or []) if isinstance(r, dict) and parse_number(r.get("value")) is not None}
+    common = [(d_, v, fmap[d_]) for d_, v in pts if d_ in fmap]
+    note = ""
+    if len(common) >= 16:
+        import math
+        a = [math.log(common[i][1] / common[i - 1][1]) for i in range(1, len(common))]
+        b = [math.log(common[i][2] / common[i - 1][2]) for i in range(1, len(common))]
+        ma, mb = sum(a) / len(a), sum(b) / len(b)
+        den = math.sqrt(sum((x - ma) ** 2 for x in a) * sum((y - mb) ** 2 for y in b))
+        corr = sum((x - ma) * (y - mb) for x, y in zip(a, b)) / den if den else 0.0
+        if corr < 0.5:
+            log("yahoo_dxy", "failure", detail=_clip(f"{sym} 和 FRED 廣義美元指數的日變動相關係數只有 {corr:.2f}（低於 0.5），可能抓到別的東西，整批不用"))
+            return []
+        note = f"；和 FRED 廣義美元指數的日變動相關係數 {corr:.2f}（{len(a)} 組）"
+    else:
+        note = f"；FRED 廣義美元指數重疊只有 {len(common)} 天，沒有核對"
+    rows = [{"series_id": sid, "label": "美元指數 DXY（ICE，Yahoo 非官方）", "as_of": d_, "value": round(v, 3), "source": "Yahoo Finance（非官方）"} for d_, v in pts]
+    log("yahoo_dxy", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 天（{rows[0]['as_of']} 到 {rows[-1]['as_of']}），最新 {rows[-1]['value']}" + note)
+    return rows
+
+
+def probe_round14():
+    """只讀探測第十四批：FINRA 融資統計（換成瀏覽器風格的標頭、找頁面上的檔案連結）、AAII 的其他讀法（結果頁、歷史檔、Nasdaq Data Link）、DXY 的備用來源（Stooq）。
+    每一項記：HTTP 狀態、內容類型、位元組數、開頭；FINRA 頁面另外找表格列與 xls／csv 連結。不寫入任何資料表。"""
+    browser = {"User-Agent": config.NASDAQ_UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.finra.org/", "Upgrade-Insecure-Requests": "1"}
+    plain = {"User-Agent": config.NASDAQ_UA, "Accept": "*/*"}
+    for tag, url, hdr in (("finra_page", config.FINRA_MARGIN_URL, browser), ("aaii_results", "https://www.aaii.com/sentimentsurvey/sent_results", dict(browser, Referer="https://www.aaii.com/")),
+                          ("aaii_xls", "https://www.aaii.com/files/surveys/sentiment.xls", dict(plain, Referer="https://www.aaii.com/")), ("nasdaq_aaii", "https://data.nasdaq.com/api/v3/datasets/AAII/AAII_SENTIMENT.json?rows=3", plain),
+                          ("stooq_dxy", "https://stooq.com/q/d/l/?s=dx.f&i=d", plain)):
+        status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=hdr)
+        time.sleep(1)
+        if status is None:
+            log(f"probe:{tag}", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+            continue
+        raw = body or b""
+        txt = raw.decode("utf-8", errors="replace")
+        head = "magic " + raw[:4].hex() if tag == "aaii_xls" else re.sub(r"\s+", " ", txt[:160])
+        extra = ""
+        if tag == "finra_page" and status == 200:
+            links = re.findall(r'href="([^"]+\.(?:xlsx?|csv))"', txt, re.I)[:4]
+            rows = re.findall(r"([A-Z][a-z]{2}[- ]\d{2,4})\s*(?:</t[dh]>\s*<t[dh][^>]*>)?\s*\$?\s*([\d,]{6,})", txt)[:3]
+            extra = f"｜檔案連結 {links}｜表格列 {rows}"
+        if tag == "aaii_results" and status == 200:
+            m = re.search(r"Bullish.{0,160}", re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", txt)))
+            extra = f"｜Bullish 附近 {m.group(0)[:160] if m else '找不到'}"
+        if tag == "stooq_dxy" and status == 200:
+            extra = f"｜行數 {len(txt.splitlines())}｜前 3 行 {txt.splitlines()[:3]}"
+        log(f"probe:{tag}", "success" if status == 200 else "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜{len(raw)} 位元組｜開頭 {head!r}{extra}"))
+
+
 def probe_round13():
     """只讀探測第十三批：櫃買網站「融資融券餘額」頁（新格式：tables → fields、data、summary）。上一批用「今天」（週日）查，資料是空的，
     這批從今天往前找最近 8 天內第一個有資料的平日，把欄位、前 2 列、summary（合計列）和 notes 記下來，看有沒有「融資金額」（算上櫃維持率需要）。不寫入任何資料表。"""
@@ -4515,6 +4590,7 @@ def run_job(job, dry_run=False):
         probe_round11()
         probe_round12()
         probe_round13()
+        probe_round14()
     inst_hist, pc_rows, margin_hist, index_long = [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
@@ -4551,6 +4627,7 @@ def run_job(job, dry_run=False):
             twopt = _run_module("M22", "台指選擇權與台指期快照", tw_options_snapshot) or []
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
+            extra.append(("macro_series", _run_module("M31", "美元指數 DXY（Yahoo，非官方）", yahoo_dxy) or [], "series_id,as_of"))
             extra.append(("watch_snapshot", _run_module("M30", "候選股估值（本益比、殖利率、股價淨值比）", watch_valuation) or [], "code"))
             extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
