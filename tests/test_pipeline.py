@@ -2444,10 +2444,10 @@ def test_fred_history_backfill_collects_all_configured_series():
     reset()
     def fj(url, **k):                                                            # 每個序列要給它合理範圍內的數字（VIX 不可能是 6000）
         sid = url.split("series_id=")[1].split("&")[0]
-        return {"observations": [{"date": D(3), "value": "20" if sid in ("VIXCLS", "VXNCLS") else "6000"}]}, ""
+        return {"observations": [{"date": D(3), "value": "20" if sid in ("VIXCLS", "VXNCLS") else "120" if sid == "DTWEXBGS" else "6000"}]}, ""
     with with_key(), mock.patch.object(fetch, "fetch_json", side_effect=fj):
         rows = REAL["fred_history_backfill"]()
-    assert {r["series_id"] for r in rows} == set(config.FRED_HISTORY) == {"SP500", "NASDAQCOM", "DJIA", "VIXCLS", "VXNCLS"}
+    assert {r["series_id"] for r in rows} == set(config.FRED_HISTORY) == {"SP500", "NASDAQCOM", "DJIA", "VIXCLS", "VXNCLS", "DTWEXBGS"}
     assert [r["value"] for r in rows if r["series_id"] == "VIXCLS"] == [20.0]
     reset()
     with with_key(), mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": D(3), "value": "6000"}]}, "")):      # 用錯單位的 VIX 要被拒收，不能被寫進去
@@ -4472,13 +4472,13 @@ def test_yahoo_dxy_validates_and_cross_checks_against_the_fed_broad_index():
     corr_fred = [{"as_of": d_, "value": round(v * 1.2 + 3, 3)} for d_, v in pts[-120:]]                                  # 和 DXY 同向的廣義指數
     ps, pts = _dxy_env(vals, corr_fred); reset()
     rows = _with(ps, lambda: REAL["yahoo_dxy"]())
-    assert len(rows) == 160 and rows[0]["series_id"] == "DXY" and rows[-1]["value"] == vals[-1] and "非官方" in rows[0]["source"] and "DXY" in rows[0]["label"] and rows[0]["as_of"] < rows[-1]["as_of"]
+    assert len(rows) == 160 and rows[0]["series_id"] == "DXY" and rows[-1]["value"] == vals[-1] and "非官方" in rows[0]["source"] and "已和聯準會廣義美元指數核對，日變動相關係數 1.00" in rows[0]["source"] and all(r["source"] == rows[0]["source"] for r in rows) and "DXY" in rows[0]["label"] and rows[0]["as_of"] < rows[-1]["as_of"]
     lg = [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]; assert lg["status"] == "success" and "相關係數 1.00" in lg["detail"] and "160 天" in lg["detail"], lg["detail"]
     anti = [{"as_of": d_, "value": round(200 - v, 3)} for d_, v in pts[-120:]]                                              # 反向：可能抓到別的東西
     ps, _ = _dxy_env(vals, anti); reset()
     assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "failure" and "相關係數只有" in fetch.LOG[-1]["detail"] and "整批不用" in fetch.LOG[-1]["detail"]
     ps, _ = _dxy_env(vals, corr_fred[:5]); reset()                                                                           # 重疊太少：照收，但寫明沒核對
-    rows = _with(ps, lambda: REAL["yahoo_dxy"]()); assert len(rows) == 160 and "沒有核對" in [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]["detail"]
+    rows = _with(ps, lambda: REAL["yahoo_dxy"]()); assert len(rows) == 160 and "沒有核對" in [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]["detail"] and "沒有核對：聯準會廣義美元指數的歷史重疊只有 5 天" in rows[0]["source"], "沒核對就明寫在每一筆的來源欄"
     ps, _ = _dxy_env(_walk(160)[:99] if False else _walk(99)); reset()
     assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "no_new_data" and "至少 100" in fetch.LOG[-1]["detail"]
     ps, _ = _dxy_env([v * 2 for v in vals]); reset()                                                                          # 數值超出 70 到 130

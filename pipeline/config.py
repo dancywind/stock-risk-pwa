@@ -53,7 +53,7 @@ FRED_OPTIONAL = {"RU2000PR", "VXNCLS"}
 # 選用＝抓不到只記「沒有資料」，不讓整個工作變紅；沒寫就是核心來源，抓不到會記失敗。
 # 2026-11-03 實測：Nasdaq 綜合（COMP）可以；S&P 500（SPX）與道瓊（DJIA）在 Nasdaq 的 API 歷史與報價都回「沒有資料」，所以不放進來。
 US_INDEX_FEED = (("COMP", "NASDAQCOM", ("index",)),)
-FRED_HISTORY = ("SP500", "NASDAQCOM", "DJIA", "VIXCLS", "VXNCLS")      # VIXCLS 用來算門檻的近一年分布
+FRED_HISTORY = ("SP500", "NASDAQCOM", "DJIA", "VIXCLS", "VXNCLS", "DTWEXBGS")      # DTWEXBGS 是給 DXY 核對用的（拿兩者的日變動算相關係數）      # VIXCLS 用來算門檻的近一年分布
 # 模組 M27：Yahoo 補 FRED 落後的天數。每項：(Yahoo 代號, macro_series 序列, 和 FRED 重疊日子的最大容許差距)。原油期貨和 FRED 的現貨價口徑略有不同，所以容許較大。
 # 模組 M31：美元指數 DXY（ICE）。Yahoo 代號、存進 macro_series 的序列名、合理範圍。
 YAHOO_DXY = ("DX-Y.NYB", "DXY", (70.0, 130.0))
@@ -166,7 +166,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v65"
+PIPELINE_VERSION = "v66"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

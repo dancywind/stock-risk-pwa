@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v65"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v66"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4019,9 +4019,11 @@ def yahoo_dxy():
             log("yahoo_dxy", "failure", detail=_clip(f"{sym} 和 FRED 廣義美元指數的日變動相關係數只有 {corr:.2f}（低於 0.5），可能抓到別的東西，整批不用"))
             return []
         note = f"；和 FRED 廣義美元指數的日變動相關係數 {corr:.2f}（{len(a)} 組）"
+        src = f"Yahoo Finance（非官方；已和聯準會廣義美元指數核對，日變動相關係數 {corr:.2f}）"
     else:
         note = f"；FRED 廣義美元指數重疊只有 {len(common)} 天，沒有核對"
-    rows = [{"series_id": sid, "label": "美元指數 DXY（ICE，Yahoo 非官方）", "as_of": d_, "value": round(v, 3), "source": "Yahoo Finance（非官方）"} for d_, v in pts]
+        src = f"Yahoo Finance（非官方；沒有核對：聯準會廣義美元指數的歷史重疊只有 {len(common)} 天）"          # 核對結果寫進資料本身，卡片的「來源」就看得到
+    rows = [{"series_id": sid, "label": "美元指數 DXY（ICE，Yahoo 非官方）", "as_of": d_, "value": round(v, 3), "source": src} for d_, v in pts]
     log("yahoo_dxy", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 天（{rows[0]['as_of']} 到 {rows[-1]['as_of']}），最新 {rows[-1]['value']}" + note)
     return rows
 
