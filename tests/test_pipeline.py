@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -4184,6 +4184,60 @@ def test_run_job_daily_persists_retail_ratio_and_isolates_m28():
     tables, st = go(False); assert tables["tw_retail_ratio"] == ([row], "as_of") and st["module:M28"] == "success"
     reset(); tables, st = go(True); assert "module:M28" not in st
     reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M28"] == "failure" and "module:M07" in st and tables["tw_retail_ratio"][0] == []
+
+
+def _otc_margin(n=200, units=10000, bad=0, date_s=None):
+    d = date_s or ymd(); roc = f"{int(d[:4]) - 1911}{d[4:]}"
+    rows = [{"Date": roc, "SecuritiesCompanyCode": f"{3000 + i}", "CompanyName": f"股{i}", "MarginPurchaseBalancePreviousDay": str(units + 100), "MarginPurchase": "50", "MarginSales": "100", "CashRedemption": "50",
+             "MarginPurchaseBalance": str(units + (7 if i < bad else 0))} for i in range(n)]                       # 前日 units+100，買 50、賣 100、償 50 → 今日 units
+    return rows
+
+
+def _otc_px(n=200, price=80.0, date_s=None, drop=0):
+    d = date_s or ymd(); roc = f"{int(d[:4]) - 1911}{d[4:]}"
+    return [{"Date": roc, "SecuritiesCompanyCode": f"{3000 + i}", "CompanyName": f"股{i}", "Close": ("" if i < drop else str(price)), "Change": "0"} for i in range(n)]
+
+
+def _otc_env(margin, px):
+    return mock.patch.object(fetch, "fetch_json", side_effect=lambda url, **k: margin if url == config.TPEX_MARGIN_URL else px)
+
+
+def test_tpex_margin_daily_sums_units_and_value_with_validation():
+    reset()
+    with _otc_env((_otc_margin(), ""), (_otc_px(), "")):
+        rows = REAL["tpex_margin_daily"]()
+    assert len(rows) == 1 and rows[0]["units"] == 200 * 10000 and rows[0]["prev_units"] == 200 * 10100 and rows[0]["value"] == 200 * 10000 * 1000 * 80 and rows[0]["n_stocks"] == 200 and rows[0]["n_missing"] == 0 and "沒有融資金額" in rows[0]["source"]
+    lg = [x for x in fetch.LOG if x["source"] == "tpex_margin"][0]; assert lg["status"] == "success" and "上櫃融資 2,000,000 張（前日 2,020,000，-0.99%）" in lg["detail"], lg["detail"]
+    def last(): return [x for x in fetch.LOG if x["source"] == "tpex_margin"][-1]
+    for m, p, st, frag in (((_otc_margin(), ""), (_otc_px(date_s=ymd(-1)), ""), "no_new_data", "兩天不一致"), ((_otc_margin(bad=60), ""), (_otc_px(), ""), "failure", "通過"), ((_otc_margin(), ""), (_otc_px(drop=20), ""), "failure", "超過 5%"),
+                           ((_otc_margin(units=1), ""), (_otc_px(), ""), "failure", "範圍"), ((None, "HTTP 403"), ([], ""), "failure", "抓取失敗"), ((None, fetch.EMPTY_RESPONSE_MSG), (None, fetch.EMPTY_RESPONSE_MSG), "no_new_data", "抓取失敗"),
+                           (([{"Date": "x"}], ""), (_otc_px(), ""), "failure", "欄位與預期不符"), ((_otc_margin(), ""), ([{"Date": "x"}], ""), "failure", "欄位與預期不符")):
+        reset()
+        with _otc_env(m, p):
+            assert REAL["tpex_margin_daily"]() == [], frag
+        assert last()["status"] == st and frag in last()["detail"], (frag, last())
+    reset()
+    with _otc_env((_otc_margin(), ""), (_otc_px(drop=8), "")):                                                   # 4% 查不到收盤價：在容許範圍
+        r = REAL["tpex_margin_daily"]()
+    assert r and r[0]["n_missing"] == 8 and r[0]["n_stocks"] == 192
+
+
+def test_run_job_daily_persists_tpex_margin_and_isolates_m29():
+    reset()
+    row = {"as_of": D(1), "units": 2000000, "prev_units": 2020000, "value": 1e11, "n_stocks": 880, "n_missing": 2, "source": "x"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(dry, **kw):
+        got = []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "tpex_margin_daily", **(kw or {"return_value": [row]})), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append({n: (r, c) for n, r, c in tables}))]
+        for p_ in ps: p_.start()
+        try: fetch.run_job("tw_close", dry_run=dry)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(False); assert tables["tpex_margin_daily"] == ([row], "as_of") and st["module:M29"] == "success"
+    reset(); tables, st = go(True); assert "module:M29" not in st
+    reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M29"] == "failure" and "module:M07" in st and tables["tpex_margin_daily"][0] == []
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v58"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v59"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3021,6 +3021,62 @@ def tw_retail_ratio():
     return [row]
 
 
+def tpex_margin_daily():
+    """模組 M29：上櫃融資餘額（張數）每天累積。櫃買中心的開放資料「上櫃股票融資融券餘額」是逐檔表（前日餘額、買進、賣出、償還、今日餘額，單位張），沒有融資金額，
+    所以算不出上櫃的融資維持率；這裡只算總張數、前日總張數、融資股票市值（Σ 張數 × 1000 × 收盤價，受股價影響，只當參考）。
+    驗證：每一列「前日＋買進－賣出－償還＝今日」要在 98% 以上對得上；融資表與收盤價的日期必須是同一天；有融資的股票查不到收盤價超過 5% 就不算。"""
+    rows, e1 = fetch_json(config.TPEX_MARGIN_URL)
+    px, e2 = fetch_json(config.TPEX_QUOTES_URL)
+    if rows is None or px is None:
+        log("tpex_margin", "no_new_data" if all(is_empty_response(e) for e in (e1, e2) if e) else "failure", detail=_clip(f"抓取失敗：融資 {e1 or '好'}；收盤價 {e2 or '好'}"))
+        return []
+    need = ("Date", "SecuritiesCompanyCode", "MarginPurchaseBalancePreviousDay", "MarginPurchase", "MarginSales", "CashRedemption", "MarginPurchaseBalance")
+    if not (isinstance(rows, list) and rows and isinstance(rows[0], dict) and all(k in rows[0] for k in need)) or not (isinstance(px, list) and px and isinstance(px[0], dict) and all(k in px[0] for k in ("Date", "SecuritiesCompanyCode", "Close"))):
+        log("tpex_margin", "failure", detail=_clip(f"欄位與預期不符：融資 {list(rows[0].keys())[:8] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else type(rows).__name__}"))
+        return []
+    as_of = roc_to_iso(Counter(str(r.get("Date", "")) for r in rows if isinstance(r, dict)).most_common(1)[0][0])
+    ok, why = validate_close_date(as_of)
+    if not ok:
+        log("tpex_margin", "failure", as_of=as_of, detail=f"資料日期異常: {why}")
+        return []
+    px_date = roc_to_iso(Counter(str(r.get("Date", "")) for r in px if isinstance(r, dict)).most_common(1)[0][0])
+    if px_date != as_of:
+        log("tpex_margin", "no_new_data", as_of=as_of, detail=f"收盤價的日期是 {px_date}，融資表是 {as_of}，兩天不一致，不算")
+        return []
+    close = {}
+    for r in px:
+        c = parse_number(r.get("Close"))
+        if isinstance(r, dict) and c and c > 0:
+            close[str(r.get("SecuritiesCompanyCode", "")).strip()] = c
+    units = prev = n_ok = n = missing = 0
+    value = 0.0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        a, b, c_, d_, e_ = (parse_number(r.get(k)) for k in need[2:])
+        if None in (a, b, c_, d_, e_) or min(a, e_) < 0:
+            continue
+        n += 1
+        if abs(a + b - c_ - d_ - e_) <= 1:
+            n_ok += 1
+        units, prev = units + int(e_), prev + int(a)
+        if e_ > 0:
+            code = str(r.get("SecuritiesCompanyCode", "")).strip()
+            if code in close:
+                value += e_ * 1000 * close[code]
+            else:
+                missing += 1
+    held = sum(1 for r in rows if isinstance(r, dict) and (parse_number(r.get("MarginPurchaseBalance")) or 0) > 0)
+    if n < 100 or n_ok / n < 0.98:
+        log("tpex_margin", "failure", as_of=as_of, detail=_clip(f"{n} 列可解析，只有 {n_ok} 列通過「前日＋買進－賣出－償還＝今日」，不採用（欄位意思可能和預期不同）"))
+        return []
+    if not (1e5 <= units <= 5e7) or prev <= 0 or held == 0 or missing / held > 0.05:
+        log("tpex_margin", "failure", as_of=as_of, detail=_clip(f"總張數 {units:,}（範圍 10 萬到 5,000 萬）、前日 {prev:,}，或有融資的 {held} 檔裡 {missing} 檔查不到收盤價（超過 5%），不採用"))
+        return []
+    log("tpex_margin", "success", as_of=as_of, detail=f"上櫃融資 {units:,} 張（前日 {prev:,}，{(units / prev - 1) * 100:+.2f}%）；融資股票市值約 {value / 1e8:,.0f} 億元（{held - missing} 檔，{missing} 檔查不到收盤價）")
+    return [{"as_of": as_of, "units": units, "prev_units": prev, "value": round(value), "n_stocks": held - missing, "n_missing": missing, "source": "櫃買中心開放資料（逐檔融資張數；沒有融資金額，所以沒有維持率）"}]
+
+
 def tw_options_snapshot():
     """模組 M22：台指選擇權（TXO）與台指期（TX）的每日快照（期交所 OpenAPI）。每天存摘要與履約價未平倉量，靠每天快照比較 OI 變動。
     期交所的每日行情在收盤後更新，跟台指期基差同一個時間點（tw_close）抓。"""
@@ -4327,6 +4383,7 @@ def run_job(job, dry_run=False):
             twopt = _run_module("M22", "台指選擇權與台指期快照", tw_options_snapshot) or []
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
+            extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
