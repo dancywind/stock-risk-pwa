@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v60"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v62"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3257,13 +3257,91 @@ def finmind_to_single(ser, basis):
     return out
 
 
+def _flex_date(raw):
+    """民國 7 位數（1151106）或西元 8 位數（20261106）→ ISO 日期；不合法回傳 None。"""
+    d = re.sub(r"\D", "", str(raw or ""))
+    try:
+        if len(d) == 7:
+            return date(int(d[:3]) + 1911, int(d[3:5]), int(d[5:])).isoformat()
+        if len(d) == 8:
+            return date(int(d[:4]), int(d[4:6]), int(d[6:])).isoformat()
+    except ValueError:
+        return None
+    return None
+
+
+def _in_range(raw, lo, hi, lo_open=False):
+    v = parse_number(raw)
+    return v if v is not None and (lo < v if lo_open else lo <= v) and v <= hi else None
+
+
+def watch_valuation():
+    """模組 M30：候選股（你在網站輸入的 private_watchlist）的收盤價、本益比、殖利率、股價淨值比，用證交所與櫃買中心的全市場表查。
+    本益比是用過去四季盈餘算的（不是預估）；虧損的公司沒有本益比，留空。代號兩個市場都查不到就列出來（可能是興櫃、已下市或代號打錯），不寫入。
+    四個來源裡有失敗的只影響該來源的欄位；全部都失敗才算失敗。"""
+    if not sb_ready():
+        log("watch", "skipped", detail="未設定 Supabase，不查候選股")
+        return []
+    got, err = sb_request("GET", "private_watchlist?select=code&limit=500")
+    if got is None:
+        log("watch", "failure", detail=_clip(f"讀取候選股清單失敗：{err}（請先執行 new_tables_v58.sql）"))
+        return []
+    codes = sorted({str(r.get("code", "")).strip() for r in got if isinstance(r, dict) and re.fullmatch(r"\d{4,6}[A-Z]?", str(r.get("code", "")).strip())})
+    if not codes:
+        log("watch", "no_new_data", detail="候選股清單是空的")
+        return []
+    srcs = (("twse_px", config.TWSE_AVG_URL), ("twse_pe", config.TWSE_OPENAPI_BASE + "/exchangeReport/BWIBBU_ALL"), ("tpex_px", config.TPEX_QUOTES_URL), ("tpex_pe", config.TPEX_DEFAULT_BASE + "/tpex_mainboard_peratio_analysis"))
+    keyf = {"twse_px": "Code", "twse_pe": "Code", "tpex_px": "SecuritiesCompanyCode", "tpex_pe": "SecuritiesCompanyCode"}
+    idx, errs = {}, []
+    for k, u in srcs:
+        j, e = fetch_json(u)
+        if isinstance(j, list) and j and isinstance(j[0], dict) and keyf[k] in j[0]:
+            idx[k] = {str(r.get(keyf[k], "")).strip(): r for r in j if isinstance(r, dict)}
+        else:
+            errs.append(f"{k}（{e or '格式非預期'}）")
+    if not idx:
+        log("watch", "no_new_data" if all("空的回應" in x for x in errs) else "failure", detail=_clip("四個來源都抓不到：" + "、".join(errs)))
+        return []
+    out, missing, bad_date = [], [], []
+    today = date.today().isoformat()
+    for code in codes:
+        if code in idx.get("twse_px", {}) or code in idx.get("twse_pe", {}):
+            mk, px, pe = "TWSE", idx.get("twse_px", {}).get(code), idx.get("twse_pe", {}).get(code)
+            name = str((px or pe).get("Name", "")).strip() or code
+            close, pev, pbv, yv = (px or {}).get("ClosingPrice"), (pe or {}).get("PEratio"), (pe or {}).get("PBratio"), (pe or {}).get("DividendYield")
+        elif code in idx.get("tpex_px", {}) or code in idx.get("tpex_pe", {}):
+            mk, px, pe = "TPEX", idx.get("tpex_px", {}).get(code), idx.get("tpex_pe", {}).get(code)
+            name = str((px or pe).get("CompanyName", "")).strip() or code
+            close, pev, pbv, yv = (px or {}).get("Close"), (pe or {}).get("PriceEarningRatio"), (pe or {}).get("PriceBookRatio"), (pe or {}).get("YieldRatio")
+        else:
+            missing.append(code)
+            continue
+        as_of = _flex_date((px or pe).get("Date")) if (px or pe) else None
+        v_as_of = _flex_date(pe.get("Date")) if pe else None
+        if not as_of or as_of > today or (v_as_of and v_as_of > today):
+            bad_date.append(code)
+            continue
+        out.append({"code": code, "name": name, "market": mk, "as_of": as_of, "close": _in_range(close, 0, 1e6, True), "val_as_of": v_as_of,
+                    "pe": _in_range(pev, 0, 1000, True), "pb": _in_range(pbv, 0, 100, True), "dividend_yield": _in_range(yv, 0, 50),
+                    "source": "證交所／櫃買中心開放資料（本益比用過去四季盈餘算，不是預估）"})
+    notes = ([f"查不到：{'、'.join(missing)}（可能是興櫃、已下市或代號打錯）"] if missing else []) + ([f"日期異常略過：{'、'.join(bad_date)}"] if bad_date else []) + ([f"來源失敗：{'、'.join(errs)}"] if errs else [])
+    log("watch", "success" if out else "no_new_data", detail=_clip(f"{len(out)} / {len(codes)} 檔有資料" + ("｜" + "；".join(notes) if notes else "")))
+    return out
+
+
 def finmind_fin_history(price_rows):
     """模組 M25：台股持股的歷史季度三率（FinMind，第三方、非官方；證交所開放資料只放最新一季，所以前一季查不到）。
     存進獨立的 tw_fin_q_ext（一律單季值），網頁只在官方查不到或比不了上一季時才用，並標示來源。
     判斷單季或累計用 detect_finmind_basis；判斷不了就一列都不寫。FinMind 有請求次數限制，被限流或擋掉就停止，記「沒有資料」（不讓工作變紅）。"""
     wanted = {r["code"]: r.get("name") or r["code"] for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")}
+    if sb_ready():                                                                           # 候選股也一併抓三率（選股前看三率）
+        wl, _e = sb_request("GET", "private_watchlist?select=code&limit=200")
+        for r in (wl or []):
+            c = str(r.get("code", "")).strip() if isinstance(r, dict) else ""
+            if re.fullmatch(r"\d{4}", c):
+                wanted.setdefault(c, c)
     if not wanted:
-        log("finmind_fin", "skipped", detail="沒有台股持股代號，不抓 FinMind")
+        log("finmind_fin", "skipped", detail="沒有台股持股或候選股代號，不抓 FinMind")
         return []
     start = f"{date.today().year - 2}-01-01"
     by_code, notes = {}, []
@@ -3285,6 +3363,10 @@ def finmind_fin_history(price_rows):
             notes.append(f"{code} {wanted[code]}（沒有一般業損益項目，可能是金融業）")
         time.sleep(config.FINMIND_SLEEP)
     basis, st = detect_finmind_basis(by_code)
+    if basis is None and sb_ready() and by_code:                                             # 樣本太少判斷不了：沿用資料庫裡已判斷過的結果（同一個資料集，口徑一致）
+        hint, _e = sb_request("GET", "tw_fin_q_ext?select=basis&limit=1")
+        if hint and isinstance(hint[0], dict) and hint[0].get("basis") in ("single", "converted"):
+            basis, st = ("single" if hint[0]["basis"] == "single" else "cumulative"), dict(st or {}, n=(st or {}).get("n", 0))
     if basis is None:
         log("finmind_fin", "no_new_data", detail=_clip(f"{len(by_code)} 檔有資料，但只有 {st['n']} 個「公司年度」可判斷單季或累計（至少 4 個、且結果要一致），不寫入" + (f"；{'、'.join(notes[:5])}" if notes else "")))
         return []
@@ -3852,6 +3934,33 @@ def yahoo_fill():
     return out
 
 
+def probe_round13():
+    """只讀探測第十三批：櫃買網站「融資融券餘額」頁（新格式：tables → fields、data、summary）。上一批用「今天」（週日）查，資料是空的，
+    這批從今天往前找最近 8 天內第一個有資料的平日，把欄位、前 2 列、summary（合計列）和 notes 記下來，看有沒有「融資金額」（算上櫃維持率需要）。不寫入任何資料表。"""
+    ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "application/json"}
+    tried, last = [], ""
+    for back in range(0, 9):
+        d = date.today() - timedelta(days=back)
+        if d.weekday() >= 5:
+            continue
+        roc = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
+        status, ctype, body, err = fetch_raw(f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={roc}", timeout=config.PROBE_TIMEOUT, headers=ua)
+        time.sleep(1)
+        txt = body.decode("utf-8", errors="replace") if body else ""
+        tried.append(f"{roc}:{status}")
+        last = txt[:200]
+        try:
+            j = json.loads(txt)
+            t0 = (j.get("tables") or [None])[0]
+            rows = t0.get("data") or []
+        except (ValueError, AttributeError, IndexError, TypeError):
+            continue
+        if rows:
+            log("probe:tpex_margin_page", "success", as_of=d.isoformat(), detail=_clip(f"{roc}｜{len(rows)} 列｜欄位 {t0.get('fields')}｜前 2 列 {rows[:2]}｜summary {json.dumps(t0.get('summary'), ensure_ascii=False)[:700]}｜notes {json.dumps(t0.get('notes'), ensure_ascii=False)[:200]}"))
+            return
+    log("probe:tpex_margin_page", "no_new_data", detail=_clip(f"最近 8 天（平日）都沒有資料；試過 {tried}｜最後一次開頭 {last!r}"))
+
+
 def probe_round12():
     """只讀探測第十二批：櫃買中心的「融資融券餘額彙總」（要有上櫃融資『金額』才能算上櫃維持率；開放資料的逐檔表只有張數）。不寫入任何資料表。"""
     ua = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "application/json"}
@@ -4359,6 +4468,7 @@ def run_job(job, dry_run=False):
         probe_round10()
         probe_round11()
         probe_round12()
+        probe_round13()
     inst_hist, pc_rows, margin_hist, index_long = [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
@@ -4395,6 +4505,7 @@ def run_job(job, dry_run=False):
             twopt = _run_module("M22", "台指選擇權與台指期快照", tw_options_snapshot) or []
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
+            extra.append(("watch_snapshot", _run_module("M30", "候選股估值（本益比、殖利率、股價淨值比）", watch_valuation) or [], "code"))
             extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
