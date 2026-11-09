@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v68"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v69"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2836,7 +2836,7 @@ def us_breadth_ndx():
         time.sleep(config.BREADTH_NDX_SLEEP)
         why_skip = "抓不到" if not pts else "日期不同" if pts[-1][0] != last else "疑似分割" if any(b[1] / a[1] >= 1.5 or b[1] / a[1] <= 0.67 for a, b in zip(pts, pts[1:])) else None
         if why_skip:
-            skipped[why_skip] = skipped.get(why_skip, 0) + 1
+            skipped.setdefault(why_skip, []).append(sym)
             continue
         c = [p[1] for p in pts]
         if len(c) >= 50:
@@ -2845,7 +2845,8 @@ def us_breadth_ndx():
         if len(c) >= 200:
             ok200 += 1
             a200 += 1 if c[-1] > sum(c[-200:]) / 200 else 0
-    note = "；略過 " + "、".join(f"{k} {v} 檔" for k, v in sorted(skipped.items())) if skipped else ""
+    # 列出被略過的代號：「疑似分割」的規則是相鄰兩天收盤價差 1.5 倍以上或 0.67 倍以下，單日暴跌超過三分之一的股票（例如財報後大跌）也會被排除，所以要讓你看得到是誰
+    note = "；略過 " + "、".join(f"{k} {len(v)} 檔（{'、'.join(v[:8])}{'…' if len(v) > 8 else ''}）" for k, v in sorted(skipped.items())) if skipped else ""
     if ok50 < config.BREADTH_NDX_MIN_OK:
         log("us_breadth_ndx", "no_new_data", as_of=last.isoformat(), detail=_clip(f"成分股 {len(syms)} 檔，只有 {ok50} 檔有效（至少 {config.BREADTH_NDX_MIN_OK}），不採用{note}"))
         return []

@@ -4643,7 +4643,7 @@ def test_us_breadth_ndx_counts_above_50_and_200_day_averages_and_skips_doubtful_
     assert len(rows) == 1; r = rows[0]
     assert r["as_of"] == last.isoformat() and r["n_total"] == 101 and r["n_ok50"] == 95 and r["above50"] == 60 and r["n_ok200"] == 85 and r["above200"] == 55, r
     assert r["pct50"] == round(60 / 95 * 100, 2) == 63.16 and r["pct200"] == round(55 / 85 * 100, 2) == 64.71 and "不是 S&P 500" in r["source"]
-    lg = [x for x in fetch.LOG if x["source"] == "us_breadth_ndx"][-1]; assert lg["status"] == "success" and "站上 50 日線 60 / 95 檔（63.16%）" in lg["detail"] and "抓不到 3 檔、日期不同 2 檔、疑似分割 1 檔" in lg["detail"], lg["detail"]
+    lg = [x for x in fetch.LOG if x["source"] == "us_breadth_ndx"][-1]; assert lg["status"] == "success" and "站上 50 日線 60 / 95 檔（63.16%）" in lg["detail"] and "抓不到 3 檔（SDM、SDN、SDO）、日期不同 2 檔（SDP、SDQ）、疑似分割 1 檔（SDR）" in lg["detail"], lg["detail"]
     # 200 日線有效檔數不到 80：只給 50 日的比例，200 日留空
     spec2 = {i: ("up", 260) if i < 30 else ("down", 80) for i in range(101)}
     ps, _ = _ndx_env(spec2); reset(); r2 = _with(ps, lambda: REAL["us_breadth_ndx"]())[0]
@@ -4655,7 +4655,7 @@ def test_us_breadth_ndx_failure_paths_never_turn_the_job_red():
     ok_spec = {i: ("up", 260) for i in range(101)}
     def go(spec, **kw):
         ps, _ = _ndx_env(spec, **kw); reset(); return _with(ps, lambda: REAL["us_breadth_ndx"]()), [x for x in fetch.LOG if x["source"] == "us_breadth_ndx"][-1]
-    rows, lg = go({i: ("up", 260) if i < 70 else None for i in range(101)}); assert rows == [] and lg["status"] == "no_new_data" and "只有 70 檔有效" in lg["detail"] and "抓不到 31 檔" in lg["detail"], lg["detail"]
+    rows, lg = go({i: ("up", 260) if i < 70 else None for i in range(101)}); assert rows == [] and lg["status"] == "no_new_data" and "只有 70 檔有效" in lg["detail"] and "抓不到 31 檔（" in lg["detail"] and "…）" in lg["detail"], lg["detail"]
     rows, lg = go(ok_spec, list_resp=(403, "text/html", b"denied", "HTTP 403")); assert rows == [] and lg["status"] == "no_new_data" and "HTTP 403" in lg["detail"]
     rows, lg = go(ok_spec, list_resp=(200, "text/html", b"<html>nope</html>", "")); assert rows == [] and lg["status"] == "no_new_data" and "不是 JSON" in lg["detail"]
     rows, lg = go(ok_spec, list_resp=(200, "application/json", json.dumps(_ndx_json(40)).encode(), "")); assert rows == [] and lg["status"] == "no_new_data" and "預期 95 到 110" in lg["detail"]
