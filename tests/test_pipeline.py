@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -758,7 +758,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round14"), mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round15"), mock.patch.object(fetch, "probe_round14"), mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -4583,6 +4583,121 @@ def test_probe_round14_logs_each_candidate_source_and_never_writes_or_turns_red(
     with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch.time, "sleep"):
         fetch.probe_round14()
     assert not [x for x in fetch.LOG if x["status"] == "failure"] and len(fetch.LOG) == 5, "連不上也不能讓工作變紅"
+
+
+def _ndx_syms(n=101):
+    return [f"S{chr(65 + i // 26)}{chr(65 + i % 26)}" for i in range(n)]
+
+
+def _ndx_json(n=101, nested=False):
+    rows = [{"symbol": s_, "companyName": "x", "marketCap": "1"} for s_ in _ndx_syms(n)]
+    return {"data": {"date": "Nov 6, 2026", "data": {"rows": rows}}, "status": {"rCode": 200}} if not nested else {"payload": [{"meta": 1}, {"deep": {"list": rows}}]}
+
+
+def _series(kind, last, n=260):
+    base = [last - timedelta(days=n - 1 - i) for i in range(n)]
+    px = [100 + i * 0.5 for i in range(n)] if kind == "up" else [200 - i * 0.5 for i in range(n)]
+    return list(zip(base, px))
+
+
+def _ndx_env(spec, last=None, list_resp=None):
+    """spec: {代號序號: ('up'|'down', 筆數) | None | 'date' | 'split'}"""
+    last = last or date.today() - timedelta(days=1)
+    syms = _ndx_syms(101)
+    def hist(sym, assetclass="etf", days=75):
+        if sym == config.SECTOR_BENCH:
+            return _series("up", last, 40), ""
+        k = spec.get(syms.index(sym))
+        if k is None: return None, "連線失敗"
+        if k == "date": return _series("up", last - timedelta(days=3)), ""
+        if k == "split":
+            pts = _series("up", last); pts[-30] = (pts[-30][0], pts[-30][1] * 3); return pts, ""
+        return _series(k[0], last, k[1]), ""
+    resp = list_resp if list_resp is not None else (200, "application/json", json.dumps(_ndx_json()).encode(), "")
+    return [mock.patch.object(fetch, "fetch_raw", return_value=resp), mock.patch.object(fetch, "_nasdaq_history", side_effect=hist), mock.patch.object(fetch.time, "sleep")], last
+
+
+def test_parse_ndx_constituents_finds_the_list_and_validates_symbols_and_count():
+    for nested in (False, True):
+        syms, why = fetch.parse_ndx_constituents(_ndx_json(nested=nested)); assert why == "" and len(syms) == 101 and syms[0] == "SAA", nested
+    rows = _ndx_json()["data"]["data"]["rows"]
+    messy = {"data": {"data": {"rows": rows + [{"symbol": "sab"}, {"symbol": "BRK/B"}, {"symbol": "TOOLONGX"}, {"symbol": ""}, {"symbol": "AAPL"}]}}}
+    s2, w2 = fetch.parse_ndx_constituents(messy); assert w2 == "" and len(s2) == 102 and "AAPL" in s2 and s2.count("SAB") == 1 and "BRK/B" not in s2 and "TOOLONGX" not in s2, "小寫轉大寫、重複只算一次、格式不對的丟掉"
+    for n, frag in ((94, "94"), (111, "111"), (0, "0")):
+        s3, w3 = fetch.parse_ndx_constituents(_ndx_json(n) if n else {"data": {}}); assert s3 == [] and "預期 95 到 110" in w3 and frag in w3, n
+    assert fetch.parse_ndx_constituents(None)[0] == [] and fetch.parse_ndx_constituents("x")[0] == [] and fetch.parse_ndx_constituents({"rows": [{"symbol": "A"}]})[0] == []
+
+
+def test_us_breadth_ndx_counts_above_50_and_200_day_averages_and_skips_doubtful_stocks():
+    spec = {}
+    for i in range(0, 50): spec[i] = ("up", 260)
+    for i in range(50, 80): spec[i] = ("down", 260)
+    for i in range(80, 85): spec[i] = ("up", 80)
+    for i in range(85, 90): spec[i] = ("down", 80)
+    for i in range(90, 93): spec[i] = None
+    for i in range(93, 95): spec[i] = "date"
+    spec[95] = "split"
+    for i in range(96, 101): spec[i] = ("up", 260)
+    ps, last = _ndx_env(spec); reset()
+    rows = _with(ps, lambda: REAL["us_breadth_ndx"]())
+    assert len(rows) == 1; r = rows[0]
+    assert r["as_of"] == last.isoformat() and r["n_total"] == 101 and r["n_ok50"] == 95 and r["above50"] == 60 and r["n_ok200"] == 85 and r["above200"] == 55, r
+    assert r["pct50"] == round(60 / 95 * 100, 2) == 63.16 and r["pct200"] == round(55 / 85 * 100, 2) == 64.71 and "不是 S&P 500" in r["source"]
+    lg = [x for x in fetch.LOG if x["source"] == "us_breadth_ndx"][-1]; assert lg["status"] == "success" and "站上 50 日線 60 / 95 檔（63.16%）" in lg["detail"] and "抓不到 3 檔、日期不同 2 檔、疑似分割 1 檔" in lg["detail"], lg["detail"]
+    # 200 日線有效檔數不到 80：只給 50 日的比例，200 日留空
+    spec2 = {i: ("up", 260) if i < 30 else ("down", 80) for i in range(101)}
+    ps, _ = _ndx_env(spec2); reset(); r2 = _with(ps, lambda: REAL["us_breadth_ndx"]())[0]
+    assert r2["n_ok50"] == 101 and r2["n_ok200"] == 30 and r2["pct200"] is None and r2["pct50"] == round(30 / 101 * 100, 2), r2
+    assert "有效檔數不到 80，不算比例" in [x for x in fetch.LOG if x["source"] == "us_breadth_ndx"][-1]["detail"]
+
+
+def test_us_breadth_ndx_failure_paths_never_turn_the_job_red():
+    ok_spec = {i: ("up", 260) for i in range(101)}
+    def go(spec, **kw):
+        ps, _ = _ndx_env(spec, **kw); reset(); return _with(ps, lambda: REAL["us_breadth_ndx"]()), [x for x in fetch.LOG if x["source"] == "us_breadth_ndx"][-1]
+    rows, lg = go({i: ("up", 260) if i < 70 else None for i in range(101)}); assert rows == [] and lg["status"] == "no_new_data" and "只有 70 檔有效" in lg["detail"] and "抓不到 31 檔" in lg["detail"], lg["detail"]
+    rows, lg = go(ok_spec, list_resp=(403, "text/html", b"denied", "HTTP 403")); assert rows == [] and lg["status"] == "no_new_data" and "HTTP 403" in lg["detail"]
+    rows, lg = go(ok_spec, list_resp=(200, "text/html", b"<html>nope</html>", "")); assert rows == [] and lg["status"] == "no_new_data" and "不是 JSON" in lg["detail"]
+    rows, lg = go(ok_spec, list_resp=(200, "application/json", json.dumps(_ndx_json(40)).encode(), "")); assert rows == [] and lg["status"] == "no_new_data" and "預期 95 到 110" in lg["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", json.dumps(_ndx_json()).encode(), "")), mock.patch.object(fetch, "_nasdaq_history", return_value=(None, "連線失敗")), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["us_breadth_ndx"]() == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "基準 SPY" in fetch.LOG[-1]["detail"]
+    assert not [x for x in fetch.LOG if x["status"] == "failure"]
+
+
+def test_run_job_us_breadth_persists_ndx_breadth_and_isolates_m32():
+    reset()
+    row = {"as_of": D(1), "n_total": 101, "n_ok50": 95, "above50": 60, "n_ok200": 85, "above200": 55, "pct50": 63.16, "pct200": 64.71, "source": "x"}
+    def go(job, dry, **kw):
+        got = []
+        base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "us_breadth_ndx", **(kw or {"return_value": [row]})), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in ps: p_.start()
+        try: fetch.run_job(job, dry_run=dry)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go("us_breadth", False); assert ("us_breadth_ndx", [row], "as_of") in tables and st["module:M32"] == "success"
+    reset(); tables, st = go("us_breadth", True); assert not [x for x in tables if x[0] == "us_breadth_ndx"] and st["us_breadth"] == "skipped" and "module:M32" not in st, "試跑不抓 100 多個請求"
+    reset(); tables, st = go("us_breadth", False, side_effect=RuntimeError("boom")); assert st["module:M32"] == "failure" and [x for x in tables if x[0] == "us_breadth_ndx"][0][1] == []
+    reset(); tables, st = go("tw_close", False); assert "module:M32" not in st, "只有 us_breadth 這個工作會跑 M32，不拖慢 tw_close"
+
+
+def test_probe_round15_reports_the_constituents_endpoint_without_writing():
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", json.dumps(_ndx_json()).encode(), "")), mock.patch.object(fetch, "sb_upsert") as up:
+        fetch.probe_round15()
+    lg = [x for x in fetch.LOG if x["source"] == "probe:ndx_list"][-1]; assert lg["status"] == "success" and "解析：101 檔，前 5 檔 ['SAA', 'SAB'" in lg["detail"]; up.assert_not_called()
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"<html>denied</html>", "HTTP 403")):
+        fetch.probe_round15()
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "不是 JSON" in fetch.LOG[-1]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")):
+        fetch.probe_round15()
+    assert fetch.LOG[-1]["status"] == "no_new_data" and not [x for x in fetch.LOG if x["status"] == "failure"]
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

@@ -166,7 +166,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v67"
+PIPELINE_VERSION = "v68"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -174,7 +174,7 @@ EARNINGS_MAX_AHEAD_DAYS = 200      # 財報日比今天晚超過這麼多天，�
 # 模組開關：改成 False 就整個關掉（排程不抓、網站顯示未啟用）。任何一個模組壞掉，不會影響其他模組。
 FEATURES = {"M01_fred_extra": True, "M02_us_quotes": True, "M03_sector_rs": True, "M04_tw_leaders": True,
             "M05_tw_index_history": True, "M06_fred_history": True, "M07_tw_fin": True, "M08_us_crash": True,
-            "M09_aaii": True, "M10_us_leaders": True, "M11_tw_events": True, "M12_inst_history": True, "M13_breadth_hist": True, "M14_pc_history": True, "M15_tw_exright": True, "M16_exright_hist": True, "M17_tw_industry": True, "M18_us_index": True, "M19_margin_hist": True, "M20_us_options": True, "M21_margin_ratio": True, "M22_tw_options": True, "M23_tw_pcr": True, "M24_index_long": True, "M25_finmind": True, "M26_us_sector": True, "M27_yahoo_fill": True, "M28_retail_ratio": True, "M29_tpex_margin": True, "M30_watch": True, "M31_yahoo_dxy": True}
+            "M09_aaii": True, "M10_us_leaders": True, "M11_tw_events": True, "M12_inst_history": True, "M13_breadth_hist": True, "M14_pc_history": True, "M15_tw_exright": True, "M16_exright_hist": True, "M17_tw_industry": True, "M18_us_index": True, "M19_margin_hist": True, "M20_us_options": True, "M21_margin_ratio": True, "M22_tw_options": True, "M23_tw_pcr": True, "M24_index_long": True, "M25_finmind": True, "M26_us_sector": True, "M27_yahoo_fill": True, "M28_retail_ratio": True, "M29_tpex_margin": True, "M30_watch": True, "M31_yahoo_dxy": True, "M32_us_breadth_ndx": True}
 # 模組 M02：美股其他行情（Nasdaq 報價，只採用已收盤的價格）。QQQ 只存漲跌幅，不存價格（規格 §13）。
 US_QUOTES = (
     ("SPY", "標普 500 ETF（SPY）", "etf", ("etf",), 50.0, 3000.0, True),
@@ -188,6 +188,11 @@ US_QUOTE_FALLBACKS = {"GLD": ("IAU", "黃金 ETF（IAU，備用，不是黃金�
 SECTOR_ETFS = {"XLK": "科技", "XLF": "金融", "XLE": "能源", "XLV": "醫療保健", "XLY": "非必需消費", "XLP": "必需消費",
                "XLI": "工業", "XLU": "公用事業", "XLB": "原物料", "XLRE": "房地產", "XLC": "通訊服務"}
 SECTOR_BENCH = "SPY"
+# 模組 M32：Nasdaq-100 廣度
+NASDAQ_NDX_URL = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
+BREADTH_NDX_DAYS = 330        # 要抓幾個日曆天的歷史（200 日均線約需要 290 天）
+BREADTH_NDX_SLEEP = 0.7       # 每檔之間等幾秒（100 多個請求，避免被限流）
+BREADTH_NDX_MIN_OK = 80       # 有效的成分股至少幾檔才採用
 SECTOR_MIN_ROWS = 25
 # 模組 M04：台股領頭股（規格 §11）。第 1 層台積電、第 2 層確認籃；代號會用官方名稱核對，對不上就不算。
 TW_LEADERS = {"2330": ("台積電", 1), "2317": ("鴻海", 2), "2454": ("聯發科", 2), "2308": ("台達電", 2), "3711": ("日月光投控", 2), "2383": ("台光電", 2)}

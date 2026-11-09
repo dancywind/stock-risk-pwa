@@ -11,7 +11,7 @@
 用法：
     python3 pipeline/fetch.py --job full            # FRED 總經 + 台幣
     python3 pipeline/fetch.py --job tw_close        # 台幣（台股資料第二步才接）
-    python3 pipeline/fetch.py --job us_breadth      # 美股廣度（尚未實作，只留紀錄）
+    python3 pipeline/fetch.py --job us_breadth      # 美股廣度（Nasdaq-100 站上 50、200 日線的比例）
     python3 pipeline/fetch.py --job full --dry-run  # 照常抓資料，但不寫 Supabase
 """
 import argparse
@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v67"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v68"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2784,6 +2784,94 @@ def us_leaders_compute():
     return out
 
 
+def parse_ndx_constituents(j):
+    """Nasdaq 官方的 Nasdaq-100 成分股清單 → 代號清單。結構是 data → data → rows，但不靠固定路徑：往下找第一個「每一項都有 symbol」的列表。
+    驗證：代號是 1 到 5 個大寫字母、不重複，總數在 95 到 110 之間（Nasdaq-100 是 100 家公司、約 101 個代號）。回傳 (代號列表, 原因)。"""
+    def find(o, depth=0):
+        if isinstance(o, list) and o and all(isinstance(x, dict) and "symbol" in x for x in o):
+            return o
+        if depth > 4:
+            return None
+        for v in (o.values() if isinstance(o, dict) else o if isinstance(o, list) else []):
+            r = find(v, depth + 1)
+            if r:
+                return r
+        return None
+    syms = []
+    for r in find(j) or []:
+        s_ = str(r.get("symbol", "")).strip().upper()
+        if re.fullmatch(r"[A-Z]{1,5}", s_) and s_ not in syms:
+            syms.append(s_)
+    if not (95 <= len(syms) <= 110):
+        return [], f"成分股數量 {len(syms)}（預期 95 到 110），不用"
+    return syms, ""
+
+
+def us_breadth_ndx():
+    """模組 M32：Nasdaq-100 廣度：成分股裡，收盤高於 50 日、200 日均線的比例。美股沒有免費的「S&P 500 站上 50 日線比例」，所以用 Nasdaq 官方的成分股清單與歷史行情自己算；
+    涵蓋的是 Nasdaq-100（科技股占比高），不是 S&P 500。每檔的規則和 M10 一樣：最新日期要和 SPY 同一天、收盤價有疑似分割的跳動就不算；
+    均線需要足夠的天數（50 日至少 50 筆、200 日至少 200 筆，不夠的那檔只是不進那個比例）。有效的至少 80 檔才採用；抓不到或不夠只記「沒有資料」，不讓工作變紅。"""
+    status, ctype, body, err = fetch_raw(config.NASDAQ_NDX_URL, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+    if status != 200 or not body:
+        log("us_breadth_ndx", "no_new_data", detail=_clip(f"成分股清單抓取失敗 HTTP {status} {err}".strip()))
+        return []
+    try:
+        j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+    except (ValueError, UnicodeDecodeError):
+        log("us_breadth_ndx", "no_new_data", detail="成分股清單不是 JSON")
+        return []
+    syms, why = parse_ndx_constituents(j)
+    if not syms:
+        log("us_breadth_ndx", "no_new_data", detail=_clip(why))
+        return []
+    bench, why = _nasdaq_history(config.SECTOR_BENCH, "etf", 40)
+    if not bench or len(bench) < 5:
+        log("us_breadth_ndx", "no_new_data", detail=_clip(f"基準 {config.SECTOR_BENCH} 歷史抓取失敗：{why or len(bench or [])}"))
+        return []
+    last = bench[-1][0]
+    ok50 = ok200 = a50 = a200 = 0
+    skipped = {}
+    for sym in syms:
+        pts, w_ = _nasdaq_history(sym, "stocks", config.BREADTH_NDX_DAYS)
+        time.sleep(config.BREADTH_NDX_SLEEP)
+        why_skip = "抓不到" if not pts else "日期不同" if pts[-1][0] != last else "疑似分割" if any(b[1] / a[1] >= 1.5 or b[1] / a[1] <= 0.67 for a, b in zip(pts, pts[1:])) else None
+        if why_skip:
+            skipped[why_skip] = skipped.get(why_skip, 0) + 1
+            continue
+        c = [p[1] for p in pts]
+        if len(c) >= 50:
+            ok50 += 1
+            a50 += 1 if c[-1] > sum(c[-50:]) / 50 else 0
+        if len(c) >= 200:
+            ok200 += 1
+            a200 += 1 if c[-1] > sum(c[-200:]) / 200 else 0
+    note = "；略過 " + "、".join(f"{k} {v} 檔" for k, v in sorted(skipped.items())) if skipped else ""
+    if ok50 < config.BREADTH_NDX_MIN_OK:
+        log("us_breadth_ndx", "no_new_data", as_of=last.isoformat(), detail=_clip(f"成分股 {len(syms)} 檔，只有 {ok50} 檔有效（至少 {config.BREADTH_NDX_MIN_OK}），不採用{note}"))
+        return []
+    row = {"as_of": last.isoformat(), "n_total": len(syms), "n_ok50": ok50, "above50": a50, "n_ok200": ok200, "above200": a200, "pct50": round(a50 / ok50 * 100, 2),
+           "pct200": round(a200 / ok200 * 100, 2) if ok200 >= config.BREADTH_NDX_MIN_OK else None,
+           "source": "Nasdaq 官方成分股清單與歷史行情（自己計算；涵蓋 Nasdaq-100，不是 S&P 500）"}
+    log("us_breadth_ndx", "success", as_of=row["as_of"], detail=f"站上 50 日線 {a50} / {ok50} 檔（{row['pct50']}%）；站上 200 日線 {a200} / {ok200} 檔" + (f"（{row['pct200']}%）" if row["pct200"] is not None else "（有效檔數不到 80，不算比例）") + note)
+    return [row]
+
+
+def probe_round15():
+    """只讀探測第十五批：Nasdaq-100 成分股清單（確認格式、數量）。不寫入任何資料表。"""
+    status, ctype, body, err = fetch_raw(config.NASDAQ_NDX_URL, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+    if status is None:
+        log("probe:ndx_list", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+        return
+    txt = (body or b"").decode("utf-8", errors="replace")
+    extra = ""
+    try:
+        syms, why = parse_ndx_constituents(json.loads(txt))
+        extra = f"｜解析：{len(syms)} 檔，前 5 檔 {syms[:5]}" + (f"｜{why}" if why else "")
+    except ValueError:
+        extra = "｜不是 JSON"
+    log("probe:ndx_list", "success" if status == 200 else "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜{len(body or b'')} 位元組｜開頭 {re.sub(chr(10), ' ', txt[:200])!r}{extra}"))
+
+
 def _news_path(sw):
     for pth, methods in ((sw or {}).get("paths") or {}).items():
         for mth in (methods or {}).values():
@@ -4638,6 +4726,7 @@ def run_job(job, dry_run=False):
         probe_round12()
         probe_round13()
         probe_round14()
+        probe_round15()
     inst_hist, pc_rows, margin_hist, index_long = [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
@@ -4653,10 +4742,15 @@ def run_job(job, dry_run=False):
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
         tw_crash_check(list(res.get("new_days", [])) + _recent_complete_days(1))
-    if job == "us_breadth":
-        log("us_breadth", "skipped", detail="美股廣度尚未實作（第三步）；此排程不再偷跑全部更新")
-
     extra = []
+    if job == "us_breadth":
+        if dry_run:
+            log("us_breadth", "skipped", detail="試跑模式不抓 100 檔成分股（要發 100 多個請求）")
+        elif not config.FEATURES.get("M32_us_breadth_ndx", True):
+            log("us_breadth", "skipped", detail="M32 已在設定裡關閉")
+        else:
+            extra.append(("us_breadth_ndx", _run_module("M32", "美股廣度（Nasdaq-100）", us_breadth_ndx) or [], "as_of"))
+
     if job in ("full", "tw_close"):
         extra.append(("us_quotes", _run_module("M02", "美股其他行情", us_extra_quotes) or [], "symbol,as_of"))
         extra.append(("sector_rs", _run_module("M03", "美股產業相對強弱", sector_rs) or [], "symbol,as_of"))
