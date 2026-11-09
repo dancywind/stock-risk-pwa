@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v71"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v73"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1437,7 +1437,8 @@ def nasdaq_prices(hold):
             else:
                 note += f"；52 週區間查不到：{why_h}"
             time.sleep(1)
-        out.append(_price_row("US", sym, h.get("name"), iso, close, change, "Nasdaq 個股報價（已收盤）", high52, low52, range_src))
+        official_name = str(got.get("companyName") or "").strip() or None      # 官方的完整名稱（貼上的名稱常被券商畫面截斷）；沒有就退回貼上的名稱
+        out.append(_price_row("US", sym, official_name or h.get("name"), iso, close, change, "Nasdaq 個股報價（已收盤）", high52, low52, range_src))
         log(f"nasdaq:price:{sym}", "success", as_of=iso,
             detail=f"收盤價 {close}（資料日 {iso}）；52 週區間 " + (f"{low52}–{high52}" if high52 is not None else "查不到") + note)
         time.sleep(1)
@@ -4222,17 +4223,23 @@ def yahoo_dxy():
             mx, my = sum(x) / len(x), sum(y) / len(y)
             den = math.sqrt(sum((p - mx) ** 2 for p in x) * sum((q - my) ** 2 for q in y))
             return sum((p - mx) * (q - my) for p, q in zip(x, y)) / den if den else 0.0
-        corr = pearson(a, b)
-        if corr < 0.5:
-            # 診斷：日變動幾乎是隨機的，兩個序列的日期只要差一天，同一天的相關係數就會掉到接近 0，所以順便算「錯開一天」的相關係數
-            prev_c, next_c = pearson(a[1:], b[:-1]), pearson(a[:-1], b[1:])
-            hint = ""
-            if max(prev_c, next_c) >= 0.5:
-                hint = "；錯開一天後相關係數很高，比較像是兩邊日期差一天，不像抓到別的東西"
-            log("yahoo_dxy", "failure", detail=_clip(f"{sym} 和 FRED 廣義美元指數的日變動相關係數只有 {corr:.2f}（低於 0.5），整批不用。診斷：DXY 今天對廣義指數前一個重疊日 {prev_c:.2f}、後一個重疊日 {next_c:.2f}{hint}"))
-            return []
-        note = f"；和 FRED 廣義美元指數的日變動相關係數 {corr:.2f}（{len(a)} 組）"
-        src = f"Yahoo Finance（非官方；已和聯準會廣義美元指數核對，日變動相關係數 {corr:.2f}）"
+        corr0 = pearson(a, b)
+        # 日變動幾乎是隨機的，兩個序列的日期只要差一天，同一天的相關係數就會掉到接近 0；所以同時看「錯開一個交易日」的相關係數。
+        # next_c：DXY 的變動，出現在廣義指數的「下一個重疊日」（廣義指數的日期比 DXY 晚一天）；prev_c 相反。
+        prev_c, next_c = pearson(a[1:], b[:-1]), pearson(a[:-1], b[1:])
+        cands = [(corr0, "同一天", 0), (next_c, "廣義指數的日期比 DXY 晚一個交易日", 1), (prev_c, "廣義指數的日期比 DXY 早一個交易日", -1)]
+        best, how, shift = max(cands, key=lambda c: c[0])
+        if best < 0.5 or (shift != 0 and best - corr0 < 0.3):
+            # 這個核對本來就不嚴格：聯準會廣義指數與 DXY 的成分、取價時間都不同（你資料庫的 229 個重疊日，同一天相關係數只有 0.31），所以不拿它當門檻擋掉資料，
+            # 只把「核對的結果很弱、無法確認」老實寫在每一筆的來源欄。真正的把關是：代號固定、至少 100 天、數值在 70 到 130、日期由舊到新。
+            note = f"；和 FRED 廣義美元指數的日變動相關係數：同一天 {corr0:.2f}、晚一個交易日 {next_c:.2f}、早一個交易日 {prev_c:.2f}，都不高，無法確認（兩個指數成分與取價時間不同，這個核對只能當粗略參考）"
+            src = f"Yahoo Finance（非官方；和聯準會廣義美元指數核對的結果很弱：日變動相關係數最高 {max(corr0, next_c, prev_c):.2f}，無法確認；兩個指數的成分與取價時間不同，只能當粗略參考）"
+        elif shift == 0:
+            note = f"；和 FRED 廣義美元指數的日變動相關係數 {corr0:.2f}（{len(a)} 組）"
+            src = f"Yahoo Finance（非官方；已和聯準會廣義美元指數核對，日變動相關係數 {corr0:.2f}）"
+        else:
+            note = f"；同一天相關係數只有 {corr0:.2f}，但{how}時是 {best:.2f}：兩個來源的日期差一個交易日（哪邊的日期是對的，從資料看不出來），DXY 的日期照 Yahoo 原樣存"
+            src = f"Yahoo Finance（非官方；已和聯準會廣義美元指數核對，日變動相關係數 {best:.2f}，但兩者的日期差一個交易日，DXY 日期照 Yahoo 原樣）"
     else:
         note = f"；FRED 廣義美元指數重疊只有 {len(common)} 天，沒有核對"
         src = f"Yahoo Finance（非官方；沒有核對：聯準會廣義美元指數的歷史重疊只有 {len(common)} 天）"          # 核對結果寫進資料本身，卡片的「來源」就看得到

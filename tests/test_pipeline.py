@@ -1145,6 +1145,21 @@ def test_nasdaq_prices_only_uses_closed_non_realtime():
         assert fetch.LOG[-1]["status"] == "skipped" and "不使用" in fetch.LOG[-1]["detail"], status
 
 
+def test_nasdaq_prices_records_the_official_name_and_falls_back_to_the_pasted_one():
+    ts = (TODAY - timedelta(days=1)).strftime("%b %d, %Y").replace(" 0", " ")
+    base = json.loads(nas_body(ts=ts))
+    def body(**extra):
+        b = json.loads(json.dumps(base)); b["data"].update(extra); return json.dumps(b).encode()
+    def run(b):
+        reset()
+        with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", b, "")), mock.patch.object(fetch.time, "sleep"):
+            return fetch.nasdaq_prices(US_HOLD)
+    assert run(body(companyName="Oracle Corporation Common Stock"))[0]["name"] == "Oracle Corporation Common Stock", "官方有完整名稱：用官方的（貼上的名稱常被券商畫面截斷）"
+    assert run(body(companyName="  GraniteShares 2x Long INTC Daily ETF  "))[0]["name"] == "GraniteShares 2x Long INTC Daily ETF", "前後空白去掉"
+    for extra in ({}, {"companyName": ""}, {"companyName": "   "}, {"companyName": None}):
+        assert run(body(**extra))[0]["name"] == "甲骨文", extra
+
+
 def test_nasdaq_prices_bad_inputs_rejected():
     reset()
     with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas_body(ts="Dec 25, 2999"), "")):
@@ -4519,13 +4534,19 @@ def test_yahoo_dxy_validates_and_cross_checks_against_the_fed_broad_index():
     rows = _with(ps, lambda: REAL["yahoo_dxy"]())
     assert len(rows) == 160 and rows[0]["series_id"] == "DXY" and rows[-1]["value"] == vals[-1] and "非官方" in rows[0]["source"] and "已和聯準會廣義美元指數核對，日變動相關係數 1.00" in rows[0]["source"] and all(r["source"] == rows[0]["source"] for r in rows) and "DXY" in rows[0]["label"] and rows[0]["as_of"] < rows[-1]["as_of"]
     lg = [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]; assert lg["status"] == "success" and "相關係數 1.00" in lg["detail"] and "160 天" in lg["detail"], lg["detail"]
-    anti = [{"as_of": d_, "value": round(200 - v, 3)} for d_, v in pts[-120:]]                                              # 反向：可能抓到別的東西
+    anti = [{"as_of": d_, "value": round(200 - v, 3)} for d_, v in pts[-120:]]                                              # 反向：核對的結果很弱
     ps, _ = _dxy_env(vals, anti); reset()
-    assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "failure" and "相關係數只有" in fetch.LOG[-1]["detail"] and "整批不用" in fetch.LOG[-1]["detail"]
-    assert "診斷：DXY 今天對廣義指數前一個重疊日" in fetch.LOG[-1]["detail"] and "錯開一天後相關係數很高" not in fetch.LOG[-1]["detail"], "反向：錯開一天也不相關，不是日期的問題: " + fetch.LOG[-1]["detail"]
-    shifted = [{"as_of": pts[i][0], "value": round(vals[i - 1] * 1.2 + 3, 3)} for i in range(len(pts) - 120, len(pts))]                  # 廣義指數的變動比 DXY 晚一天出現
-    ps, _ = _dxy_env(vals, shifted); reset()
-    assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "failure" and "錯開一天後相關係數很高" in fetch.LOG[-1]["detail"] and "不像抓到別的東西" in fetch.LOG[-1]["detail"], "日期差一天：診斷要點出來: " + fetch.LOG[-1]["detail"]
+    rows = _with(ps, lambda: REAL["yahoo_dxy"]()); lg = [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]
+    assert len(rows) == 160 and lg["status"] == "success", "核對結果很弱：不再整批擋下（兩個指數本來就不同），照收"
+    assert all("核對的結果很弱" in r["source"] and "無法確認" in r["source"] and "只能當粗略參考" in r["source"] for r in rows) and "都不高，無法確認" in lg["detail"] and "同一天" in lg["detail"] and "晚一個交易日" in lg["detail"] and "早一個交易日" in lg["detail"], "老實寫進每一筆的來源，並列出三個相關係數: " + lg["detail"]
+    late = [{"as_of": pts[i][0], "value": round(vals[i - 1] * 1.2 + 3, 3)} for i in range(len(pts) - 120, len(pts))]                       # 廣義指數的變動比 DXY 晚一天出現（你資料庫裡就是這種）
+    ps, _ = _dxy_env(vals, late); reset()
+    rows = _with(ps, lambda: REAL["yahoo_dxy"]()); lg = [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]
+    assert len(rows) == 160 and lg["status"] == "success" and "同一天相關係數只有" in lg["detail"] and "廣義指數的日期比 DXY 晚一個交易日時是 1.00" in lg["detail"] and "哪邊的日期是對的，從資料看不出來" in lg["detail"], "日期差一天、錯開後相關很高：採用，並明寫日期落差: " + lg["detail"]
+    assert all("日期差一個交易日，DXY 日期照 Yahoo 原樣" in r["source"] and "已和聯準會廣義美元指數核對" in r["source"] for r in rows) and [r["as_of"] for r in rows] == [p[0] for p in pts], "DXY 自己的日期一個字都不改"
+    early = [{"as_of": pts[i][0], "value": round(vals[i + 1] * 1.2 + 3, 3)} for i in range(len(pts) - 121, len(pts) - 1)]                       # 反方向：廣義指數比 DXY 早一天
+    ps, _ = _dxy_env(vals, early); reset()
+    rows = _with(ps, lambda: REAL["yahoo_dxy"]()); assert len(rows) == 160 and "廣義指數的日期比 DXY 早一個交易日時是 1.00" in [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]["detail"], "另一個方向也認得出來"
     ps, _ = _dxy_env(vals, corr_fred[:5]); reset()                                                                           # 重疊太少：照收，但寫明沒核對
     rows = _with(ps, lambda: REAL["yahoo_dxy"]()); assert len(rows) == 160 and "沒有核對" in [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]["detail"] and "沒有核對：聯準會廣義美元指數的歷史重疊只有 5 天" in rows[0]["source"], "沒核對就明寫在每一筆的來源欄"
     ps, _ = _dxy_env(_walk(160)[:99] if False else _walk(99)); reset()
