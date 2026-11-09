@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v69"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v71"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1923,6 +1923,78 @@ def cftc_cot():
     log("cftc:cot", "success", as_of=out[0]["report_date"],
         detail=f"報告日 {out[0]['report_date']}：槓桿基金淨 {n(out[0], 'lev'):+,.0f}、資產管理機構淨 {n(out[0], 'asset_mgr'):+,.0f}、交易商淨 {n(out[0], 'dealer'):+,.0f}（口）" + (f"；{bad} 列未通過驗證" if bad else ""))
     return out
+
+
+def _cot_rows(rows, market_name, label):
+    """CFTC TFF 的列 → us_cot 的列（和標普那個模組同樣的驗證：市場名稱、日期、口數都要合理）。回傳 (列, 未通過的列數)。"""
+    keys = {"open_interest": "open_interest_all", "dealer_long": "dealer_positions_long_all", "dealer_short": "dealer_positions_short_all",
+            "asset_mgr_long": "asset_mgr_positions_long", "asset_mgr_short": "asset_mgr_positions_short",
+            "lev_long": "lev_money_positions_long", "lev_short": "lev_money_positions_short"}
+    out, bad = [], 0
+    for r in rows:
+        if not isinstance(r, dict) or r.get("market_and_exchange_names") != market_name:
+            bad += 1
+            continue
+        d = str(r.get("report_date_as_yyyy_mm_dd", ""))[:10]
+        ok, _why = validate_close_date(d if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) else None)
+        vals = {k: parse_number(r.get(src)) for k, src in keys.items()}
+        if (not ok or None in vals.values() or vals["open_interest"] <= 0 or any(v < 0 for v in vals.values())
+                or any(vals[k] > vals["open_interest"] for k in ("dealer_long", "dealer_short", "asset_mgr_long", "asset_mgr_short", "lev_long", "lev_short"))):
+            bad += 1
+            continue
+        out.append(dict(vals, report_date=d, market=label, source="CFTC TFF 期貨 only（publicreporting.cftc.gov）"))
+    out.sort(key=lambda r: r["report_date"], reverse=True)
+    return out, bad
+
+
+def cftc_cot_ndx():
+    """模組 M33：CFTC COT（TFF 期貨 only）Nasdaq-100 期貨最近兩週的三類交易人多空口數，存進 us_cot（market 欄位區分，不和標普混在一起）。
+    先找「Nasdaq-100 合併合約」，沒有就找 E-mini；兩個都沒有時，列出 CFTC 資料裡含 NASDAQ 的市場名稱，方便對照。每週才更新一次，報告日是週二、週五才公布。"""
+    notes = []
+    for name, label in config.CFTC_NDX_MARKETS:
+        q = urllib.parse.urlencode({"$limit": 2, "$order": "report_date_as_yyyy_mm_dd DESC", "market_and_exchange_names": name}, quote_via=urllib.parse.quote)
+        rows, err = fetch_json(config.CFTC_TFF_BASE + "?" + q)
+        if rows is None:
+            notes.append(f"{label}：抓取失敗 {err}")
+            continue
+        if not isinstance(rows, list) or not rows:
+            notes.append(f"{label}：CFTC 沒有這個市場名稱的資料")
+            continue
+        out, bad = _cot_rows(rows, name, label)
+        if out:
+            n = lambda r, k: r[k + "_long"] - r[k + "_short"]
+            log("cftc:cot_ndx", "success", as_of=out[0]["report_date"], detail=f"{label}：報告日 {out[0]['report_date']}，槓桿基金淨 {n(out[0], 'lev'):+,.0f}、資產管理機構淨 {n(out[0], 'asset_mgr'):+,.0f}、交易商淨 {n(out[0], 'dealer'):+,.0f}（口）" + (f"；{bad} 列未通過驗證" if bad else ""))
+            return out
+        notes.append(f"{label}：{len(rows)} 列都沒通過驗證")
+    q2 = urllib.parse.urlencode({"$select": "market_and_exchange_names", "$where": "market_and_exchange_names like '%NASDAQ%'", "$group": "market_and_exchange_names", "$limit": 12}, quote_via=urllib.parse.quote)
+    names, _e = fetch_json(config.CFTC_TFF_BASE + "?" + q2)
+    found = [str(x.get("market_and_exchange_names")) for x in names if isinstance(x, dict)] if isinstance(names, list) else []
+    log("cftc:cot_ndx", "no_new_data", detail=_clip("；".join(notes) + f"｜CFTC 資料裡含 NASDAQ 的市場名稱：{found or '查不到'}"))
+    return []
+
+
+def probe_round16():
+    """只讀探測第十六批：Yahoo 的 NQ=F、ES=F 期貨報價有沒有 openInterest（未平倉量）欄位。有的話才值得自己每天存一筆累積；沒有或被擋就算了。不寫入任何資料表。"""
+    hdr = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa-probe/1.0)", "Accept": "application/json"}
+    for tag, url in (("yahoo_quote_oi", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NQ%3DF,ES%3DF"), ("yahoo_chart_meta", "https://query1.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=5d&interval=1d")):
+        status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=hdr)
+        time.sleep(1)
+        if status is None:
+            log(f"probe:{tag}", "no_new_data", detail=_clip(f"連線失敗: {err}"))
+            continue
+        txt = (body or b"").decode("utf-8", errors="replace")
+        extra = ""
+        try:
+            j = json.loads(txt)
+            if tag == "yahoo_quote_oi":
+                res = (((j.get("quoteResponse") or {}).get("result")) or [])
+                extra = "｜" + "；".join(f"{r.get('symbol')}：openInterest={r.get('openInterest', '沒有這個欄位')}、欄位數 {len(r)}" for r in res if isinstance(r, dict)) if res else "｜result 是空的"
+            else:
+                meta = ((((j.get("chart") or {}).get("result") or [{}])[0]).get("meta")) or {}
+                extra = f"｜meta 欄位：{sorted(meta.keys())[:24]}｜openInterest 在 meta 裡：{'openInterest' in meta}"
+        except (ValueError, AttributeError, IndexError, TypeError):
+            extra = "｜不是 JSON"
+        log(f"probe:{tag}", "success" if status == 200 else "no_new_data", detail=_clip(f"HTTP {status}｜{ctype}｜{len(body or b'')} 位元組｜開頭 {re.sub(chr(10), ' ', txt[:140])!r}{extra}"))
 
 
 def _now_et():
@@ -4146,11 +4218,18 @@ def yahoo_dxy():
         import math
         a = [math.log(common[i][1] / common[i - 1][1]) for i in range(1, len(common))]
         b = [math.log(common[i][2] / common[i - 1][2]) for i in range(1, len(common))]
-        ma, mb = sum(a) / len(a), sum(b) / len(b)
-        den = math.sqrt(sum((x - ma) ** 2 for x in a) * sum((y - mb) ** 2 for y in b))
-        corr = sum((x - ma) * (y - mb) for x, y in zip(a, b)) / den if den else 0.0
+        def pearson(x, y):
+            mx, my = sum(x) / len(x), sum(y) / len(y)
+            den = math.sqrt(sum((p - mx) ** 2 for p in x) * sum((q - my) ** 2 for q in y))
+            return sum((p - mx) * (q - my) for p, q in zip(x, y)) / den if den else 0.0
+        corr = pearson(a, b)
         if corr < 0.5:
-            log("yahoo_dxy", "failure", detail=_clip(f"{sym} 和 FRED 廣義美元指數的日變動相關係數只有 {corr:.2f}（低於 0.5），可能抓到別的東西，整批不用"))
+            # 診斷：日變動幾乎是隨機的，兩個序列的日期只要差一天，同一天的相關係數就會掉到接近 0，所以順便算「錯開一天」的相關係數
+            prev_c, next_c = pearson(a[1:], b[:-1]), pearson(a[:-1], b[1:])
+            hint = ""
+            if max(prev_c, next_c) >= 0.5:
+                hint = "；錯開一天後相關係數很高，比較像是兩邊日期差一天，不像抓到別的東西"
+            log("yahoo_dxy", "failure", detail=_clip(f"{sym} 和 FRED 廣義美元指數的日變動相關係數只有 {corr:.2f}（低於 0.5），整批不用。診斷：DXY 今天對廣義指數前一個重疊日 {prev_c:.2f}、後一個重疊日 {next_c:.2f}{hint}"))
             return []
         note = f"；和 FRED 廣義美元指數的日變動相關係數 {corr:.2f}（{len(a)} 組）"
         src = f"Yahoo Finance（非官方；已和聯準會廣義美元指數核對，日變動相關係數 {corr:.2f}）"
@@ -4728,6 +4807,7 @@ def run_job(job, dry_run=False):
         probe_round13()
         probe_round14()
         probe_round15()
+        probe_round16()
     inst_hist, pc_rows, margin_hist, index_long = [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
@@ -4760,6 +4840,8 @@ def run_job(job, dry_run=False):
         extra.append(("tw_fin_q", _run_module("M07", "台股三率", tw_financials, price_rows or []) or [], "code,year,quarter"))
         extra.append(("us_crash_candidates", _run_module("M08", "美股大型股暴跌", us_crash_screen) or [], "as_of,symbol"))
         extra.append(("us_aaii", _run_module("M09", "AAII 散戶情緒", aaii_sentiment) or [], "as_of"))
+        if not dry_run:
+            extra.append(("us_cot", _run_module("M33", "CFTC COT：Nasdaq-100 期貨", cftc_cot_ndx) or [], "report_date,market"))
         extra.append(("us_leaders", _run_module("M10", "美股領頭股", us_leaders_compute) or [], "as_of,symbol"))
         extra.append(("tw_investor_events", _run_module("M11", "台股法說會日曆", tw_investor_events, price_rows or []) or [], "code,event_date"))
         extra.append(("tw_exright_events", _run_module("M15", "台股除權息預告（上市、上櫃）", tw_exright_preview) or [], "market,code,event_date"))

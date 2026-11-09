@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -758,7 +758,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round15"), mock.patch.object(fetch, "probe_round14"), mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_round16"), mock.patch.object(fetch, "probe_round15"), mock.patch.object(fetch, "probe_round14"), mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -4522,6 +4522,10 @@ def test_yahoo_dxy_validates_and_cross_checks_against_the_fed_broad_index():
     anti = [{"as_of": d_, "value": round(200 - v, 3)} for d_, v in pts[-120:]]                                              # 反向：可能抓到別的東西
     ps, _ = _dxy_env(vals, anti); reset()
     assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "failure" and "相關係數只有" in fetch.LOG[-1]["detail"] and "整批不用" in fetch.LOG[-1]["detail"]
+    assert "診斷：DXY 今天對廣義指數前一個重疊日" in fetch.LOG[-1]["detail"] and "錯開一天後相關係數很高" not in fetch.LOG[-1]["detail"], "反向：錯開一天也不相關，不是日期的問題: " + fetch.LOG[-1]["detail"]
+    shifted = [{"as_of": pts[i][0], "value": round(vals[i - 1] * 1.2 + 3, 3)} for i in range(len(pts) - 120, len(pts))]                  # 廣義指數的變動比 DXY 晚一天出現
+    ps, _ = _dxy_env(vals, shifted); reset()
+    assert _with(ps, lambda: REAL["yahoo_dxy"]()) == [] and fetch.LOG[-1]["status"] == "failure" and "錯開一天後相關係數很高" in fetch.LOG[-1]["detail"] and "不像抓到別的東西" in fetch.LOG[-1]["detail"], "日期差一天：診斷要點出來: " + fetch.LOG[-1]["detail"]
     ps, _ = _dxy_env(vals, corr_fred[:5]); reset()                                                                           # 重疊太少：照收，但寫明沒核對
     rows = _with(ps, lambda: REAL["yahoo_dxy"]()); assert len(rows) == 160 and "沒有核對" in [x for x in fetch.LOG if x["source"] == "yahoo_dxy"][-1]["detail"] and "沒有核對：聯準會廣義美元指數的歷史重疊只有 5 天" in rows[0]["source"], "沒核對就明寫在每一筆的來源欄"
     ps, _ = _dxy_env(_walk(160)[:99] if False else _walk(99)); reset()
@@ -4698,6 +4702,83 @@ def test_probe_round15_reports_the_constituents_endpoint_without_writing():
     with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")):
         fetch.probe_round15()
     assert fetch.LOG[-1]["status"] == "no_new_data" and not [x for x in fetch.LOG if x["status"] == "failure"]
+
+
+NDX_C = "NASDAQ-100 Consolidated - CHICAGO MERCANTILE EXCHANGE"
+NDX_E = "NASDAQ MINI - CHICAGO MERCANTILE EXCHANGE"
+
+
+def test_cftc_cot_ndx_prefers_consolidated_falls_back_to_emini_and_lists_names_when_none():
+    def run(by_name, names=None):
+        urls = []
+        def fj(url, **k):
+            urls.append(url)
+            if "%24select" in url: return (names if names is not None else []), ""
+            for nm, v in by_name.items():
+                if urllib_unquote(url).find("market_and_exchange_names=" + nm) >= 0: return v
+            return [], ""
+        reset()
+        with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+            return REAL["cftc_cot_ndx"](), urls, [x for x in fetch.LOG if x["source"] == "cftc:cot_ndx"][-1]
+    out, urls, lg = run({NDX_C: ([cot_row(D(10), market=NDX_C), cot_row(D(17), market=NDX_C, ll=380000, ls=650000)], "")})
+    assert [r["report_date"] for r in out] == [D(10), D(17)] and out[0]["market"] == "Nasdaq-100 Consolidated" and out[0]["lev_long"] == 400000 and "gpe5-46if" in urls[0] and "NASDAQ-100" in urllib_unquote(urls[0]) and len(urls) == 1, "找到合併合約就不用再找 E-mini"
+    assert lg["status"] == "success" and "Nasdaq-100 Consolidated：報告日" in lg["detail"] and "槓桿基金淨 -300,000" in lg["detail"]
+    out, urls, lg = run({NDX_E: ([cot_row(D(10), market=NDX_E)], "")})
+    assert out and out[0]["market"] == "Nasdaq-100 E-mini" and len(urls) == 2, "合併合約沒資料：改找 E-mini"
+    bad = cot_row(D(10), market=NDX_C, ll=9999999)                                                                     # 槓桿基金多單比未平倉量還大：不合理
+    out, urls, lg = run({NDX_C: ([bad], ""), NDX_E: ([cot_row(D(10), market=NDX_E)], "")}); assert out and out[0]["market"] == "Nasdaq-100 E-mini", "合併合約的數字不合理：不採用，改找 E-mini"
+    out, urls, lg = run({}, names=[{"market_and_exchange_names": "NASDAQ-100 STOCK INDEX (MINI) - CHICAGO MERCANTILE EXCHANGE"}, {"market_and_exchange_names": "NASDAQ MICRO"}])
+    assert out == [] and lg["status"] == "no_new_data" and "CFTC 沒有這個市場名稱的資料" in lg["detail"] and "NASDAQ-100 STOCK INDEX (MINI)" in lg["detail"] and "NASDAQ MICRO" in lg["detail"], "找不到：列出 CFTC 裡實際含 NASDAQ 的名稱，讓你對照: " + lg["detail"]
+    out, urls, lg = run({NDX_C: (None, "HTTP 503"), NDX_E: (None, "HTTP 503")}); assert out == [] and lg["status"] == "no_new_data" and "抓取失敗 HTTP 503" in lg["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "timeout")):
+        assert REAL["cftc_cot_ndx"]() == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "查不到" in fetch.LOG[-1]["detail"] and not [x for x in fetch.LOG if x["status"] == "failure"], "連不上：只記沒有資料，不讓工作變紅"
+
+
+def test_run_job_daily_persists_ndx_cot_and_isolates_m33():
+    reset()
+    row = {"report_date": D(10), "market": "Nasdaq-100 Consolidated", "open_interest": 2000000, "dealer_long": 1, "dealer_short": 2, "asset_mgr_long": 3, "asset_mgr_short": 4, "lev_long": 5, "lev_short": 6, "source": "x"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(dry, **kw):
+        got = []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "cftc_cot_ndx", **(kw or {"return_value": [row]})), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in ps: p_.start()
+        try: fetch.run_job("tw_close", dry_run=dry)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(False); assert ("us_cot", [row], "report_date,market") in tables and st["module:M33"] == "success"
+    reset(); tables, st = go(True); assert "module:M33" not in st
+    reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M33"] == "failure" and "module:M07" in st
+
+
+def test_probe_round16_reports_whether_yahoo_futures_quotes_carry_open_interest():
+    def raw(oi):
+        def f(url, timeout=None, headers=None):
+            if "v7/finance/quote" in url:
+                res = [{"symbol": "NQ=F", "regularMarketPrice": 21000, **({"openInterest": 250000} if oi else {})}, {"symbol": "ES=F", "regularMarketPrice": 5800, **({"openInterest": 2100000} if oi else {})}]
+                return 200, "application/json", json.dumps({"quoteResponse": {"result": res}}).encode(), ""
+            return 200, "application/json", json.dumps({"chart": {"result": [{"meta": {"symbol": "NQ=F", "regularMarketPrice": 21000, "currency": "USD"}}]}}).encode(), ""
+        return f
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw(True)), mock.patch.object(fetch, "sb_upsert") as up, mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round16()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "NQ=F：openInterest=250000" in by["probe:yahoo_quote_oi"]["detail"] and "ES=F：openInterest=2100000" in by["probe:yahoo_quote_oi"]["detail"] and "openInterest 在 meta 裡：False" in by["probe:yahoo_chart_meta"]["detail"]; up.assert_not_called()
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw(False)), mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round16()
+    assert "openInterest=沒有這個欄位" in [x for x in fetch.LOG if x["source"] == "probe:yahoo_quote_oi"][0]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(401, "application/json", b'{"finance":{"error":{"code":"Unauthorized"}}}', "HTTP 401")), mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round16()
+    assert all(x["status"] == "no_new_data" for x in fetch.LOG if x["source"].startswith("probe:")) and "result 是空的" in [x for x in fetch.LOG if x["source"] == "probe:yahoo_quote_oi"][0]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch.time, "sleep"):
+        fetch.probe_round16()
+    assert not [x for x in fetch.LOG if x["status"] == "failure"] and len(fetch.LOG) == 2
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
