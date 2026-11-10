@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -4800,6 +4800,59 @@ def test_probe_round16_reports_whether_yahoo_futures_quotes_carry_open_interest(
     with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch.time, "sleep"):
         fetch.probe_round16()
     assert not [x for x in fetch.LOG if x["status"] == "failure"] and len(fetch.LOG) == 2
+
+
+def _bars_body(end, n=70, vol=60_000_000, extra=()):
+    """由 end 往前數 n 個平日（含 end 若是平日）的 Nasdaq 日線 JSON；extra：額外的列"""
+    rows, d_ = [], end
+    while len(rows) < n:
+        if d_.weekday() < 5:
+            rows.append({"date": d_.strftime("%m/%d/%Y"), "close": f"${700 + len(rows) * 0.1:.2f}", "volume": f"{vol + len(rows) * 1000:,}", "open": "$1", "high": "$1", "low": "$1"})
+        d_ -= timedelta(days=1)
+    return json.dumps({"data": {"tradesTable": {"rows": rows + list(extra)}}}).encode()
+
+
+def test_us_daily_bars_keeps_only_closed_days_with_plausible_volume():
+    now = datetime(2026, 11, 9, 10, 0)                                                    # 週一美東 10:00：今天的那一筆還在盤中
+    fri = date(2026, 11, 6)
+    def run(body, status=200, when=now):
+        reset()
+        with mock.patch.object(fetch, "fetch_raw", return_value=(status, "application/json", body, "" if status == 200 else "HTTP")), mock.patch.object(fetch, "_now_et", return_value=when):
+            return REAL["us_daily_bars"](), [x for x in fetch.LOG if x["source"] == "us_daily_bars"][-1]
+    partial = {"date": "11/09/2026", "close": "$715.00", "volume": "3,000,000", "open": "$1", "high": "$1", "low": "$1"}         # 今天盤中：成交量只有一小部分
+    out, lg = run(_bars_body(fri, 70, extra=[partial]))
+    assert len(out) == 70 and max(r["as_of"] for r in out) == "2026-11-06" and all(r["symbol"] == "SPY" and r["volume"] > 1e6 and r["close"] > 0 for r in out), "盤中那一筆不收"
+    assert "2026-11-09" not in {r["as_of"] for r in out} and "Nasdaq" in out[0]["source"] and lg["status"] == "success" and "70 筆（SPY）" in lg["detail"], lg["detail"]
+    out2, _ = run(_bars_body(date(2026, 11, 9), 70), when=datetime(2026, 11, 9, 17, 0))                                            # 收盤後（美東 17:00）：今天那一筆可以收
+    assert max(r["as_of"] for r in out2) == "2026-11-09", "收盤後今天的那一筆才收"
+    bad_vol = [{"date": "11/05/2026", "close": "$701.00", "volume": "12", "open": "$1", "high": "$1", "low": "$1"}, {"date": "11/04/2026", "close": "$701.00", "volume": "", "open": "$1", "high": "$1", "low": "$1"}, {"date": "11/03/2026", "close": "$701.00", "volume": "N/A", "open": "$1", "high": "$1", "low": "$1"}]
+    out3, lg3 = run(_bars_body(fri, 70, extra=bad_vol)); n_before = len(out); assert len(out3) == n_before and all(r["volume"] >= 1e6 for r in out3), "成交量不合理或讀不出來的列丟掉，不編"
+    out4, lg4 = run(_bars_body(fri, 30)); assert out4 == [] and lg4["status"] == "no_new_data" and "只有 30 天有可用的成交量（至少 60 天）" in lg4["detail"]
+    out5, lg5 = run(_bars_body(date(2026, 10, 20), 70)); assert out5 == [] and lg5["status"] == "no_new_data" and "太舊" in lg5["detail"], "最新一天超過 7 天前：不用"
+    out6, lg6 = run(b"", status=403); assert out6 == [] and lg6["status"] == "no_new_data"
+    out7, lg7 = run(b"<html>nope</html>"); assert out7 == [] and lg7["status"] == "no_new_data" and "不是 JSON" in lg7["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")), mock.patch.object(fetch, "_now_et", return_value=now):
+        assert REAL["us_daily_bars"]() == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "連線失敗" in fetch.LOG[-1]["detail"] and not [x for x in fetch.LOG if x["status"] == "failure"], "連不上：只記沒有資料，不讓工作變紅"
+
+
+def test_run_job_us_breadth_also_persists_spy_bars_and_isolates_m34():
+    reset()
+    bar = {"symbol": "SPY", "as_of": D(1), "close": 712.5, "volume": 61234500, "source": "x"}
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    def go(dry, **kw):
+        got = []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "us_breadth_ndx", return_value=[{"as_of": D(1)}]),
+              mock.patch.object(fetch, "us_daily_bars", **(kw or {"return_value": [bar]})), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
+        for p_ in ps: p_.start()
+        try: fetch.run_job("us_breadth", dry_run=dry)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(False); assert ("us_daily_bars", [bar], "symbol,as_of") in tables and st["module:M34"] == "success" and st["module:M32"] == "success"
+    reset(); tables, st = go(True); assert not [x for x in tables if x[0] == "us_daily_bars"] and "module:M34" not in st, "試跑不抓"
+    reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M34"] == "failure" and st["module:M32"] == "success" and [x for x in tables if x[0] == "us_daily_bars"][0][1] == [], "M34 壞了不影響 M32"
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():

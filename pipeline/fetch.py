@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v73"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v74"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2299,8 +2299,8 @@ def us_extra_quotes():
     return out
 
 
-def _nasdaq_history(sym, assetclass="etf", days=75):
-    """Nasdaq 歷史行情（預設約 60 天，ETF）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。"""
+def _nasdaq_rows(sym, assetclass="etf", days=75):
+    """Nasdaq 歷史行情 → ([{date, close, volume}] 由舊到新, "")；失敗回傳 (None, 原因)。收盤價超出合理範圍的列丟掉；成交量讀不出來就是 None（不編）。"""
     today = date.today()
     url = config.NASDAQ_HIST_URL.format(symbol=sym, assetclass=assetclass, fromdate=(today - timedelta(days=days)).isoformat(), todate=today.isoformat())
     status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
@@ -2310,18 +2310,55 @@ def _nasdaq_history(sym, assetclass="etf", days=75):
         rows = (((json.loads(body.decode("utf-8-sig").lstrip("\ufeff")) or {}).get("data") or {}).get("tradesTable") or {}).get("rows") or []
     except (ValueError, UnicodeDecodeError, AttributeError):
         return None, "不是 JSON"
-    pts = []
+    out = []
     for r in rows:
         m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", str(r.get("date", "")).strip())
         c = parse_number(str(r.get("close", "")).replace("$", ""))
         if not m or c is None or not (0 < c < config.PRICE_LIMIT):
             continue
         try:
-            pts.append((date(int(m.group(3)), int(m.group(1)), int(m.group(2))), c))
+            d_ = date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
         except ValueError:
             continue
-    pts.sort()
-    return pts, ""
+        out.append({"date": d_, "close": c, "volume": parse_number(str(r.get("volume", "")))})
+    out.sort(key=lambda x: x["date"])
+    return out, ""
+
+
+def _nasdaq_history(sym, assetclass="etf", days=75):
+    """Nasdaq 歷史行情（預設約 60 天，ETF）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。"""
+    rows, why = _nasdaq_rows(sym, assetclass, days)
+    if rows is None:
+        return None, why
+    return [(r["date"], r["close"]) for r in rows], ""
+
+
+def us_daily_bars():
+    """模組 M34：美股 ETF（目前只有 SPY）近約 130 天的日線收盤價與成交量，給「量價成本（估算）」用。
+    只收「已經收盤」的日子（美東 16:30 以前，今天那一筆是盤中的、成交量還不完整，不收）；成交量要在合理範圍；至少 60 天有成交量；最新一天不能超過 7 天前。
+    抓不到或不夠只記「沒有資料」，不讓工作變紅。"""
+    out, notes = [], []
+    lo, hi = config.US_VOL_RANGE
+    for sym in config.US_BAR_SYMBOLS:
+        rows, why = _nasdaq_rows(sym, "etf", config.US_BAR_DAYS)
+        if rows is None:
+            notes.append(f"{sym}：{why}")
+            continue
+        now_et = _now_et()
+        last_ok = now_et.date() if (now_et.hour, now_et.minute) >= (16, 30) else now_et.date() - timedelta(days=1)
+        good = [r for r in rows if r["volume"] is not None and lo <= r["volume"] <= hi and r["date"] <= last_ok]
+        if len(good) < 60:
+            notes.append(f"{sym}：只有 {len(good)} 天有可用的成交量（至少 60 天）")
+            continue
+        if (last_ok - good[-1]["date"]).days > 7:
+            notes.append(f"{sym}：最新一天是 {good[-1]['date']}，太舊，不用")
+            continue
+        out += [{"symbol": sym, "as_of": r["date"].isoformat(), "close": r["close"], "volume": r["volume"], "source": "Nasdaq 歷史行情（日線，含成交量）"} for r in good]
+    if out:
+        log("us_daily_bars", "success", as_of=max(r["as_of"] for r in out), detail=f"{len(out)} 筆（{', '.join(sorted({r['symbol'] for r in out}))}），最新 {max(r['as_of'] for r in out)}" + (f"；{'；'.join(notes)}" if notes else ""))
+    else:
+        log("us_daily_bars", "no_new_data", detail=_clip("；".join(notes) or "沒有資料"))
+    return out
 
 
 def us_index_quotes():
@@ -4838,6 +4875,7 @@ def run_job(job, dry_run=False):
             log("us_breadth", "skipped", detail="M32 已在設定裡關閉")
         else:
             extra.append(("us_breadth_ndx", _run_module("M32", "美股廣度（Nasdaq-100）", us_breadth_ndx) or [], "as_of"))
+            extra.append(("us_daily_bars", _run_module("M34", "SPY 日線（含成交量）", us_daily_bars) or [], "symbol,as_of"))
 
     if job in ("full", "tw_close"):
         extra.append(("us_quotes", _run_module("M02", "美股其他行情", us_extra_quotes) or [], "symbol,as_of"))
