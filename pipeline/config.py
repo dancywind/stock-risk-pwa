@@ -166,7 +166,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v76"
+PIPELINE_VERSION = "v77"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -244,5 +244,9 @@ def supabase_key():
 DASHBOARD_KEYWORDS = ("維持率", "儀表板", "信用交易", "追繳", "不限用途")
 DASHBOARD_HOME_PAGES = ("https://www.twse.com.tw/zh/", "https://www.twse.com.tw/")
 DASHBOARD_MAX_PAGES = 3
-DASHBOARD_MAX_SCRIPTS = 3
+DASHBOARD_MAX_SCRIPTS = 4
 DASHBOARD_MAX_SUBPAGES = 3
+
+# 探測：哪些持股／候選股沒有三率，官方各財報資料集與 FinMind 有沒有。
+FIN_PROBE_MAX_DATASETS = 16
+FIN_PROBE_FINMIND = 6

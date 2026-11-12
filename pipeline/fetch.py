@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v76"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v77"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -975,7 +975,11 @@ def probe_dashboard():
         if len(body) < 1200:
             extra = "｜頁面原文：" + re.sub(r"\s+", " ", html)[:400]
         log(f"probe:dashboard_{label}", "success", detail=_clip(f"{url}｜標題 {(title.group(1).strip() if title else '（無）')[:60]}｜{status} {ctype}｜{len(body)} 位元組｜程式檔 {len(scripts)} 個：" + " ; ".join(scripts[:6]) + "｜框架 " + (" ; ".join(frames[:3]) or "無") + "｜轉址 " + (" ; ".join(refresh[:2] + jump[:2]) or "無") + "｜像資料網址的字串：" + (" ; ".join(found[:10]) if found else "無") + extra))
-        for js in [s for s in scripts if urllib.parse.urlparse(s).netloc.endswith(("twse.com.tw", "tpex.org.tw"))][: config.DASHBOARD_MAX_SCRIPTS]:
+        slug = urllib.parse.urlparse(url).path.rsplit("/", 2)
+        slug = (slug[-2] + "-" + slug[-1].rsplit(".", 1)[0]) if len(slug) >= 2 else ""                                  # credit/margin.html → credit-margin
+        mine = [s for s in scripts if urllib.parse.urlparse(s).netloc.endswith(("twse.com.tw", "tpex.org.tw")) and "/lib/" not in s]     # 函式庫（highcharts 之類）不用看
+        mine.sort(key=lambda s: 0 if slug and slug in s else 1)                                                         # 頁面專屬的程式檔（credit-margin.js）排最前面
+        for js in mine[: config.DASHBOARD_MAX_SCRIPTS]:
             st, ct, jb, er = fetch_raw(js, timeout=config.PROBE_TIMEOUT, headers=DASH_HEADERS)
             if st is None or st != 200:
                 log("probe:dashboard_script", "no_new_data", detail=_clip(f"{js}：HTTP {st}；{er}"))
@@ -983,7 +987,8 @@ def probe_dashboard():
             text = jb[:2_000_000].decode("utf-8", errors="replace")
             hits = sorted({u for u in api_re.findall(text) if re.search(r"\.(json|csv)\b|/rwd/|/api/|/v1/|dashboard|margin|credit|maint", u, re.I)})
             kw = [k for k in config.DASHBOARD_KEYWORDS if k in text]
-            log("probe:dashboard_script", "success", detail=_clip(f"{js}｜{len(jb)} 位元組｜含關鍵字 {'、'.join(kw) if kw else '無'}｜像資料網址的字串：" + (" ; ".join(hits[:14]) if hits else "無")))
+            calls = [re.sub(r"\s+", " ", text[max(0, m.start() - 40): m.end() + 110]) for m in re.finditer(r"fetch\(|getJSON|\$\.get\(|\$\.ajax|axios|XMLHttpRequest|\.open\(\s*[\"']GET|\.json[\"']", text)][:5]
+            log("probe:dashboard_script", "success", detail=_clip(f"{js}｜{len(jb)} 位元組｜含關鍵字 {'、'.join(kw) if kw else '無'}｜像資料網址的字串：" + (" ; ".join(hits[:14]) if hits else "無") + "｜讀資料的呼叫附近：" + (" ## ".join(calls) if calls else "無")))
         subs = []
         for u in found + [urllib.parse.urlparse(x).path for x in frames + refresh + jump]:
             absu = urllib.parse.urljoin(url, u)
@@ -999,6 +1004,69 @@ def probe_dashboard():
             if sub not in visited:
                 visited.add(sub)
                 inspect_page(sub, "subpage")
+
+
+def probe_fin_coverage():
+    """只讀探測：你的持股與候選股裡，哪些代號沒有三率？官方的各個財報資料集（上市、上櫃、各業別）和 FinMind 有沒有它們？
+    先從資料庫算出「沒有三率的代號」（持股的價格表與候選股，減去 tw_fin_q 與 tw_fin_q_ext 已有的），再逐一查：
+    1) 證交所與櫃買開放資料裡每一個財報／損益表資料集：筆數、欄位、你的缺三率代號出現在哪幾個；
+    2) 這些代號的產業（tw_industry）；3) 最多 6 檔去問 FinMind，記它回傳哪些損益項目名稱。只記錄，不寫任何資料表。"""
+    if not sb_ready():
+        log("probe:fin_missing", "skipped", detail="未設定 Supabase，無法找出沒有三率的代號")
+        return
+    px, e1 = sb_request("GET", "stock_prices?select=code,name&market=eq.TW&limit=500")
+    wl, e2 = sb_request("GET", "private_watchlist?select=code&limit=200")
+    q1, e3 = sb_request("GET", "tw_fin_q?select=code&limit=2000")
+    q2, e4 = sb_request("GET", "tw_fin_q_ext?select=code&limit=3000")
+    if px is None or q1 is None or q2 is None:
+        log("probe:fin_missing", "failure", detail=_clip(f"讀取資料庫失敗：{e1 or e3 or e4}"))
+        return
+    names = {str(r.get("code", "")).strip(): r.get("name") or "" for r in px if isinstance(r, dict)}
+    for r in (wl or []):
+        c = str(r.get("code", "")).strip() if isinstance(r, dict) else ""
+        if c:
+            names.setdefault(c, "（候選股）")
+    have = {str(r.get("code", "")).strip() for r in (q1 or []) + (q2 or []) if isinstance(r, dict)}
+    missing = sorted(c for c in names if c and c not in have)
+    ind, _e5 = sb_request("GET", "tw_industry?select=code,industry&limit=3000")
+    indmap = {str(r.get("code", "")).strip(): r.get("industry") for r in (ind or []) if isinstance(r, dict)}
+    log("probe:fin_missing", "success", detail=_clip(f"持股與候選股共 {len(names)} 檔，已有三率 {len(names) - len(missing)} 檔，沒有 {len(missing)} 檔：" + "；".join(f"{c} {names[c]}（{indmap.get(c) or '產業查不到'}）" for c in missing[:25])))
+    if not missing:
+        return
+    seen_paths = []
+    for tag, swag_url, base in (("twse", config.TWSE_OPENAPI_SWAGGER, config.TWSE_OPENAPI_BASE), ("tpex", config.TPEX_SWAGGER, config.TPEX_DEFAULT_BASE)):
+        swag, err = fetch_swagger(swag_url)
+        if not isinstance(swag, dict):
+            log(f"probe:fin_dataset_{tag}", "failure", detail=_clip(f"說明文件抓取失敗：{err}"))
+            continue
+        cands = []
+        for pth, methods in (swag.get("paths") or {}).items():
+            for m in (methods or {}).values():
+                s = str(m.get("summary", "")) if isinstance(m, dict) else ""
+                if re.search(r"財報|綜合損益|損益表", s):
+                    cands.append((pth, s))
+        log(f"probe:fin_dataset_{tag}", "success", detail=_clip(f"財報／損益表相關資料集 {len(cands)} 個：" + " ; ".join(f"{p} {s}" for p, s in cands[:12])))
+        for pth, s in cands[: config.FIN_PROBE_MAX_DATASETS]:
+            rows, e = fetch_json(_openapi_base(swag, base) + pth)
+            dicts = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+            if not dicts:
+                log(f"probe:fin_dataset_{tag}", "no_new_data", detail=_clip(f"{pth} {s}：沒有資料或抓取失敗（{e or ''}）"))
+                continue
+            kc = next((k for k in dicts[0] if "代號" in k or k.lower() in ("code", "companycode", "securitiescompanycode")), None)
+            codes = {str(r.get(kc, "")).strip() for r in dicts} if kc else set()
+            hit = [c for c in missing if c in codes]
+            log(f"probe:fin_dataset_{tag}", "success", detail=_clip(f"{pth} {s}｜{len(dicts)} 筆｜欄位 {' / '.join(list(dicts[0])[:14])}｜缺三率的代號出現在這裡：{'、'.join(hit) if hit else '無'}"))
+            seen_paths.append((pth, set(hit)))
+    found_any = set().union(*[h for _p, h in seen_paths]) if seen_paths else set()
+    log("probe:fin_missing_summary", "success", detail=_clip("官方財報資料集裡完全找不到的代號：" + ("、".join(c for c in missing if c not in found_any) or "無（每一檔至少出現在一個資料集）")))
+    for code in missing[: config.FIN_PROBE_FINMIND]:
+        j, err = fetch_json(f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockFinancialStatements&data_id={code}&start_date={date.today().year - 1}-01-01")
+        if not isinstance(j, dict) or j.get("status") != 200 or not isinstance(j.get("data"), list):
+            log("probe:fin_finmind", "no_new_data", detail=_clip(f"{code} {names.get(code, '')}：FinMind 沒給資料（{err or str(j)[:60]}）"))
+            continue
+        types = Counter(str(r.get("type", "")) for r in j["data"] if isinstance(r, dict))
+        log("probe:fin_finmind", "success", detail=_clip(f"{code} {names.get(code, '')}（{indmap.get(code) or '產業查不到'}）：FinMind 共 {len(j['data'])} 列；損益項目名稱：" + "、".join(t for t, _n in types.most_common(14))))
+        time.sleep(config.FINMIND_SLEEP)
 
 
 def probe_extra():
@@ -4931,6 +4999,7 @@ def run_job(job, dry_run=False):
         probe_extra()
         probe_taifex_daily()
         probe_dashboard()
+        probe_fin_coverage()
     if job == "us_probe":
         probe_earnings()
         probe_round3()

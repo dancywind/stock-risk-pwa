@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -4895,7 +4895,7 @@ def test_probe_dashboard_finds_keyword_endpoints_links_and_data_urls():
     assert "/openapi/v1/credit | 信用交易統計" in by["probe:dashboard_swagger_tpex"]["detail"]
     d = by["probe:dashboard_home"]["detail"]; assert by["probe:dashboard_home"]["status"] == "success" and "找到 1 個疑似儀表板連結" in d and "臺股 儀表板 → https://www.twse.com.tw/zh/dashboard/index.html" in d and "javascript" not in d and "about" not in d, "首頁：只收真的儀表板連結（排除 javascript、#、無關連結）: " + d
     d = by["probe:dashboard_page"]["detail"]; assert "標題 臺股儀表板" in d and "程式檔 2 個" in d and "/rwd/zh/dashboard/credit?response=json" in d and "logo.png" not in d.split("頁面原文")[0] and "頁面原文：" in d, "頁面：標題、程式檔、像資料網址的字串（很短的頁面連原文一起記）: " + d
-    d = by["probe:dashboard_script"]["detail"]; assert "含關鍵字 維持率" in d and "/api/v1/margin/maintenance?d=1" in d and "MI_CREDIT.json" in d and "main.css" not in d, "程式檔: " + d
+    d = by["probe:dashboard_script"]["detail"]; assert "含關鍵字 維持率" in d and "/api/v1/margin/maintenance?d=1" in d and "MI_CREDIT.json" in d and "main.css" not in d.split("讀資料的呼叫附近")[0] and "讀資料的呼叫附近：fetch(" in d, "程式檔: " + d
     assert "https://cdn.example.com/lib.js" not in asked, "外部網域的程式檔不抓"; assert asked.count("https://www.twse.com.tw/assets/app.js") == 1
     assert all(x["status"] in ("success",) for x in by.values()) and not [x for x in fetch.LOG if x["status"] == "failure"], "全部成功、沒有失敗"
 
@@ -4916,6 +4916,101 @@ def test_probe_dashboard_follows_redirect_pages_to_subpages_one_level_only():
     asked_set = [u for u in asked if "/dashboard/zh/" in u]
     assert "https://www.twse.com.tw/dashboard/zh/credit/frame.html" not in asked and "https://www.twse.com.tw/dashboard/zh/loop/index.html" not in asked and "https://www.twse.com.tw/elsewhere/x.html" not in asked and not [u for u in asked if "evil.example.com" in u], "只再往下一層，不追子頁的子頁；不碰外站: " + str(asked_set)
     assert asked.count("https://www.twse.com.tw/dashboard/zh/index.html") == 1, "同一頁不重複抓"
+
+
+def test_probe_dashboard_reads_page_specific_script_first_skips_libraries_and_shows_data_calls():
+    home = "https://www.twse.com.tw/zh/"
+    page = '<title>信用交易</title><script src="https://www.googletagmanager.com/gtag/js?id=G-1"></script><script src="/dashboard/js/main.js"></script><script src="/dashboard/lib/hc/highcharts.js"></script><script src="/dashboard/lib/hc/accessibility.js"></script><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300
+    pages = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, page),
+             "https://www.twse.com.tw/dashboard/js/main.js": (200, "var a = 1;"), "https://www.twse.com.tw/dashboard/lib/hc/highcharts.js": (200, "x"), "https://www.twse.com.tw/dashboard/lib/hc/accessibility.js": (200, "x"),
+             "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, "$.getJSON('/dashboard/api/credit/margin?type=day', function (d) { render(d); }); // 維持率")}
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages))
+    js = [u for u in asked if u.endswith(".js")]
+    assert js == ["https://www.twse.com.tw/dashboard/js/credit-margin.js", "https://www.twse.com.tw/dashboard/js/main.js"], "頁面專屬的程式檔排最前面；函式庫（lib）和外站的不看: " + str(js)
+    d = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_script"][0]
+    assert "credit-margin.js" in d and "含關鍵字 維持率" in d and "/dashboard/api/credit/margin?type=day" in d and "讀資料的呼叫附近：$.getJSON('/dashboard/api/credit/margin?type=day'" in d, "第一支就是頁面專屬的，並記下讀資料呼叫附近的字: " + d
+
+
+def _fin_env(swagger, datasets, finmind=None, tables=None, sb=True):
+    """三率覆蓋探測用的假環境：資料庫表（路徑開頭→列）、swagger、開放資料資料集（網址尾→列）、FinMind（代號→回傳）。"""
+    tables = tables or {}
+    finmind = finmind or {}
+    asked = []
+    def fake_sb(method, path, *a, **k):
+        asked.append(path)
+        for pre, rows in tables.items():
+            if path.startswith(pre):
+                return (rows, None) if rows is not None else (None, "讀取失敗")
+        return [], None
+    def fake_json(url, *a, **k):
+        asked.append(url)
+        if "finmindtrade" in url:
+            code = url.split("data_id=")[1].split("&")[0]
+            return finmind.get(code, (None, "HTTP 402"))
+        for tail, rows in datasets.items():
+            if url.endswith(tail):
+                return rows, None
+        return None, "HTTP 404"
+    def fake_swagger(url):
+        d = swagger.get(url)
+        return (d, "") if d is not None else (None, "連線失敗")
+    return asked, [mock.patch.object(fetch, "sb_ready", return_value=sb), mock.patch.object(fetch, "sb_request", side_effect=fake_sb), mock.patch.object(fetch, "fetch_json", side_effect=fake_json), mock.patch.object(fetch, "fetch_swagger", side_effect=fake_swagger), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "persist_extra")]
+
+
+def _run_fin(env):
+    asked, patches = env
+    reset()
+    for p in patches: p.start()
+    try:
+        REAL["probe_fin_coverage"]()
+    finally:
+        for p in patches: p.stop()
+    return asked, [x for x in fetch.LOG if x["source"].startswith("probe:fin")]
+
+
+def test_probe_fin_coverage_finds_missing_codes_and_checks_every_statement_dataset_and_finmind():
+    swagger = {config.TWSE_OPENAPI_SWAGGER: {"paths": {"/opendata/t187ap06_L_ci": {"get": {"summary": "上市公司綜合損益表-一般業"}}, "/opendata/t187ap06_L_basi": {"get": {"summary": "上市公司綜合損益表-銀行業"}}, "/opendata/other": {"get": {"summary": "無關的東西"}}}},
+               config.TPEX_SWAGGER: {"paths": {"/mopsfin_t187ap06_O_ciA": {"get": {"summary": "上櫃公司財報資訊（一般業）"}}}}}
+    datasets = {"/opendata/t187ap06_L_ci": [{"公司代號": "2330", "營業收入": "1"}, {"公司代號": "1597", "營業收入": "1"}], "/opendata/t187ap06_L_basi": [{"公司代號": "2882", "淨收益": "9"}, {"公司代號": "2891", "淨收益": "9"}], "/mopsfin_t187ap06_O_ciA": [{"SecuritiesCompanyCode": "6862", "營業收入": "1"}]}
+    tables = {"stock_prices": [{"code": "2330", "name": "台積電"}, {"code": "2882", "name": "國泰金"}, {"code": "1597", "name": "直得"}, {"code": "6862", "name": "新股"}], "private_watchlist": [{"code": "2317"}, {"code": "00878"}],
+              "tw_fin_q?": [{"code": "2330"}], "tw_fin_q_ext": [{"code": "1597"}, {"code": "2317"}], "tw_industry": [{"code": "2882", "industry": "金融保險業"}, {"code": "6862", "industry": "電子零組件業"}]}
+    finmind = {"2882": ({"status": 200, "data": [{"type": "Revenue"}, {"type": "NetIncome"}, {"type": "NetIncome"}, {"type": "EPS"}]}, None), "6862": ({"status": 200, "data": []}, None)}
+    asked, logs = _run_fin(_fin_env(swagger, datasets, finmind, tables))
+    by = {}
+    for x in logs: by.setdefault(x["source"], []).append(x["detail"])
+    m = by["probe:fin_missing"][0]
+    assert "共 6 檔，已有三率 3 檔，沒有 3 檔" in m and "00878 （候選股）（產業查不到）" in m and "2882 國泰金（金融保險業）" in m and "6862 新股（電子零組件業）" in m and "2330" not in m.split("沒有 3 檔")[1], "沒有三率的代號與產業: " + m
+    twse = " ## ".join(by["probe:fin_dataset_twse"]); tpex = " ## ".join(by["probe:fin_dataset_tpex"])
+    assert "財報／損益表相關資料集 2 個" in twse and "/opendata/other" not in twse and "t187ap06_L_basi 上市公司綜合損益表-銀行業｜2 筆｜欄位 公司代號 / 淨收益｜缺三率的代號出現在這裡：2882" in twse and "t187ap06_L_ci 上市公司綜合損益表-一般業｜2 筆｜欄位 公司代號 / 營業收入｜缺三率的代號出現在這裡：無" in twse, "上市各資料集: " + twse
+    assert "mopsfin_t187ap06_O_ciA 上櫃公司財報資訊（一般業）｜1 筆｜欄位 SecuritiesCompanyCode / 營業收入｜缺三率的代號出現在這裡：6862" in tpex, "上櫃資料集（欄位名不是『公司代號』也認得）: " + tpex
+    assert "官方財報資料集裡完全找不到的代號：00878" in by["probe:fin_missing_summary"][0] and "2882" not in by["probe:fin_missing_summary"][0].split("：")[1], "完全找不到: " + by["probe:fin_missing_summary"][0]
+    fm = by["probe:fin_finmind"]; assert any("2882 國泰金（金融保險業）：FinMind 共 4 列；損益項目名稱：NetIncome、Revenue、EPS" in d for d in fm) and any("6862" in d and "共 0 列" in d for d in fm) and any("00878" in d and "FinMind 沒給資料" in d for d in fm), "FinMind 回傳的項目名稱: " + str(fm)
+    assert not [x for x in logs if x["status"] == "failure"], "沒有失敗"
+
+
+def test_probe_fin_coverage_failures_skips_and_limits():
+    sw = {config.TWSE_OPENAPI_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}
+    # 沒設資料庫：略過
+    asked, logs = _run_fin(_fin_env(sw, {}, sb=False)); assert [(x["source"], x["status"]) for x in logs] == [("probe:fin_missing", "skipped")] and asked == []
+    # 讀資料庫失敗
+    asked, logs = _run_fin(_fin_env(sw, {}, tables={"stock_prices": None}))
+    assert logs[0]["status"] == "failure" and "讀取資料庫失敗" in logs[0]["detail"] and len(logs) == 1
+    # 每一檔都有三率：只記一筆就結束，不去抓資料集
+    asked, logs = _run_fin(_fin_env(sw, {}, tables={"stock_prices": [{"code": "2330", "name": "台積電"}], "tw_fin_q?": [{"code": "2330"}]}))
+    assert len(logs) == 1 and "沒有 0 檔" in logs[0]["detail"] and not [u for u in asked if "openapi" in u or "finmind" in u], "沒有缺的就不再往下查"
+    # 說明文件抓不到、資料集沒有資料：各記一筆，不丟例外
+    swb = {config.TWSE_OPENAPI_SWAGGER: {"paths": {"/a": {"get": {"summary": "上市公司財報資訊"}}}}}
+    asked, logs = _run_fin(_fin_env(swb, {}, tables={"stock_prices": [{"code": "2882", "name": "國泰金"}]}))
+    st = [(x["source"], x["status"]) for x in logs]; assert ("probe:fin_dataset_tpex", "failure") in st and ("probe:fin_dataset_twse", "no_new_data") in st and ("probe:fin_finmind", "no_new_data") in st, "各步驟各記一筆: " + str(st)
+    # 數量上限：資料集最多 FIN_PROBE_MAX_DATASETS 個、FinMind 最多 FIN_PROBE_FINMIND 檔
+    many = {config.TWSE_OPENAPI_SWAGGER: {"paths": {f"/p{i}": {"get": {"summary": f"上市公司財報資訊{i}"}} for i in range(30)}}, config.TPEX_SWAGGER: {"paths": {}}}
+    ds = {f"/p{i}": [{"公司代號": "9999"}] for i in range(30)}
+    px = [{"code": f"{3000 + i}", "name": f"股{i}"} for i in range(10)]
+    asked, logs = _run_fin(_fin_env(many, ds, {}, {"stock_prices": px}))
+    assert len([u for u in asked if "/p" in u and "finmind" not in u]) == config.FIN_PROBE_MAX_DATASETS and len([u for u in asked if "finmindtrade" in u]) == config.FIN_PROBE_FINMIND, "資料集與 FinMind 都有上限: " + str((len([u for u in asked if '/p' in u]), len([u for u in asked if 'finmindtrade' in u])))
+    # 只讀：探測不寫任何資料列
+    import inspect
+    src = inspect.getsource(fetch.probe_fin_coverage); assert "persist(" not in src and '"POST"' not in src and '"PATCH"' not in src and '"DELETE"' not in src, "只讀"
 
 
 def test_probe_dashboard_failures_are_logged_not_raised_and_never_write_tables():
@@ -4939,7 +5034,7 @@ def test_probe_dashboard_failures_are_logged_not_raised_and_never_write_tables()
     for i in range(5): pg[f"https://www.twse.com.tw/p{i}"] = (200, "<title>t</title>" + "".join(f'<script src="/s{j}.js"></script>' for j in range(6)))
     for j in range(6): pg[f"https://www.twse.com.tw/s{j}.js"] = (200, "x")
     asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pg))
-    assert len([u for u in asked if u.startswith("https://www.twse.com.tw/p")]) == 3 and len([u for u in asked if u.endswith(".js")]) == 9, "最多 3 頁、每頁最多 3 支程式檔: " + str(len(asked))
+    assert len([u for u in asked if u.startswith("https://www.twse.com.tw/p")]) == 3 and len([u for u in asked if u.endswith(".js")]) == 3 * config.DASHBOARD_MAX_SCRIPTS, "最多 3 頁、每頁最多 DASHBOARD_MAX_SCRIPTS 支程式檔: " + str(len(asked))
 
 
 def test_probe_dashboard_runs_only_in_tw_probe_job_and_never_persists():
@@ -5695,7 +5790,7 @@ if __name__ == "__main__":
     urllib.request.urlopen = _guard
     n = 0
     for name, fn in list(globals().items()):
-        if name.startswith("test_"):
+        if name.startswith("test_") and (not os.environ.get("ONLY_TESTS") or any(k in name for k in os.environ["ONLY_TESTS"].split(","))):          # 反向驗證時可以只跑指定的測試（環境變數 ONLY_TESTS）
             before = len(NETWORK_CALLS)
             fn(); n += 1; print("PASS", name)
             if len(NETWORK_CALLS) != before:
