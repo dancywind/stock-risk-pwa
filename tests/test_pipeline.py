@@ -4897,7 +4897,7 @@ def test_probe_dashboard_finds_keyword_endpoints_links_and_data_urls():
     d = by["probe:dashboard_page"]["detail"]; assert "標題 臺股儀表板" in d and "程式檔 2 個" in d and "/rwd/zh/dashboard/credit?response=json" in d and "logo.png" not in d.split("頁面原文")[0] and "頁面原文：" in d, "頁面：標題、程式檔、像資料網址的字串（很短的頁面連原文一起記）: " + d
     d = by["probe:dashboard_script"]["detail"]; assert "含關鍵字 維持率" in d and "/api/v1/margin/maintenance?d=1" in d and "MI_CREDIT.json" in d and "main.css" not in d.split("讀資料的呼叫附近")[0] and "讀資料的呼叫附近：fetch(" in d, "程式檔: " + d
     assert "https://cdn.example.com/lib.js" not in asked, "外部網域的程式檔不抓"; assert asked.count("https://www.twse.com.tw/assets/app.js") == 1
-    assert all(x["status"] in ("success",) for x in by.values()) and not [x for x in fetch.LOG if x["status"] == "failure"], "全部成功、沒有失敗"
+    assert all(x["status"] in ("success",) for k, x in by.items() if k != "probe:dashboard_api") and not [x for x in fetch.LOG if x["status"] == "failure"], "全部成功、沒有失敗（找得到端點但沒有基底網址的那幾筆是「沒抓」，不算失敗）"
 
 
 def test_probe_dashboard_follows_redirect_pages_to_subpages_one_level_only():
@@ -4929,6 +4929,35 @@ def test_probe_dashboard_reads_page_specific_script_first_skips_libraries_and_sh
     assert js == ["https://www.twse.com.tw/dashboard/js/credit-margin.js", "https://www.twse.com.tw/dashboard/js/main.js"], "頁面專屬的程式檔排最前面；函式庫（lib）和外站的不看: " + str(js)
     d = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_script"][0]
     assert "credit-margin.js" in d and "含關鍵字 維持率" in d and "/dashboard/api/credit/margin?type=day" in d and "讀資料的呼叫附近：$.getJSON('/dashboard/api/credit/margin?type=day'" in d, "第一支就是頁面專屬的，並記下讀資料呼叫附近的字: " + d
+
+
+def test_probe_dashboard_collects_api_constants_and_fetches_endpoints_logging_response_shape():
+    home = "https://www.twse.com.tw/zh/"
+    page = '<title>信用交易</title><script src="/dashboard/js/main.js"></script><script src="/dashboard/js/credit-margin.js"></script><script>window.cfg = {TWSE_API: "https://www.twse.com.tw/api"}; var x = 1;</script>' + "x" * 1300
+    main = 'const TPEX_API = "https://www.tpex.org.tw/otc"; var APP_NAME = "x";'
+    cm = ('$.get(TWSE_API + "/marginTrading/MI_MARGN_TREND"); $.get("/marginTrading/BFIJ3U", ok); $.get(TPEX_API + "/dashboardOtc/marginTrend?lang=zh-tw&days=5"); var css = "/dashboard/css/page.css"; var img = "/dashboard/img/a.png"; var h = "/dashboard/zh/credit/lending.html";')
+    pages = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, page), "https://www.twse.com.tw/dashboard/js/main.js": (200, main), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, cm),
+             "https://www.twse.com.tw/api/marginTrading/MI_MARGN_TREND": (200, '{"stat": "OK", "data": [{"date": "20261110", "maintRatio": 193.9, "balance": 123456}, {"date": "20261109", "maintRatio": 194.2, "balance": 123000}]}'),
+             "https://www.twse.com.tw/api/marginTrading/BFIJ3U": (500, ""),
+             "https://www.tpex.org.tw/otc/dashboardOtc/marginTrend?lang=zh-tw&days=5": (200, "<html>not json</html>")}
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages))
+    by = {}
+    for v in logs.values(): by.setdefault(v["source"], []).append(v["detail"])
+    c = by["probe:dashboard_consts"][0]
+    assert "TWSE_API = https://www.twse.com.tw/api" in c and "TPEX_API = https://www.tpex.org.tw/otc" in c and "APP_NAME" not in c and "/marginTrading/MI_MARGN_TREND" in c and "/dashboardOtc/marginTrend?lang=zh-tw&days=5" in c and "page.css" not in c and "a.png" not in c and "lending.html" not in c, "基底網址常數與端點（排除靜態檔）: " + c
+    api = by["probe:dashboard_api"]
+    ok = [d for d in api if "結構" in d]; assert len(ok) == 1 and "https://www.twse.com.tw/api/marginTrading/MI_MARGN_TREND｜" in ok[0] and "stat: 'OK'" in ok[0] and "[2 筆；第一筆 {date: '20261110', maintRatio: 193.9, balance: 123456}]" in ok[0], "記下回傳結構與樣本值: " + str(api)
+    assert any("BFIJ3U：HTTP 500" in d or "BFIJ3U" in d and "HTTP 500" in d for d in api) and any("dashboardOtc/marginTrend" in d and "不是 JSON" in d for d in api), "非 200、不是 JSON：各記一筆: " + str(api)
+    assert "https://www.tpex.org.tw/otc/dashboardOtc/marginTrend?lang=zh-tw&days=5" in asked and "https://www.twse.com.tw/api/marginTrading/MI_MARGN_TREND" in asked and not [u for u in asked if u.startswith("https://www.twse.com.tw/api/dashboardOtc")], "上櫃端點用 TPEX 的基底、上市端點用 TWSE 的基底"
+    # 沒有基底網址：不猜，記「沒抓」
+    pages2 = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, '<title>x</title><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, '$.get(API_ROOT + "/marginTrading/X1");')}
+    asked2, logs2, _p = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages2))
+    d2 = [v["detail"] for v in logs2.values() if v["source"] == "probe:dashboard_api"]; assert len(d2) == 1 and "找不到 API 基底網址，沒抓" in d2[0] and not [u for u in asked2 if "marginTrading" in u], "沒有基底網址：不亂猜網址: " + str(d2)
+    # 端點數量上限
+    eps = " ".join(f'$.get("/marginTrading/E{i}");' for i in range(25))
+    pages3 = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, '<title>x</title><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, 'var TWSE_API = "https://www.twse.com.tw/api"; ' + eps)}
+    asked3, logs3, _p = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages3))
+    assert len([u for u in asked3 if "/marginTrading/E" in u]) == config.DASHBOARD_MAX_ENDPOINTS, "端點最多抓 DASHBOARD_MAX_ENDPOINTS 個: " + str(len([u for u in asked3 if '/marginTrading/E' in u]))
 
 
 def _fin_env(swagger, datasets, finmind=None, tables=None, sb=True):

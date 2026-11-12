@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v77"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v78"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -965,6 +965,8 @@ def probe_dashboard():
             log(f"probe:dashboard_{label}", "no_new_data", detail=_clip(f"{url}：HTTP {status}；{err}"))
             return []
         html = body.decode("utf-8", errors="replace")
+        collect(html)
+        inline = [re.sub(r"\s+", " ", s.strip())[:300] for s in re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S | re.I) if re.search(r"api|base|url|host", s, re.I)]
         title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
         scripts = [urllib.parse.urljoin(url, s) for s in re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.I)]
         frames = [urllib.parse.urljoin(url, s) for s in re.findall(r"<(?:iframe|frame)[^>]+src=[\"']([^\"']+)[\"']", html, re.I)]
@@ -974,7 +976,7 @@ def probe_dashboard():
         extra = ""
         if len(body) < 1200:
             extra = "｜頁面原文：" + re.sub(r"\s+", " ", html)[:400]
-        log(f"probe:dashboard_{label}", "success", detail=_clip(f"{url}｜標題 {(title.group(1).strip() if title else '（無）')[:60]}｜{status} {ctype}｜{len(body)} 位元組｜程式檔 {len(scripts)} 個：" + " ; ".join(scripts[:6]) + "｜框架 " + (" ; ".join(frames[:3]) or "無") + "｜轉址 " + (" ; ".join(refresh[:2] + jump[:2]) or "無") + "｜像資料網址的字串：" + (" ; ".join(found[:10]) if found else "無") + extra))
+        log(f"probe:dashboard_{label}", "success", detail=_clip(f"{url}｜標題 {(title.group(1).strip() if title else '（無）')[:60]}｜{status} {ctype}｜{len(body)} 位元組｜程式檔 {len(scripts)} 個：" + " ; ".join(scripts[:6]) + "｜框架 " + (" ; ".join(frames[:3]) or "無") + "｜轉址 " + (" ; ".join(refresh[:2] + jump[:2]) or "無") + "｜像資料網址的字串：" + (" ; ".join(found[:10]) if found else "無") + ("｜內嵌程式（含 api/url 字樣）：" + " ## ".join(inline[:3]) if inline else "") + extra))
         slug = urllib.parse.urlparse(url).path.rsplit("/", 2)
         slug = (slug[-2] + "-" + slug[-1].rsplit(".", 1)[0]) if len(slug) >= 2 else ""                                  # credit/margin.html → credit-margin
         mine = [s for s in scripts if urllib.parse.urlparse(s).netloc.endswith(("twse.com.tw", "tpex.org.tw")) and "/lib/" not in s]     # 函式庫（highcharts 之類）不用看
@@ -985,6 +987,7 @@ def probe_dashboard():
                 log("probe:dashboard_script", "no_new_data", detail=_clip(f"{js}：HTTP {st}；{er}"))
                 continue
             text = jb[:2_000_000].decode("utf-8", errors="replace")
+            collect(text)
             hits = sorted({u for u in api_re.findall(text) if re.search(r"\.(json|csv)\b|/rwd/|/api/|/v1/|dashboard|margin|credit|maint", u, re.I)})
             kw = [k for k in config.DASHBOARD_KEYWORDS if k in text]
             calls = [re.sub(r"\s+", " ", text[max(0, m.start() - 40): m.end() + 110]) for m in re.finditer(r"fetch\(|getJSON|\$\.get\(|\$\.ajax|axios|XMLHttpRequest|\.open\(\s*[\"']GET|\.json[\"']", text)][:5]
@@ -997,6 +1000,21 @@ def probe_dashboard():
                 subs.append(absu)
         return subs
 
+    consts, endpoints = {}, []
+    const_re = re.compile(r"(?<![\w$])([A-Za-z_$][\w$]*)\s*[:=]\s*[\"'`]((?:https?:)?//[^\"'`\s]{4,120}|/[A-Za-z0-9_./-]{2,80})[\"'`]")
+    ep_re = re.compile(r"[\"'`](/[A-Za-z][A-Za-z0-9_]*/[A-Za-z0-9_./-]+(?:\?[^\"'`\s]*)?)[\"'`]")
+
+    def collect(text):
+        for m in const_re.finditer(text):
+            if re.search(r"api|base|host|url|domain|origin", m.group(1), re.I):
+                consts.setdefault(m.group(1), m.group(2))
+        for m in ep_re.finditer(text):
+            p = m.group(1)
+            if "/lib/" in p or p.startswith("/dashboard/") or re.search(r"\.(css|js|html?|png|jpe?g|svg|ico|woff2?|map)(\?|$)", p, re.I):
+                continue
+            if p not in endpoints:
+                endpoints.append(p)
+
     visited = set()
     for url, txt in links[: config.DASHBOARD_MAX_PAGES]:
         visited.add(url)
@@ -1004,6 +1022,47 @@ def probe_dashboard():
             if sub not in visited:
                 visited.add(sub)
                 inspect_page(sub, "subpage")
+    if consts or endpoints:
+        probe_dashboard_data(consts, endpoints)
+
+
+def _shape(j, depth=0):
+    """把 JSON 的結構與各欄位的樣本值壓成一行文字（只記結構與第一筆的值，方便判斷哪個欄位是什麼）。"""
+    if isinstance(j, dict):
+        if depth >= 4:
+            return "{…}"
+        return "{" + ", ".join(f"{k}: {_shape(v, depth + 1)}" for k, v in list(j.items())[:14]) + "}"
+    if isinstance(j, list):
+        if depth >= 4:
+            return f"[{len(j)} 筆]"
+        return f"[{len(j)} 筆；第一筆 " + (_shape(j[0], depth + 1) if j else "空") + "]"
+    return repr(j)[:40]
+
+
+def probe_dashboard_data(consts, endpoints):
+    """只讀探測：儀表板頁面的程式讀的資料端點，真的抓一次，記回傳的結構（有沒有擔保維持率、有幾天的歷史）。"""
+    log("probe:dashboard_consts", "success", detail=_clip("API 基底網址常數：" + (" ; ".join(f"{k} = {v}" for k, v in list(consts.items())[:12]) or "沒找到") + f"｜端點 {len(endpoints)} 個：" + " ; ".join(endpoints[:14])))
+    bases = [v for v in consts.values() if v.startswith(("http://", "https://", "//"))]
+    for ep in endpoints[: config.DASHBOARD_MAX_ENDPOINTS]:
+        want = "tpex|otc" if ep.startswith("/dashboardOtc") else "twse|tse"
+        pick = [v for k, v in consts.items() if re.search(want, k, re.I) and v.startswith(("http", "//"))] or bases
+        if not pick:
+            log("probe:dashboard_api", "no_new_data", detail=_clip(f"{ep}：找不到 API 基底網址，沒抓"))
+            continue
+        for base in pick[:2]:
+            base = ("https:" + base) if base.startswith("//") else base
+            url = base.rstrip("/") + ep
+            st, ct, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=dict(DASH_HEADERS, **{"Referer": "https://www.twse.com.tw/dashboard/zh/credit/margin.html", "Accept": "application/json, text/plain, */*"}))
+            if st != 200:
+                log("probe:dashboard_api", "no_new_data", detail=_clip(f"{url}：HTTP {st}；{err}"))
+                continue
+            try:
+                j = json.loads(body.decode("utf-8", errors="replace"))
+            except ValueError:
+                log("probe:dashboard_api", "no_new_data", detail=_clip(f"{url}：HTTP 200 但不是 JSON：{body[:80]!r}"))
+                continue
+            log("probe:dashboard_api", "success", detail=_clip(f"{url}｜{len(body)} 位元組｜結構 {_shape(j)}"))
+            break
 
 
 def probe_fin_coverage():
