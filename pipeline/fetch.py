@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v78"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v79"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1368,6 +1368,35 @@ def load_holdings():
         seen.add(key)
         out.append({"market": market, "symbol": p.get("symbol"), "name": p.get("name"), "kind": p.get("kind"), "pos_key": p.get("pos_key")})
     return out, ""
+
+
+def load_us_watch():
+    """讀你的美股候選股清單（private_watchlist_us），只回傳代號（大寫、格式正確、不重複）。
+    這些代號不是持股：只拿來抓收盤價、52 週高低、下次財報日和產業。資料表還不存在＝還沒啟用這個功能，記一筆，不算壞掉。"""
+    if not sb_ready():
+        return []
+    got, err = sb_request("GET", "private_watchlist_us?select=symbol&limit=500")
+    if got is None:
+        if "PGRST205" in str(err) or "HTTP 404" in str(err):
+            log("watch_us", "no_new_data", detail=_clip("美股候選股清單的資料表還不存在（還沒執行 new_tables_v67.sql）：沒有要用美股候選股功能的話可以忽略；要用，請執行 new_tables_v67.sql，再重新跑一次。"))
+        else:
+            log("watch_us", "failure", detail=_clip(f"讀取美股候選股清單失敗：{err}（如果是資料表不存在，請先執行 new_tables_v67.sql）"))
+        return []
+    syms = sorted({s for s in (str(r.get("symbol") or "").strip().upper() for r in got if isinstance(r, dict)) if re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", s)})        # 空值要先換成空字串（否則 None 會變成 "NONE"，剛好符合代號格式）
+    log("watch_us", "success" if syms else "no_new_data", detail=_clip(f"美股候選股 {len(syms)} 檔：" + ("、".join(syms[:20]) or "（清單是空的）")))
+    return syms
+
+
+def with_us_watch(hold, syms):
+    """把美股候選股接在持股清單後面（已經是持股的不重複），格式和 load_holdings 一樣；只給「抓美股價格、財報日、產業」的函式用，持股清單本身不動。"""
+    held = {str(h.get("symbol") or h.get("pos_key") or "").upper().strip() for h in (hold or []) if h.get("market") == "US"}
+    extra, seen = [], set(held)
+    for s in (syms or []):
+        u = str(s or "").upper().strip()
+        if u and u not in seen:                                  # 已經是持股、或清單裡重複的，不再加一次（大小寫不分）
+            seen.add(u)
+            extra.append({"market": "US", "symbol": u, "name": u, "kind": "stock", "pos_key": u})
+    return list(hold or []) + extra
 
 
 def _openapi_base(swagger, default):
@@ -5024,6 +5053,7 @@ def run_job(job, dry_run=False):
         return us_options_job(dry_run)
     macro_rows, twd_row, tw_rows, breadth_rows = [], None, None, None
     inst_rows = margin_rows = futures_rows = basis_rows = price_rows = cot_rows = putcall_rows = earnings_rows = None
+    us_watch = []                                                  # 美股候選股代號（只在 tw_close／full 讀）
 
     if job == "full":
         for sid, (label, low, high) in config.FRED_MACRO.items():
@@ -5046,13 +5076,15 @@ def run_job(job, dry_run=False):
         cot_rows = cftc_cot()
         putcall_rows = cboe_putcall()
         hold, herr = load_holdings()
+        us_watch = load_us_watch()
         if hold is None:
             log("prices:holdings", "skipped", detail=_clip(f"{herr}；不抓持股現價"))
         else:
             tp = tpex_prices(hold) or []
             tw = twse_prices(hold, {r["name"] for r in tp}) or []
-            price_rows = tw_ranges(tp + tw) + (nasdaq_prices(hold) or [])
-            earnings_rows = nasdaq_earnings(hold)
+            hold_us = with_us_watch(hold, us_watch)                  # 持股＋美股候選股：美股價格與財報日一起抓
+            price_rows = tw_ranges(tp + tw) + (nasdaq_prices(hold_us) or [])
+            earnings_rows = nasdaq_earnings(hold_us)
     if job == "tw_probe":
         probe_twse()
         probe_extra()
@@ -5125,7 +5157,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
-            extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, hold or []) or [], "symbol"))
+            extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, with_us_watch(hold or [], us_watch)) or [], "symbol"))
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))

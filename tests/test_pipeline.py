@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -1209,6 +1209,76 @@ def test_run_job_collects_tpex_and_nasdaq_prices_when_holdings_available():
     tp.assert_called_once_with(hold); nq.assert_called_once_with(hold)
     tw.assert_called_once_with(hold, {"金居"})                           # 上櫃已有的名稱不重複查上市
     assert res["prices"] == [{"k": 1, "name": "金居"}, {"k": 3}, {"k": 2}]
+
+
+def test_load_us_watch_reads_valid_unique_uppercase_symbols_and_handles_missing_table_and_errors():
+    got = [{"symbol": "orcl"}, {"symbol": " NVDA "}, {"symbol": "ORCL"}, {"symbol": "BRK.B"}, {"symbol": "2330"}, {"symbol": "ABCDEFG"}, {"symbol": ""}, {"symbol": None}, {"x": 1}, "壞的"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(got, None)) as sq:
+        syms = REAL["load_us_watch"]()
+    assert syms == ["BRK.B", "NVDA", "ORCL"], "大寫、去空白、去重、只留格式正確的: " + str(syms)
+    assert sq.call_args[0][0] == "GET" and "private_watchlist_us" in sq.call_args[0][1], "只讀"
+    lg = [x for x in fetch.LOG if x["source"] == "watch_us"]; assert len(lg) == 1 and lg[0]["status"] == "success" and "3 檔：BRK.B、NVDA、ORCL" in lg[0]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], None)):
+        assert REAL["load_us_watch"]() == []
+    assert [(x["status"], "清單是空的" in x["detail"]) for x in fetch.LOG if x["source"] == "watch_us"] == [("no_new_data", True)]
+    for err in ("PGRST205 relation does not exist", "HTTP 404"):
+        reset()
+        with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, err)):
+            assert REAL["load_us_watch"]() == []
+        lg = [x for x in fetch.LOG if x["source"] == "watch_us"]; assert lg[0]["status"] == "no_new_data" and "new_tables_v67.sql" in lg[0]["detail"], "資料表還不存在：不算壞掉"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=(None, "HTTP 500 boom")):
+        assert REAL["load_us_watch"]() == []
+    lg = [x for x in fetch.LOG if x["source"] == "watch_us"]; assert lg[0]["status"] == "failure" and "HTTP 500" in lg[0]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "sb_request") as sq:
+        assert REAL["load_us_watch"]() == [] and sq.call_count == 0 and not [x for x in fetch.LOG if x["source"] == "watch_us"], "沒設 Supabase：不查、不記"
+
+
+def test_with_us_watch_appends_only_symbols_not_already_held_and_leaves_holdings_untouched():
+    hold = [{"market": "TW", "symbol": None, "name": "台積電", "kind": "stock", "pos_key": "台積電"}, {"market": "US", "symbol": "ORCL", "name": "甲骨文", "kind": "stock", "pos_key": "ORCL"},
+            {"market": "US", "symbol": None, "name": "ARM", "kind": "stock", "pos_key": "arm"}]
+    out = fetch.with_us_watch(hold, ["AMD", "orcl", "ARM", "NVDA", "nvda", "", None])
+    assert out[:3] == hold and out is not hold and len(hold) == 3, "持股清單本身不動"
+    assert [x["symbol"] for x in out[3:]] == ["AMD", "NVDA"], "已經是持股的（不分大小寫，也看 pos_key）、清單裡重複的、空的都不加: " + str(out[3:])
+    assert out[3] == {"market": "US", "symbol": "AMD", "name": "AMD", "kind": "stock", "pos_key": "AMD"}
+    assert fetch.with_us_watch(None, ["AMD"]) == [{"market": "US", "symbol": "AMD", "name": "AMD", "kind": "stock", "pos_key": "AMD"}] and fetch.with_us_watch(hold, None) == hold and fetch.with_us_watch(hold, []) == hold and fetch.with_us_watch(None, None) == []
+    assert not [x for x in fetch.with_us_watch([{"market": "TW", "symbol": "AMD", "name": "x", "kind": "stock", "pos_key": "AMD"}], ["AMD"]) if x["market"] == "TW" and x is None], "台股持股不影響美股候選"
+    assert len([x for x in fetch.with_us_watch([{"market": "TW", "symbol": "AMD", "name": "x", "kind": "stock", "pos_key": "AMD"}], ["AMD"]) if x["market"] == "US"]) == 1
+
+
+def test_run_job_tw_close_feeds_us_watch_symbols_to_nasdaq_prices_earnings_and_sector_without_changing_tw_steps():
+    reset()
+    hold = HOLD + US_HOLD
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    seen = {}
+    def cap(name, ret):
+        def f(h, *a, **k):
+            seen[name] = h
+            return ret
+        return f
+    got = []
+    patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "load_us_watch", return_value=["AMD", "ORCL"]),
+              mock.patch.object(fetch, "tpex_prices", side_effect=cap("tpex", [])), mock.patch.object(fetch, "twse_prices", side_effect=cap("twse", [])), mock.patch.object(fetch, "nasdaq_prices", side_effect=cap("px", [])),
+              mock.patch.object(fetch, "nasdaq_earnings", side_effect=cap("earn", [])), mock.patch.object(fetch, "us_sector_lookup", side_effect=cap("sec", [])), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(t_)),
+              mock.patch.object(fetch, "fred_latest", return_value=None)]
+    for p_ in patches: p_.start()
+    try:
+        fetch.run_job("tw_close", dry_run=False)
+    finally:
+        for p_ in patches: p_.stop()
+    want = hold + [{"market": "US", "symbol": "AMD", "name": "AMD", "kind": "stock", "pos_key": "AMD"}]
+    assert seen["px"] == want and seen["earn"] == want and seen["sec"] == want, "美股價格、財報日、產業都包含候選股（ORCL 已持有，不重複）: " + str({k: len(v) for k, v in seen.items()})
+    assert seen["tpex"] == hold and seen["twse"] == hold, "台股價格只看持股，不受影響"
+    reset()
+    with mock.patch.object(fetch, "twse_market", return_value=None), mock.patch.object(fetch, "twse_breadth", return_value=None), mock.patch.object(fetch, "twse_institutional", return_value=None), mock.patch.object(fetch, "twse_margin", return_value=None), \
+            mock.patch.object(fetch, "taifex_futures", return_value=None), mock.patch.object(fetch, "taifex_basis", return_value=None), mock.patch.object(fetch, "cftc_cot", return_value=None), mock.patch.object(fetch, "cboe_putcall", return_value=None), \
+            mock.patch.object(fetch, "twd_fallback_chain", return_value=None), mock.patch.object(fetch, "load_holdings", return_value=(hold, "")), mock.patch.object(fetch, "load_us_watch", return_value=[]), mock.patch.object(fetch, "nasdaq_earnings", return_value=[]) as ne, \
+            mock.patch.object(fetch, "tpex_prices", return_value=[]), mock.patch.object(fetch, "twse_prices", return_value=[]), mock.patch.object(fetch, "nasdaq_prices", return_value=[]) as npx:
+        fetch.run_job("tw_close", dry_run=True)
+    npx.assert_called_once_with(hold); ne.assert_called_once_with(hold)
 
 
 def test_probe_twse_failure_logs_raw_response_and_openapi_candidates():
