@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v82"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v83"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1040,8 +1040,12 @@ def probe_dashboard():
 
     snips = []                                                                                                      # 指定名稱（TPEX_API、TWSE_API、ApiPath）後面 260 個字原文：壓縮過的程式碼會把好幾個定義黏成一長串，上面那種只取 140 字會被截斷
     snip_re = re.compile(r"(?:TPEX_API|TWSE_API|class\s+ApiPath|function\s+ApiPath|ApiPath\s*=|new\s+ApiPath)[^\n]{0,260}")
+    assign_re = re.compile(r"(?:TPEX_API|TWSE_API)\s*=(?!=)[^\n]{0,240}")                                       # 「賦值」那一段（用到的地方很多，會把名額用完，所以另外抓）
 
     def collect(text):
+        for m in assign_re.finditer(text):
+            if len(snips) < 8 and m.group(0) not in snips:
+                snips.insert(0, m.group(0))
         for m in snip_re.finditer(text):
             if len(snips) < 8 and m.group(0) not in snips:
                 snips.append(m.group(0))
@@ -1092,12 +1096,14 @@ def probe_dashboard_data(consts, endpoints, defs=None, snips=None):
     for ep in endpoints[: config.DASHBOARD_MAX_ENDPOINTS]:
         want = "tpex|otc" if ep.startswith("/dashboardOtc") else "twse|tse"
         pick = [v for k, v in consts.items() if re.search(want, k, re.I) and v.startswith(("http", "//"))] or bases
+        if not pick and not ep.startswith("/dashboardOtc"):
+            pick = [config.TWSE_RWD_BASE]                                                                   # 頁面程式 new ApiPath("/rwd", lan)：證交所的路徑是 /rwd/zh/…；網址後面再加 ?response=json
         if not pick:
             log("probe:dashboard_api", "no_new_data", detail=_clip(f"{ep}：找不到 API 基底網址，沒抓"))
             continue
         for base in pick[:2]:
             base = ("https:" + base) if base.startswith("//") else base
-            url = base.rstrip("/") + ep
+            url = base.rstrip("/") + ep + ("?response=json" if base == config.TWSE_RWD_BASE and "?" not in ep else "")             # 只有用 /rwd/zh 這個基底時才補（頁面程式就是這樣組的）
             st, ct, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=dict(DASH_HEADERS, **{"Referer": "https://www.twse.com.tw/dashboard/zh/credit/margin.html", "Accept": "application/json, text/plain, */*"}))
             if st != 200:
                 log("probe:dashboard_api", "no_new_data", detail=_clip(f"{url}：HTTP {st}；{err}"))
@@ -4589,6 +4595,60 @@ def yahoo_fill():
     return out
 
 
+def yahoo_twd_fill():
+    """模組 M36：美元兌台幣較新的天數（Yahoo Finance 的 TWD=X，非官方）。FRED 的台幣收盤（DEXTAUS）常落後約一週，這個補上之後的日子，
+    存進 twd_rates 的另一層（layer 4、kind spot_aggregator、is_close_history = false，來源明寫「非官方」），不動 FRED 那些列；FRED 之後補上同一天，網頁以 FRED 為準。
+    安全做法：1) 只補比 FRED 最新一天更新、而且早於今天的日子；2) 先拿重疊的日子和 FRED 比：至少 3 天、平均差不超過 0.5%、最大差不超過 1%，
+    而且「日期不位移」比「位移一天」更吻合（匯率每天變動不大，差一天不容易被發現，所以要明確檢查）；3) 數值要在合理範圍；4) 抓不到只記「沒有資料」，不讓工作變紅。"""
+    if not sb_ready():
+        log("yahoo_twd", "skipped", detail="未設定 Supabase，無法比對 FRED 的台幣收盤，不補")
+        return []
+    have, err = sb_request("GET", "twd_rates?is_close_history=eq.true&order=as_of.desc&limit=15&select=as_of,value")
+    fred = {str(r["as_of"]): float(r["value"]) for r in (have or []) if parse_number(r.get("value")) is not None}
+    if len(fred) < 3:
+        log("yahoo_twd", "no_new_data", detail=_clip(f"資料庫裡的 FRED 台幣收盤不到 3 筆，沒辦法核對，不補（{err or '資料不足'}）"))
+        return []
+    status, ctype, body, e2 = fetch_raw("https://query1.finance.yahoo.com/v8/finance/chart/TWD%3DX?range=1mo&interval=1d", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
+    if status != 200:
+        log("yahoo_twd", "no_new_data", detail=_clip(f"Yahoo TWD=X：HTTP {status} {e2}".strip()))
+        return []
+    try:
+        pts = parse_yahoo_chart(json.loads(body.decode("utf-8-sig")))
+    except (ValueError, UnicodeDecodeError):
+        pts = None
+    if not pts:
+        log("yahoo_twd", "no_new_data", detail="Yahoo TWD=X：不是預期的格式")
+        return []
+    low, high = config.TWD_RANGE
+    pts = [(d_, v) for d_, v in pts if low <= v <= high]
+
+    def errs(shift):
+        out = []
+        for d_, v in pts:
+            k = (date.fromisoformat(d_) + timedelta(days=shift)).isoformat()
+            if k in fred:
+                out.append(abs(v / fred[k] - 1))
+        return out
+    e0 = errs(0)
+    if len(e0) < 3:
+        log("yahoo_twd", "no_new_data", detail=_clip(f"和 FRED 重疊的日子只有 {len(e0)} 天（要至少 3 天），沒辦法核對，不用"))
+        return []
+    m0, x0 = sum(e0) / len(e0), max(e0)
+    if m0 > 0.005 or x0 > 0.01:
+        log("yahoo_twd", "no_new_data", detail=_clip(f"和 FRED 重疊的 {len(e0)} 天平均差 {m0 * 100:.2f}%、最大差 {x0 * 100:.2f}%，超過 0.5%／1%，口徑不同，不用"))
+        return []
+    for shift in (-1, 1):
+        es = errs(shift)
+        if len(es) >= 3 and sum(es) / len(es) < m0:
+            log("yahoo_twd", "no_new_data", detail=_clip(f"日期位移 {shift:+d} 天比不位移更吻合 FRED（平均差 {sum(es) / len(es) * 100:.2f}% 對 {m0 * 100:.2f}%），日期可能差一天，不用"))
+            return []
+    newest, today = max(fred), date.today().isoformat()
+    got = [{"as_of": d_, "value": round(v, 4), "kind": "spot_aggregator", "source": "Yahoo Finance（非官方，補 FRED 落後的天數）", "layer": 4, "is_close_history": False} for d_, v in pts if newest < d_ < today]
+    log("yahoo_twd", "success" if got else "no_new_data", as_of=got[-1]["as_of"] if got else None,
+        detail=_clip((f"補 {len(got)} 天（{got[0]['as_of']} 到 {got[-1]['as_of']}）" if got else f"FRED 已經是最新（{newest}），不需要補") + f"；和 FRED 重疊 {len(e0)} 天，平均差 {m0 * 100:.2f}%、最大差 {x0 * 100:.2f}%"))
+    return got
+
+
 def yahoo_dxy():
     """模組 M31：美元指數 DXY（ICE 的那個，不是聯準會的廣義美元指數），用 Yahoo Finance（非官方）的 DX-Y.NYB，近 2 年日資料存進 macro_series（series_id = DXY）。
     驗證：筆數夠（至少 100）、數值在 70 到 130、日期由舊到新且不含今天（還沒收盤）；再拿「和 FRED 廣義美元指數的日變動」算相關係數核對（兩個指數不同但高度相關，
@@ -5274,6 +5334,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
+            extra.append(("twd_rates", _run_module("M36", "Yahoo 補美元兌台幣落後的天數（非官方）", yahoo_twd_fill) or [], "layer,source,as_of"))
             extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, with_us_watch(hold or [], us_watch)) or [], "symbol"))
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:

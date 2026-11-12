@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -5146,7 +5146,7 @@ def test_probe_dashboard_collects_api_constants_and_fetches_endpoints_logging_re
     # 沒有基底網址：不猜，記「沒抓」
     pages2 = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, '<title>x</title><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, '$.get(API_ROOT + "/marginTrading/X1");')}
     asked2, logs2, _p = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages2))
-    d2 = [v["detail"] for v in logs2.values() if v["source"] == "probe:dashboard_api"]; assert len(d2) == 1 and "找不到 API 基底網址，沒抓" in d2[0] and not [u for u in asked2 if "marginTrading" in u], "沒有基底網址：不亂猜網址: " + str(d2)
+    d2 = [v["detail"] for v in logs2.values() if v["source"] == "probe:dashboard_api"]; assert len(d2) == 1 and "https://www.twse.com.tw/rwd/zh/marginTrading/X1?response=json" in d2[0] and "HTTP 404" in d2[0] and not [u for u in asked2 if "tpex" in u.lower() and "dashboardOtc" in u], "沒有基底網址：證交所的端點改用頁面程式裡看到的 /rwd/zh（有依據），櫃買的不亂猜: " + str(d2)
     # 端點數量上限
     eps = " ".join(f'$.get("/marginTrading/E{i}");' for i in range(25))
     pages3 = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, '<title>x</title><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, 'var TWSE_API = "https://www.twse.com.tw/api"; ' + eps)}
@@ -5280,6 +5280,69 @@ def test_probe_nasdaq_access_logs_ip_header_variants_and_backup_sources_without_
     with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch, "_fetch_raw_once", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch.time, "sleep"):
         REAL["probe_nasdaq_access"]()
     assert all(x["status"] in ("no_new_data",) for x in fetch.LOG if x["source"].startswith("probe:nasdaq_access")) and len([x for x in fetch.LOG if x["source"].startswith("probe:nasdaq_access")]) == 7
+
+
+def _twd_env(fred_rows, yahoo_pts, status=200, ready=True):
+    def sbr(method, path, body=None, prefer=None):
+        return (fred_rows, "") if "twd_rates" in path else ([], "")
+    def raw(url, timeout=None, headers=None):
+        if status != 200: return status, "", b"", f"HTTP {status}"
+        return 200, "application/json", json.dumps({"chart": {"result": [{"meta": {"gmtoffset": 0}, "timestamp": [int(datetime.fromisoformat(d_ + "T12:00:00+00:00").timestamp()) for d_, _v in yahoo_pts], "indicators": {"quote": [{"close": [v for _d, v in yahoo_pts]}]}}]}}).encode(), ""
+    return [mock.patch.object(fetch, "sb_ready", return_value=ready), mock.patch.object(fetch, "sb_request", side_effect=sbr), mock.patch.object(fetch, "fetch_raw", side_effect=raw)]
+
+
+def test_yahoo_twd_fill_adds_only_newer_days_in_a_separate_unofficial_layer_after_value_and_date_checks():
+    dd = lambda n: (date.today() - timedelta(days=n)).isoformat()
+    vals = [31.0, 31.4, 30.9, 31.5, 31.1, 31.6]                           # 每天變動約 1%：日期差一天一定看得出來
+    fred = [{"as_of": dd(12 - i), "value": v} for i, v in enumerate(vals)][::-1]                       # 由新到舊（資料庫的 order=as_of.desc）
+    same = [(dd(12 - i), v * 1.001) for i, v in enumerate(vals)] + [(dd(5), 31.7), (dd(3), 31.2), (dd(1), 31.3), (date.today().isoformat(), 31.4), (dd(2), 3.1)]
+    reset()
+    rows = _with(_twd_env(fred, same), lambda: REAL["yahoo_twd_fill"]())
+    assert [r["as_of"] for r in rows] == [dd(5), dd(3), dd(1)], "只補比 FRED 最新一天（%s）更新、早於今天的日子；超出合理範圍的 3.1 不收: %s" % (dd(7), [r["as_of"] for r in rows])
+    assert all(r["layer"] == 4 and r["kind"] == "spot_aggregator" and r["is_close_history"] is False and r["source"].startswith("Yahoo Finance（非官方") for r in rows), "另一層、不算收盤歷史、標非官方"
+    lg = [x for x in fetch.LOG if x["source"] == "yahoo_twd"][0]; assert lg["status"] == "success" and "補 3 天" in lg["detail"] and "平均差 0.10%" in lg["detail"], lg["detail"]
+    # 數值口徑差太多
+    reset(); rows = _with(_twd_env(fred, [(d_, v * 1.03) for d_, v in same]), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and "口徑不同" in fetch.LOG[-1]["detail"]
+    # 日期差一天：數值平均差看起來可能不大，但位移一天比不位移更吻合 → 不用
+    shifted = [((date.fromisoformat(d_) + timedelta(days=1)).isoformat(), v) for d_, v in [(dd(12 - i), v) for i, v in enumerate(vals)]] + [(dd(3), 31.2)]
+    reset(); rows = _with(_twd_env(fred, shifted), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and ("日期位移" in fetch.LOG[-1]["detail"] or "口徑不同" in fetch.LOG[-1]["detail"]), fetch.LOG[-1]["detail"]
+    # 重疊太少、FRED 資料太少、Yahoo 擋住、格式不對、沒設 Supabase：都只記錄、不補、不變紅
+    reset(); rows = _with(_twd_env(fred, [(dd(1), 31.3), (dd(2), 31.2)]), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and "只有 0 天" in fetch.LOG[-1]["detail"]
+    reset(); rows = _with(_twd_env(fred[:2], same), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and "不到 3 筆" in fetch.LOG[-1]["detail"]
+    reset(); rows = _with(_twd_env(fred, same, status=429), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and "HTTP 429" in fetch.LOG[-1]["detail"]
+    reset(); rows = _with(_twd_env(fred, same, ready=False), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and fetch.LOG[-1]["status"] == "skipped"
+    assert not [x for x in fetch.LOG if x["status"] == "failure"]
+    # FRED 已經是最新：不需要補
+    reset(); rows = _with(_twd_env(fred, [(d_, v) for d_, v in same if d_ <= dd(7)]), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and "FRED 已經是最新" in fetch.LOG[-1]["detail"]
+
+
+def test_run_job_tw_close_persists_yahoo_twd_rows_in_their_own_layer_and_isolates_a_crash():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    rows_ = [{"as_of": "2026-11-10", "value": 31.2, "kind": "spot_aggregator", "source": "Yahoo Finance（非官方，補 FRED 落後的天數）", "layer": 4, "is_close_history": False}]
+    def go(**kw):
+        got = []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "yahoo_twd_fill", **kw), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
+        for p_ in ps: p_.start()
+        try:
+            fetch.run_job("tw_close", dry_run=False)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(return_value=rows_); assert ("twd_rates", rows_, "layer,source,as_of") in tables and st["module:M36"] == "success", "寫進 twd_rates，主鍵是 layer,source,as_of"
+    reset(); tables, st = go(side_effect=RuntimeError("boom")); assert st["module:M36"] == "failure" and ("twd_rates", rows_, "layer,source,as_of") not in tables and "module:M27" in st, "壞掉不影響其他模組"
+
+
+def test_probe_dashboard_falls_back_to_the_twse_rwd_base_for_margin_endpoints():
+    home = "https://www.twse.com.tw/zh/"
+    page = '<title>x</title><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300
+    pages = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, page),
+             "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, 'a=apiAny.name("/marginTrading/BFIJ3U")+"?response=json";$.get(TPEX_API+"/dashboardOtc/margin?lang=zh-tw");')}
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages))
+    assert any(u.startswith("https://www.twse.com.tw/rwd/zh/marginTrading/BFIJ3U?response=json") for u in asked), "證交所的端點用 /rwd/zh 當基底並加 ?response=json: " + str([u for u in asked if "rwd" in u or "marginTrading" in u])
+    api = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_api"]
+    assert any("/dashboardOtc/margin" in d and "找不到 API 基底網址" in d for d in api), "櫃買的還是不知道基底：照實記錄、不猜: " + str(api)
 
 
 def test_probe_dashboard_failures_are_logged_not_raised_and_never_write_tables():
