@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v75"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v76"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -957,16 +957,24 @@ def probe_dashboard():
         log("probe:dashboard_pages", "no_new_data", detail="首頁沒有找到通往儀表板的連結（可能是動態產生的，需要人工把儀表板網址貼過來再探測）")
         return
     api_re = re.compile(r"[\"'`]((?:https?:)?//[^\"'`\s]{6,140}|/[A-Za-z0-9_./?=&%-]{4,120})[\"'`]")
-    for url, txt in links[: config.DASHBOARD_MAX_PAGES]:
+
+    def inspect_page(url, label):
+        """看一頁：標題、程式檔、像資料網址的字串；很短的頁面（轉址頁）連原文一起記。回傳頁面裡指向同站 /dashboard 的子頁網址。"""
         status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=DASH_HEADERS)
         if status is None or status != 200:
-            log("probe:dashboard_page", "no_new_data", detail=_clip(f"{url}：HTTP {status}；{err}"))
-            continue
+            log(f"probe:dashboard_{label}", "no_new_data", detail=_clip(f"{url}：HTTP {status}；{err}"))
+            return []
         html = body.decode("utf-8", errors="replace")
         title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
         scripts = [urllib.parse.urljoin(url, s) for s in re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.I)]
+        frames = [urllib.parse.urljoin(url, s) for s in re.findall(r"<(?:iframe|frame)[^>]+src=[\"']([^\"']+)[\"']", html, re.I)]
+        refresh = re.findall(r"<meta[^>]+http-equiv=[\"']?refresh[\"']?[^>]+content=[\"'][^\"']*url=([^\"';>]+)", html, re.I)
+        jump = re.findall(r"(?:location\.(?:href|replace)|window\.open)\s*[=(]\s*[\"']([^\"']+)[\"']", html)
         found = sorted({u for u in api_re.findall(html) if re.search(r"\.(json|csv)\b|/rwd/|/api/|/v1/|dashboard|margin|credit", u, re.I)})
-        log("probe:dashboard_page", "success", detail=_clip(f"{url}｜標題 {(title.group(1).strip() if title else '（無）')[:60]}｜{status} {ctype}｜{len(body)} 位元組｜程式檔 {len(scripts)} 個：" + " ; ".join(scripts[:6]) + "｜頁面裡像資料網址的字串：" + (" ; ".join(found[:10]) if found else "無")))
+        extra = ""
+        if len(body) < 1200:
+            extra = "｜頁面原文：" + re.sub(r"\s+", " ", html)[:400]
+        log(f"probe:dashboard_{label}", "success", detail=_clip(f"{url}｜標題 {(title.group(1).strip() if title else '（無）')[:60]}｜{status} {ctype}｜{len(body)} 位元組｜程式檔 {len(scripts)} 個：" + " ; ".join(scripts[:6]) + "｜框架 " + (" ; ".join(frames[:3]) or "無") + "｜轉址 " + (" ; ".join(refresh[:2] + jump[:2]) or "無") + "｜像資料網址的字串：" + (" ; ".join(found[:10]) if found else "無") + extra))
         for js in [s for s in scripts if urllib.parse.urlparse(s).netloc.endswith(("twse.com.tw", "tpex.org.tw"))][: config.DASHBOARD_MAX_SCRIPTS]:
             st, ct, jb, er = fetch_raw(js, timeout=config.PROBE_TIMEOUT, headers=DASH_HEADERS)
             if st is None or st != 200:
@@ -976,6 +984,21 @@ def probe_dashboard():
             hits = sorted({u for u in api_re.findall(text) if re.search(r"\.(json|csv)\b|/rwd/|/api/|/v1/|dashboard|margin|credit|maint", u, re.I)})
             kw = [k for k in config.DASHBOARD_KEYWORDS if k in text]
             log("probe:dashboard_script", "success", detail=_clip(f"{js}｜{len(jb)} 位元組｜含關鍵字 {'、'.join(kw) if kw else '無'}｜像資料網址的字串：" + (" ; ".join(hits[:14]) if hits else "無")))
+        subs = []
+        for u in found + [urllib.parse.urlparse(x).path for x in frames + refresh + jump]:
+            absu = urllib.parse.urljoin(url, u)
+            p = urllib.parse.urlparse(absu)
+            if p.netloc.endswith("twse.com.tw") and p.path.startswith("/dashboard") and re.search(r"\.(html?|aspx?)$|/$", p.path) and absu != url and absu not in subs:
+                subs.append(absu)
+        return subs
+
+    visited = set()
+    for url, txt in links[: config.DASHBOARD_MAX_PAGES]:
+        visited.add(url)
+        for sub in inspect_page(url, "page")[: config.DASHBOARD_MAX_SUBPAGES]:                                      # 再往下一層：頁面裡指向 /dashboard 的子頁（例如信用交易頁）
+            if sub not in visited:
+                visited.add(sub)
+                inspect_page(sub, "subpage")
 
 
 def probe_extra():

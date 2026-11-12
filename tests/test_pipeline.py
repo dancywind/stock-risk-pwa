@@ -4894,10 +4894,28 @@ def test_probe_dashboard_finds_keyword_endpoints_links_and_data_urls():
     assert "共 3 個端點" in by["probe:dashboard_swagger_twse"]["detail"] and "/credit/maintenance | 全市場擔保維持率" in by["probe:dashboard_swagger_twse"]["detail"] and "/x/y" not in by["probe:dashboard_swagger_twse"]["detail"] and "MI_MARGN" not in by["probe:dashboard_swagger_twse"]["detail"], "只列含關鍵字的端點: " + by["probe:dashboard_swagger_twse"]["detail"]
     assert "/openapi/v1/credit | 信用交易統計" in by["probe:dashboard_swagger_tpex"]["detail"]
     d = by["probe:dashboard_home"]["detail"]; assert by["probe:dashboard_home"]["status"] == "success" and "找到 1 個疑似儀表板連結" in d and "臺股 儀表板 → https://www.twse.com.tw/zh/dashboard/index.html" in d and "javascript" not in d and "about" not in d, "首頁：只收真的儀表板連結（排除 javascript、#、無關連結）: " + d
-    d = by["probe:dashboard_page"]["detail"]; assert "標題 臺股儀表板" in d and "程式檔 2 個" in d and "/rwd/zh/dashboard/credit?response=json" in d and "logo.png" not in d, "頁面：標題、程式檔、像資料網址的字串: " + d
+    d = by["probe:dashboard_page"]["detail"]; assert "標題 臺股儀表板" in d and "程式檔 2 個" in d and "/rwd/zh/dashboard/credit?response=json" in d and "logo.png" not in d.split("頁面原文")[0] and "頁面原文：" in d, "頁面：標題、程式檔、像資料網址的字串（很短的頁面連原文一起記）: " + d
     d = by["probe:dashboard_script"]["detail"]; assert "含關鍵字 維持率" in d and "/api/v1/margin/maintenance?d=1" in d and "MI_CREDIT.json" in d and "main.css" not in d, "程式檔: " + d
     assert "https://cdn.example.com/lib.js" not in asked, "外部網域的程式檔不抓"; assert asked.count("https://www.twse.com.tw/assets/app.js") == 1
     assert all(x["status"] in ("success",) for x in by.values()) and not [x for x in fetch.LOG if x["status"] == "failure"], "全部成功、沒有失敗"
+
+
+def test_probe_dashboard_follows_redirect_pages_to_subpages_one_level_only():
+    home = "https://www.twse.com.tw/zh/"
+    stub = '<html><head><title>臺股儀表板</title></head><body><a href="/dashboard/zh/credit/margin.html">信用交易</a><a href="/dashboard/zh/default/other.html">其他</a><a href="/elsewhere/x.html">別的</a><a href="https://evil.example.com/dashboard/zh/y.html">外站</a></body></html>'
+    pages = {home: (200, '<a href="/dashboard/zh/index.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/index.html": (200, stub),
+             "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, '<html><title>融資</title><script src="/dashboard/js/margin.js"></script><iframe src="/dashboard/zh/credit/frame.html"></iframe><meta http-equiv="refresh" content="0; url=/dashboard/zh/credit/next.html"><script>location.href = "/dashboard/zh/loop/index.html";</script>' + "x" * 1300 + "</html>"),
+             "https://www.twse.com.tw/dashboard/zh/default/other.html": (200, "<title>other</title>"),
+             "https://www.twse.com.tw/dashboard/js/margin.js": (200, 'fetch("/dashboard/api/credit/margin.json"); var m = "維持率";')}
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages))
+    page = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_page"]; subs = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_subpage"]; scripts = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_script"]
+    assert len(page) == 1 and "頁面原文：" in page[0] and "信用交易" in page[0], "短頁面（轉址頁）：連原文一起記: " + page[0]
+    assert len(subs) == 2 and "融資" in subs[0] and "標題 other" in subs[1], "往下一層：只追同站 /dashboard 的子頁（排除別的路徑、外站）: " + str(subs)
+    assert "框架 https://www.twse.com.tw/dashboard/zh/credit/frame.html" in subs[0] and "轉址 /dashboard/zh/credit/next.html" in subs[0] and "/dashboard/zh/loop/index.html" in subs[0] and "頁面原文" not in subs[0], "框架、meta 轉址、location 轉址都記下來；長頁面不記原文: " + subs[0]
+    assert "https://www.twse.com.tw/dashboard/js/margin.js" in asked and "/dashboard/api/credit/margin.json" in scripts[0] and "含關鍵字 維持率" in scripts[0], "子頁的程式檔也看: " + scripts[0]
+    asked_set = [u for u in asked if "/dashboard/zh/" in u]
+    assert "https://www.twse.com.tw/dashboard/zh/credit/frame.html" not in asked and "https://www.twse.com.tw/dashboard/zh/loop/index.html" not in asked and "https://www.twse.com.tw/elsewhere/x.html" not in asked and not [u for u in asked if "evil.example.com" in u], "只再往下一層，不追子頁的子頁；不碰外站: " + str(asked_set)
+    assert asked.count("https://www.twse.com.tw/dashboard/zh/index.html") == 1, "同一頁不重複抓"
 
 
 def test_probe_dashboard_failures_are_logged_not_raised_and_never_write_tables():
