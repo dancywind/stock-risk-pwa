@@ -4159,6 +4159,25 @@ def test_yahoo_fill_adds_only_newer_days_after_cross_checking_against_fred():
     assert rows == [] and "FRED 已經是最新" in fetch.LOG[-1]["detail"]
 
 
+def test_yahoo_fill_also_fills_vix_vxn_and_nasdaq_composite_when_fred_lags_and_rejects_mismatched_ones():
+    today = fetch._now_et().date()
+    dd = lambda n: (today - timedelta(days=n)).isoformat()
+    assert [x[:2] for x in config.YAHOO_FILL if x[1] in ("VIXCLS", "VXNCLS", "NASDAQCOM")] == [("^VIX", "VIXCLS"), ("^VXN", "VXNCLS"), ("^IXIC", "NASDAQCOM")], "設定裡有這三個"
+    fred = {"SP500": [], "DCOILWTICO": [], "DCOILBRENTEU": [],
+            "VIXCLS": [{"as_of": dd(n), "value": 18.0 + n * 0.1} for n in (5, 4, 3, 2)], "VXNCLS": [{"as_of": dd(n), "value": 22.0 + n * 0.1} for n in (5, 4, 3, 2)],
+            "NASDAQCOM": [{"as_of": dd(n), "value": 24000.0 + n} for n in (5, 4, 3, 2)]}
+    vix = [(dd(n), 18.0 + n * 0.1) for n in (5, 4, 3, 2)] + [(dd(1), 19.5), (today.isoformat(), 20.0)]                      # FRED 只到 dd(2)；Yahoo 多一天（今天的不收）
+    vxn = [(dd(n), 22.0 + n * 0.1) for n in (5, 4, 3, 2)] + [(dd(1), 23.5)]
+    ixic = [(dd(n), 24300.0 + n) for n in (5, 4, 3, 2)] + [(dd(1), 24400.0)]                                              # 和 FRED 差 1.2%，超過 0.5%：口徑不同，整批不用
+    reset()
+    rows = _with(_yh_env(fred, {"^GSPC": _yh_json([]), "CL=F": _yh_json([]), "BZ=F": _yh_json([]), "^VIX": _yh_json(vix), "^VXN": _yh_json(vxn), "^IXIC": _yh_json(ixic)}), lambda: REAL["yahoo_fill"]())
+    by = {}
+    for r in rows: by.setdefault(r["series_id"], []).append(r)
+    assert [r["as_of"] for r in by["VIXCLS"]] == [dd(1)] and by["VIXCLS"][0]["value"] == 19.5 and by["VIXCLS"][0]["source"].startswith("Yahoo Finance（非官方"), "VIX 補上 FRED 還沒有的那一天、今天的不收: " + str(by.get("VIXCLS"))
+    assert [r["as_of"] for r in by["VXNCLS"]] == [dd(1)], "VXN 也補"
+    assert "NASDAQCOM" not in by and "口徑不同，不用" in [x for x in fetch.LOG if x["source"] == "yahoo_fill"][0]["detail"], "Nasdaq 綜合和 FRED 差太多：整批不用"
+
+
 def test_yahoo_fill_never_turns_the_job_red_when_blocked_or_unconfigured():
     reset()
     rows = _with(_yh_env({"SP500": [{"as_of": "2026-11-01", "value": 7000.0}]}, {}, status=429), lambda: REAL["yahoo_fill"]())

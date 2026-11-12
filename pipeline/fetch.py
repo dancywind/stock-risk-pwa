@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v79"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v80"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4426,7 +4426,7 @@ def parse_yahoo_chart(j):
 
 
 def yahoo_fill():
-    """模組 M27：用 Yahoo Finance（非官方）補 FRED 落後的天數：標普 500（^GSPC）、WTI 與 Brent 原油期貨。FRED 的這幾個常落後 3 到 5 天。
+    """模組 M27：用 Yahoo Finance（非官方）補 FRED 落後的天數：標普 500（^GSPC）、WTI 與 Brent 原油期貨（FRED 常落後 3 到 5 天），以及 VIX、VXN、Nasdaq 綜合（FRED 常落後約一個營業日以上）。
     安全做法：1) 只補「比 FRED 最新一天更新」的日子，不動已有的；2) 先拿重疊的日子和 FRED 的數字比，差太多就整批不用（價格口徑不同）；
     3) 價格要在合理範圍；4) 今天還沒收盤的不收；5) 抓不到只記「沒有資料」，不讓工作變紅。來源欄位明寫「非官方」，之後 FRED 補上同一天會蓋回官方值。"""
     if not sb_ready():
