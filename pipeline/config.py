@@ -97,6 +97,8 @@ INST_SIDE_LIMIT = 5e12
 MARGIN_BALANCE_RANGE = (1e10, 5e13)
 
 # 美股廣度探測（只讀）：Nasdaq 官方網站使用的公開介面，沒有保證穩定；每次只打少數幾個請求。
+NASDAQ_RETRY_WAITS = (20, 60)       # Nasdaq 回 403／429 時，每次重試前等幾秒（共試 1 + 2 次）
+NASDAQ_COOLDOWN = 600              # 重試後仍被擋：這麼多秒內不再打 Nasdaq
 NASDAQ_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
              "Chrome/124.0.0.0 Safari/537.36")
 NASDAQ_PROBE_URLS = {
@@ -169,7 +171,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v81"
+PIPELINE_VERSION = "v82"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

@@ -4059,6 +4059,39 @@ def test_run_job_tw_backfill_persists_us_index_long_history_and_isolates_a_crash
     assert st["module:M35"] == "failure" and ("macro_series", long_rows, "series_id,as_of") not in tables and "market_stats" in [n for n, _r, _c in tables], "這個模組壞掉不影響其他回補"
 
 
+def test_fetch_raw_guards_only_nasdaq_with_waited_retries_and_a_cooldown_after_a_confirmed_block():
+    N = "https://api.nasdaq.com/api/quote/SPY/info?assetclass=etf"
+    ok_, blk = (200, "application/json", b"{}", ""), (403, "text/html", b"denied", "HTTP 403")
+    def run(seq, url=N, times=None):
+        calls, sleeps = [], []
+        def once(u, timeout=None, headers=None):
+            calls.append(u); return seq[min(len(calls) - 1, len(seq) - 1)]
+        clock = iter(times) if times else None
+        with mock.patch.object(fetch, "_fetch_raw_once", side_effect=once), mock.patch.object(fetch.time, "sleep", side_effect=sleeps.append), \
+                (mock.patch.object(fetch.time, "monotonic", side_effect=lambda: next(clock)) if clock else mock.patch.object(fetch.time, "monotonic", return_value=1000.0)):
+            res = fetch.fetch_raw(url)
+        return res, len(calls), sleeps
+    def fresh(): fetch._NASDAQ_GUARD.update({"blocked_until": 0.0, "last": None}); fetch.LOG.clear()
+    fresh(); res, n, sl = run([blk], url="https://www.twse.com.tw/x"); assert res == blk and n == 1 and sl == [], "不是 Nasdaq：不重試、不等"
+    fresh(); res, n, sl = run([ok_]); assert res == ok_ and n == 1 and sl == [], "成功：一次就好"
+    fresh(); res, n, sl = run([(404, "", b"", "HTTP 404")]); assert res[0] == 404 and n == 1 and sl == [], "404 不重試"
+    fresh(); res, n, sl = run([blk, ok_]); assert res == ok_ and n == 2 and len(sl) == 1 and 20 <= sl[0] < 24 and fetch._NASDAQ_GUARD["blocked_until"] == 0.0 and not fetch.LOG, "403 之後等 20 秒再試就成功：不進冷卻、不記失敗"
+    fresh(); res, n, sl = run([blk, blk, ok_]); assert res == ok_ and n == 3 and len(sl) == 2 and 20 <= sl[0] < 24 and 60 <= sl[1] < 64, "第二次還是 403：再等 60 秒"
+    fresh(); res, n, sl = run([(None, "", b"", "逾時"), ok_]); assert res == ok_ and n == 2, "逾時也會再試一次"
+    # 一直被擋：試 3 次、進冷卻、記一筆說明；冷卻期間直接回傳不再打；冷卻過了再試
+    fresh(); res, n, sl = run([blk], times=[1000.0, 1000.0, 1000.0]); assert res[0] == 403 and n == 3 and len(sl) == 2, "試 3 次"
+    g = [x for x in fetch.LOG if x["source"] == "nasdaq_guard"]; assert len(g) == 1 and g[0]["status"] == "no_new_data" and "試了 3 次仍被擋" in g[0]["detail"] and "10 分鐘內不再打 Nasdaq" in g[0]["detail"], g
+    assert fetch._NASDAQ_GUARD["blocked_until"] == 1000.0 + config.NASDAQ_COOLDOWN
+    res, n, sl = run([ok_], times=[1100.0]); assert res[0] == 403 and n == 0 and sl == [] and "本次執行已確認 Nasdaq 暫時擋住，不再重試" in res[3], "冷卻中：不打、不等"
+    res, n, sl = run([ok_], times=[1000.0 + config.NASDAQ_COOLDOWN + 1, 0, 0]); assert res == ok_ and n == 1 and fetch._NASDAQ_GUARD["blocked_until"] == 0.0, "冷卻過了：再試，成功就解除"
+    # 逾時（不是明確被擋）：不進冷卻
+    fresh(); res, n, sl = run([(None, "", b"", "逾時")], times=[1000.0] * 3); assert res[0] is None and n == 3 and fetch._NASDAQ_GUARD["blocked_until"] == 0.0 and not fetch.LOG, "只是逾時：試 3 次但不進冷卻"
+    # 冷卻只影響 Nasdaq
+    fresh(); fetch._NASDAQ_GUARD.update({"blocked_until": 5000.0, "last": blk})
+    res, n, sl = run([ok_], url="https://www.twse.com.tw/x", times=[1.0]); assert res == ok_ and n == 1, "冷卻中，其他網站照常"
+    fresh()
+
+
 def test_us_sector_lookup_uses_the_underlying_stock_for_leveraged_etfs_and_says_so():
     reset()
     hold = [{"market": "US", "symbol": "MUU", "name": "2倍做多MU ETF", "kind": "leveraged_etf"}, {"market": "US", "symbol": "INTW", "name": "2倍做多INTC ETF", "kind": "leveraged_etf"}, {"market": "US", "symbol": "MU", "name": "美光", "kind": "stock"},
@@ -5210,6 +5243,13 @@ def test_probe_dashboard_logs_api_definition_lines_even_when_the_right_side_is_a
     pages = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, page), "https://www.twse.com.tw/dashboard/js/main.js": (200, main), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, '$.get(TWSE_API + "/marginTrading/X1");')}
     asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages))
     d = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_defs"]
+    sn = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_snips"]
+    assert len(sn) == 1 and 'TPEX_API = isProd ? "https://www.tpex.org.tw/dashboard" : "https://test.example/x"' in sn[0] and 'TWSE_API=location.origin+"/dashboardApi"' in sn[0], "指定名稱後面的原文也記下: " + str(sn)
+    long_main = 'var a=1,webHost=oWL.hostname,isDev=/^(?:local|^192\\.168\\.)/.test(webHost),isZ="zh"===lan,api=new ApiPath("/rwd",lan),TPEX_API=isDev?"/tpex-api":"https://www.tpex.org.tw/openapi/v1",TWSE_API="/x";'
+    pages2 = dict(pages); pages2["https://www.twse.com.tw/dashboard/js/main.js"] = (200, long_main)
+    asked2, logs2, _p2 = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages2))
+    sn2 = [v["detail"] for v in logs2.values() if v["source"] == "probe:dashboard_snips"][0]
+    assert 'TPEX_API=isDev?"/tpex-api":"https://www.tpex.org.tw/openapi/v1"' in sn2 and 'api=new ApiPath("/rwd",lan)' in sn2 or 'new ApiPath("/rwd",lan)' in sn2, "壓縮成一長串也要抓到完整的 TPEX_API 值: " + sn2
     assert len(d) == 1 and 'TPEX_API = isProd ? "https://www.tpex.org.tw/dashboard" : "https://test.example/x"' in d[0] and 'TWSE_API = location.origin+"/dashboardApi"' in d[0] and "a.png" not in d[0] and "appName" not in d[0], "右邊是運算式也記下原文: " + str(d)
 
 
@@ -5225,7 +5265,7 @@ def test_probe_nasdaq_access_logs_ip_header_variants_and_backup_sources_without_
         if "yahoo" in url: return 200, "application/json", json.dumps({"chart": {"result": [{"timestamp": [1762300800, 1762387200], "indicators": {"quote": [{"close": [680.1, 683.2]}]}}]}}).encode(), ""
         if "stooq" in url: return 200, "text/csv", b"Date,Open,High,Low,Close,Volume\n2026-11-10,1,2,0.5,1.5,100\n2026-11-11,1,2,0.5,1.6,110\n", ""
         return None, "", b"", "unexpected"
-    with mock.patch.object(fetch, "fetch_raw", side_effect=fake), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "persist") as per, mock.patch.object(fetch, "persist_extra") as pe:
+    with mock.patch.object(fetch, "fetch_raw", side_effect=fake), mock.patch.object(fetch, "_fetch_raw_once", side_effect=fake), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "persist") as per, mock.patch.object(fetch, "persist_extra") as pe:
         REAL["probe_nasdaq_access"]()
     by = {}
     for x in fetch.LOG: by.setdefault(x["source"], []).append(x)
@@ -5237,7 +5277,7 @@ def test_probe_nasdaq_access_logs_ip_header_variants_and_backup_sources_without_
     assert per.call_count == 0 and pe.call_count == 0 and len([c for c in calls if "api.nasdaq.com" in c[0]]) == 4, "只讀；Nasdaq 只打 4 次（每組標頭一次）"
     # 全部連不上：只記錄，不丟例外
     reset()
-    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch.time, "sleep"):
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch, "_fetch_raw_once", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch.time, "sleep"):
         REAL["probe_nasdaq_access"]()
     assert all(x["status"] in ("no_new_data",) for x in fetch.LOG if x["source"].startswith("probe:nasdaq_access")) and len([x for x in fetch.LOG if x["source"].startswith("probe:nasdaq_access")]) == 7
 

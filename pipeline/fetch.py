@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v81"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v82"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -163,8 +163,8 @@ def fetch_swagger(url):
     return data, err
 
 
-def fetch_raw(url, timeout=None, headers=None):
-    """診斷用：不解析 JSON，只回傳 (HTTP 狀態, Content-Type, 原始位元組, 錯誤)。"""
+def _fetch_raw_once(url, timeout=None, headers=None):
+    """單次請求：不解析 JSON，只回傳 (HTTP 狀態, Content-Type, 原始位元組, 錯誤)。"""
     headers = _with_gzip(headers or {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -175,6 +175,37 @@ def fetch_raw(url, timeout=None, headers=None):
         return e.code, ctype, e.read()[:2000], f"HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
         return None, "", b"", _scrub(e)
+
+
+_NASDAQ_GUARD = {"blocked_until": 0.0, "last": None}               # Nasdaq 被擋時的「冷卻」狀態（整個執行共用）
+_NASDAQ_BLOCK = (403, 429)
+
+
+def fetch_raw(url, timeout=None, headers=None):
+    """診斷用：不解析 JSON，只回傳 (HTTP 狀態, Content-Type, 原始位元組, 錯誤)。
+    只有 api.nasdaq.com 有額外保護（GitHub 排程的機器偶爾會被 Nasdaq 暫時擋掉，回 HTTP 403）：
+    403／429 或連線逾時就照 NASDAQ_RETRY_WAITS 等一下再試；最後還是 403／429，就記下「被擋」，之後 NASDAQ_COOLDOWN 秒內不再打 Nasdaq
+    （直接回傳同樣的結果），避免一次產生幾十筆失敗、也避免白等。其他網站、其他狀態碼（成功、404…）完全不受影響。"""
+    if "api.nasdaq.com" not in url:
+        return _fetch_raw_once(url, timeout, headers)
+    if time.monotonic() < _NASDAQ_GUARD["blocked_until"] and _NASDAQ_GUARD["last"]:
+        st, ct, body, err = _NASDAQ_GUARD["last"]
+        return st, ct, body, f"{err}｜本次執行已確認 Nasdaq 暫時擋住，不再重試"
+    res = _fetch_raw_once(url, timeout, headers)
+    tries = 1
+    for wait in config.NASDAQ_RETRY_WAITS:
+        if res[0] is not None and res[0] not in _NASDAQ_BLOCK:
+            break
+        time.sleep(wait + (time.time() * 1000 % 3))                  # 加一點 0 到 3 秒的零頭，避免和別的請求同時重試
+        res = _fetch_raw_once(url, timeout, headers)
+        tries += 1
+    if res[0] in _NASDAQ_BLOCK:
+        _NASDAQ_GUARD["blocked_until"] = time.monotonic() + config.NASDAQ_COOLDOWN
+        _NASDAQ_GUARD["last"] = res
+        log("nasdaq_guard", "no_new_data", detail=_clip(f"Nasdaq 回 HTTP {res[0]}：試了 {tries} 次仍被擋（GitHub 這台機器的 IP 可能被暫時擋掉）。{config.NASDAQ_COOLDOWN // 60} 分鐘內不再打 Nasdaq；這次美股的價格、產業等會沿用舊資料。晚一點再按「立刻更新資料」或重跑一次。"))
+    elif res[0] is not None:
+        _NASDAQ_GUARD["blocked_until"] = 0.0
+    return res
 
 
 # ---------------------------------------------------------------- Supabase
@@ -1007,7 +1038,13 @@ def probe_dashboard():
     defs = []                                                                                                       # 名稱含 API／BASE／HOST 的常數「定義那一行」原文（右邊可能是運算式，字串比對抓不到）
     def_re = re.compile(r"(?<![\w$.])((?:const|let|var)\s+)?([A-Za-z_$][\w$]*(?:API|Api|BASE|Base|HOST|Host|ORIGIN|Origin)[\w$]*)\s*=\s*([^;\n]{1,140})")
 
+    snips = []                                                                                                      # 指定名稱（TPEX_API、TWSE_API、ApiPath）後面 260 個字原文：壓縮過的程式碼會把好幾個定義黏成一長串，上面那種只取 140 字會被截斷
+    snip_re = re.compile(r"(?:TPEX_API|TWSE_API|class\s+ApiPath|function\s+ApiPath|ApiPath\s*=|new\s+ApiPath)[^\n]{0,260}")
+
     def collect(text):
+        for m in snip_re.finditer(text):
+            if len(snips) < 8 and m.group(0) not in snips:
+                snips.append(m.group(0))
         for m in def_re.finditer(text):
             d = f"{m.group(2)} = {m.group(3).strip()}"
             if d not in defs and len(defs) < 14 and not re.search(r"\.(css|png|svg)", d):
@@ -1030,7 +1067,7 @@ def probe_dashboard():
                 visited.add(sub)
                 inspect_page(sub, "subpage")
     if consts or endpoints:
-        probe_dashboard_data(consts, endpoints, defs)
+        probe_dashboard_data(consts, endpoints, defs, snips)
 
 
 def _shape(j, depth=0):
@@ -1046,10 +1083,11 @@ def _shape(j, depth=0):
     return repr(j)[:40]
 
 
-def probe_dashboard_data(consts, endpoints, defs=None):
+def probe_dashboard_data(consts, endpoints, defs=None, snips=None):
     """只讀探測：儀表板頁面的程式讀的資料端點，真的抓一次，記回傳的結構（有沒有擔保維持率、有幾天的歷史）。"""
     log("probe:dashboard_consts", "success", detail=_clip("API 基底網址常數：" + (" ; ".join(f"{k} = {v}" for k, v in list(consts.items())[:12]) or "沒找到") + f"｜端點 {len(endpoints)} 個：" + " ; ".join(endpoints[:14])))
     log("probe:dashboard_defs", "success", detail=_clip("名稱含 API／BASE／HOST 的定義（原文）：" + (" ## ".join(defs or []) or "沒找到")))
+    log("probe:dashboard_snips", "success", detail=_clip("TPEX_API／TWSE_API／ApiPath 後面的原文：" + (" ## ".join(snips or []) or "沒找到"), 1800))
     bases = [v for v in consts.values() if v.startswith(("http://", "https://", "//"))]
     for ep in endpoints[: config.DASHBOARD_MAX_ENDPOINTS]:
         want = "tpex|otc" if ep.startswith("/dashboardOtc") else "twse|tse"
@@ -1149,7 +1187,7 @@ def probe_nasdaq_access():
               "Connection": "keep-alive", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-site", "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"'}
     variants = (("目前使用的標頭", NASDAQ_HEADERS), ("完整瀏覽器標頭（含 Sec-Fetch、sec-ch-ua）", chrome), ("只有 User-Agent", {"User-Agent": ua}), ("curl 風格", {"User-Agent": "curl/8.5.0", "Accept": "*/*"}))
     for name, hdr in variants:
-        st, ct, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=hdr)
+        st, ct, body, err = _fetch_raw_once(url, timeout=config.PROBE_TIMEOUT, headers=hdr)               # 診斷要看每一組標頭的真實結果：不走重試與冷卻
         head = body[:110].decode("utf-8", errors="replace").replace("\n", " ") if body else ""
         log("probe:nasdaq_access_hdr", "success" if st == 200 else "no_new_data", detail=_clip(f"{name}：HTTP {st}｜{ct}｜{len(body or b'')} 位元組｜開頭 {head!r}｜{err or ''}"))
         time.sleep(1)
