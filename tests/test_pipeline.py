@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -4011,6 +4011,78 @@ def test_us_sector_lookup_skips_fresh_handles_etfs_and_never_turns_red():
     assert REAL["us_sector_lookup"]([]) == [] and fetch.LOG[-1]["status"] == "skipped" and REAL["us_sector_lookup"]([{"market": "TW", "name": "台積電"}]) == []
 
 
+def test_leveraged_underlying_extracts_the_stock_ticker_from_the_etf_name_and_never_guesses():
+    f = fetch.leveraged_underlying
+    assert f("2倍做多MU ETF") == "MU" and f("2倍做多INTC ETF") == "INTC" and f("2倍做空TSLA ETF") == "TSLA" and f("2X Long NVDA ETF") == "NVDA" and f("3x BULL AAPL ETF") == "AAPL" and f("2倍做多BRK.B ETF") == "BRK.B"
+    for bad in ("元大台灣50正2", "槓桿", "2倍做多 ETF", "Direxion Daily Semiconductor Bull 3X", "", None, "2倍做多abc ETF"):
+        assert f(bad) is None, bad
+
+
+def test_us_index_long_history_fetches_ten_years_for_both_indexes_and_never_turns_the_job_red():
+    reset()
+    seen = []
+    def fr(sid, low, high, days=None):
+        seen.append((sid, days))
+        return [{"series_id": sid, "label": "x", "as_of": "2016-11-14", "value": 2100.0, "source": "FRED"}, {"series_id": sid, "label": "x", "as_of": "2026-11-10", "value": 6800.0, "source": "FRED"}] if sid == "SP500" else None
+    with mock.patch.object(fetch, "fred_history_rows", side_effect=fr):
+        rows = REAL["us_index_long_history"]()
+    assert [s for s, _d in seen] == ["SP500", "NASDAQCOM"] and all(d == config.US_LONG_YEARS * 366 for _s, d in seen), "兩個指數都要 10 年: " + str(seen)
+    assert len(rows) == 2 and {r["series_id"] for r in rows} == {"SP500"}
+    st = {x["source"]: x["status"] for x in fetch.LOG}; assert st["us_index_long:SP500"] == "success" and st["us_index_long:NASDAQCOM"] == "no_new_data" and not [x for x in fetch.LOG if x["status"] == "failure"], "抓不到的只記沒有資料"
+    # fred_history_rows 的 days 參數：不給就是約一年，給了就用給的
+    captured = []
+    def fj(url, **k):
+        captured.append(url); return {"observations": []}, ""
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(config, "fred_key", return_value="k"):
+        fetch.fred_history_rows("SP500", 500.0, 30000.0); fetch.fred_history_rows("SP500", 500.0, 30000.0, days=3660)
+    s1 = captured[0].split("observation_start=")[1]; s2 = captured[1].split("observation_start=")[1]
+    assert (date.fromisoformat(s1) - date.fromisoformat(s2)).days == 3660 - config.FRED_HISTORY_DAYS and (TODAY - date.fromisoformat(s1)).days == config.FRED_HISTORY_DAYS, "預設約一年、指定天數照給: " + s1 + " / " + s2
+
+
+def test_run_job_tw_backfill_persists_us_index_long_history_and_isolates_a_crash():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    long_rows = [{"series_id": "SP500", "label": "x", "as_of": "2026-11-10", "value": 6800.0, "source": "FRED"}]
+    def go(**kw):
+        got = []
+        patches = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None), mock.patch.object(fetch, "tw_backfill", return_value={}), mock.patch.object(fetch, "tw_breadth_update"), mock.patch.object(fetch, "tw_crash_check"),
+                  mock.patch.object(fetch, "us_index_long_history", **kw), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
+        for p_ in patches: p_.start()
+        try:
+            fetch.run_job("tw_backfill", dry_run=False)
+        finally:
+            for p_ in patches: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(return_value=long_rows)
+    assert ("macro_series", long_rows, "series_id,as_of") in tables and st["module:M35"] == "success", "寫進 macro_series，主鍵是 series_id,as_of"
+    reset(); tables, st = go(side_effect=RuntimeError("boom"))
+    assert st["module:M35"] == "failure" and ("macro_series", long_rows, "series_id,as_of") not in tables and "market_stats" in [n for n, _r, _c in tables], "這個模組壞掉不影響其他回補"
+
+
+def test_us_sector_lookup_uses_the_underlying_stock_for_leveraged_etfs_and_says_so():
+    reset()
+    hold = [{"market": "US", "symbol": "MUU", "name": "2倍做多MU ETF", "kind": "leveraged_etf"}, {"market": "US", "symbol": "INTW", "name": "2倍做多INTC ETF", "kind": "leveraged_etf"}, {"market": "US", "symbol": "MU", "name": "美光", "kind": "stock"},
+            {"market": "US", "symbol": "ZZZU", "name": "槓桿 ETF（名稱看不出標的）", "kind": "leveraged_etf"}, {"market": "US", "symbol": "SPYX", "name": "某 ETF", "kind": "etf"}]
+    body = lambda sym, sec: json.dumps({"data": {"Symbol": {"value": sym}, "Industry": {"value": "Semis"}, "Sector": {"value": sec}}}).encode()
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        sym = url.split("/company/")[1].split("/")[0]; seen.append(sym)
+        if sym in ("MU", "INTC"): return 200, "application/json", body(sym, "Technology"), ""
+        return 200, "application/json", json.dumps({"data": None}).encode(), ""
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch.time, "sleep"):
+        rows = REAL["us_sector_lookup"](hold)
+    by = {r["symbol"]: r for r in rows}
+    assert sorted(by) == ["INTW", "MU", "MUU"] and by["MUU"]["sector"] == "資訊科技" and by["INTW"]["sector"] == "資訊科技" and by["MU"]["sector"] == "資訊科技", "槓桿 ETF 用標的的產業: " + str(sorted(by))
+    assert "依標的 MU" in by["MUU"]["source"] and "槓桿 ETF 本身沒有產業" in by["MUU"]["source"] and "依標的" not in by["MU"]["source"], "來源寫明依哪一檔標的"
+    assert sorted(seen) == ["INTC", "MU", "SPYX", "ZZZU"] and seen.count("MU") == 1, "標的 MU 同時是持股：只查一次；ETF 本身不去查（槓桿 ETF），一般 ETF 照舊: " + str(seen)
+    lg = [x for x in fetch.LOG if x["source"] == "us_sector"][0]["detail"]
+    assert "MUU→Technology（依標的 MU）" in lg and "ZZZU（沒有公司簡介" in lg and "SPYX（沒有公司簡介" in lg, lg
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(403, "text/html", b"blocked", "HTTP 403")), mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["us_sector_lookup"]([{"market": "US", "symbol": "MUU", "name": "2倍做多MU ETF", "kind": "leveraged_etf"}]) == []
+    assert "MUU（標的 MU：HTTP 403" in fetch.LOG[-1]["detail"] and fetch.LOG[-1]["status"] == "no_new_data", "標的查不到：寫出是查哪一檔、為什麼"
+
+
 def test_run_job_daily_persists_us_sector_and_finmind_tables_and_isolates_them():
     reset()
     sec = [{"symbol": "ARM", "sector_en": "Technology", "industry_en": "Semiconductors", "sector": "資訊科技", "source": "x"}]
@@ -5129,6 +5201,45 @@ def test_probe_fin_coverage_failures_skips_and_limits():
     # 只讀：探測不寫任何資料列
     import inspect
     src = inspect.getsource(fetch.probe_fin_coverage); assert "persist(" not in src and '"POST"' not in src and '"PATCH"' not in src and '"DELETE"' not in src, "只讀"
+
+
+def test_probe_dashboard_logs_api_definition_lines_even_when_the_right_side_is_an_expression():
+    home = "https://www.twse.com.tw/zh/"
+    page = '<title>x</title><script src="/dashboard/js/main.js"></script><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300
+    main = 'const TPEX_API = isProd ? "https://www.tpex.org.tw/dashboard" : "https://test.example/x"; var TWSE_API=location.origin+"/dashboardApi"; var ICON_BASE = "/img/a.png"; let appName = "x";'
+    pages = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, page), "https://www.twse.com.tw/dashboard/js/main.js": (200, main), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, '$.get(TWSE_API + "/marginTrading/X1");')}
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages))
+    d = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_defs"]
+    assert len(d) == 1 and 'TPEX_API = isProd ? "https://www.tpex.org.tw/dashboard" : "https://test.example/x"' in d[0] and 'TWSE_API = location.origin+"/dashboardApi"' in d[0] and "a.png" not in d[0] and "appName" not in d[0], "右邊是運算式也記下原文: " + str(d)
+
+
+def test_probe_nasdaq_access_logs_ip_header_variants_and_backup_sources_without_writing_anything():
+    reset()
+    calls = []
+    def fake(url, timeout=None, headers=None):
+        calls.append((url, dict(headers or {})))
+        if "ipify" in url: return 200, "application/json", b'{"ip":"20.1.2.3"}', ""
+        if "api.nasdaq.com" in url:
+            full = "Sec-Fetch-Mode" in (headers or {})
+            return (200, "application/json", b'{"data":{"symbol":"SPY"}}', "") if full else (403, "text/html", b"<HTML><HEAD><TITLE>Access Denied</TITLE>", "")
+        if "yahoo" in url: return 200, "application/json", json.dumps({"chart": {"result": [{"timestamp": [1762300800, 1762387200], "indicators": {"quote": [{"close": [680.1, 683.2]}]}}]}}).encode(), ""
+        if "stooq" in url: return 200, "text/csv", b"Date,Open,High,Low,Close,Volume\n2026-11-10,1,2,0.5,1.5,100\n2026-11-11,1,2,0.5,1.6,110\n", ""
+        return None, "", b"", "unexpected"
+    with mock.patch.object(fetch, "fetch_raw", side_effect=fake), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "persist") as per, mock.patch.object(fetch, "persist_extra") as pe:
+        REAL["probe_nasdaq_access"]()
+    by = {}
+    for x in fetch.LOG: by.setdefault(x["source"], []).append(x)
+    assert "20.1.2.3" in by["probe:nasdaq_access_ip"][0]["detail"], "記下對外 IP"
+    hdr = by["probe:nasdaq_access_hdr"]; assert len(hdr) == 4 and [("HTTP 403" in h["detail"]) for h in hdr] == [True, False, True, True] and "Access Denied" in hdr[0]["detail"] and hdr[1]["status"] == "success" and hdr[0]["status"] == "no_new_data", "四組標頭各記一筆: " + str([h["detail"][:70] for h in hdr])
+    assert "目前使用的標頭" in hdr[0]["detail"] and "完整瀏覽器標頭" in hdr[1]["detail"] and "只有 User-Agent" in hdr[2]["detail"] and "curl 風格" in hdr[3]["detail"]
+    assert "2 筆，最新" in by["probe:nasdaq_access_yahoo"][0]["detail"] and by["probe:nasdaq_access_yahoo"][0]["status"] == "success"
+    assert "3 行" in by["probe:nasdaq_access_stooq"][0]["detail"] and "2026-11-11,1,2,0.5,1.6,110" in by["probe:nasdaq_access_stooq"][0]["detail"]
+    assert per.call_count == 0 and pe.call_count == 0 and len([c for c in calls if "api.nasdaq.com" in c[0]]) == 4, "只讀；Nasdaq 只打 4 次（每組標頭一次）"
+    # 全部連不上：只記錄，不丟例外
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch.time, "sleep"):
+        REAL["probe_nasdaq_access"]()
+    assert all(x["status"] in ("no_new_data",) for x in fetch.LOG if x["source"].startswith("probe:nasdaq_access")) and len([x for x in fetch.LOG if x["source"].startswith("probe:nasdaq_access")]) == 7
 
 
 def test_probe_dashboard_failures_are_logged_not_raised_and_never_write_tables():

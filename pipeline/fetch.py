@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v80"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v81"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1004,7 +1004,14 @@ def probe_dashboard():
     const_re = re.compile(r"(?<![\w$])([A-Za-z_$][\w$]*)\s*[:=]\s*[\"'`]((?:https?:)?//[^\"'`\s]{4,120}|/[A-Za-z0-9_./-]{2,80})[\"'`]")
     ep_re = re.compile(r"[\"'`](/[A-Za-z][A-Za-z0-9_]*/[A-Za-z0-9_./-]+(?:\?[^\"'`\s]*)?)[\"'`]")
 
+    defs = []                                                                                                       # 名稱含 API／BASE／HOST 的常數「定義那一行」原文（右邊可能是運算式，字串比對抓不到）
+    def_re = re.compile(r"(?<![\w$.])((?:const|let|var)\s+)?([A-Za-z_$][\w$]*(?:API|Api|BASE|Base|HOST|Host|ORIGIN|Origin)[\w$]*)\s*=\s*([^;\n]{1,140})")
+
     def collect(text):
+        for m in def_re.finditer(text):
+            d = f"{m.group(2)} = {m.group(3).strip()}"
+            if d not in defs and len(defs) < 14 and not re.search(r"\.(css|png|svg)", d):
+                defs.append(d)
         for m in const_re.finditer(text):
             if re.search(r"api|base|host|url|domain|origin", m.group(1), re.I):
                 consts.setdefault(m.group(1), m.group(2))
@@ -1023,7 +1030,7 @@ def probe_dashboard():
                 visited.add(sub)
                 inspect_page(sub, "subpage")
     if consts or endpoints:
-        probe_dashboard_data(consts, endpoints)
+        probe_dashboard_data(consts, endpoints, defs)
 
 
 def _shape(j, depth=0):
@@ -1039,9 +1046,10 @@ def _shape(j, depth=0):
     return repr(j)[:40]
 
 
-def probe_dashboard_data(consts, endpoints):
+def probe_dashboard_data(consts, endpoints, defs=None):
     """只讀探測：儀表板頁面的程式讀的資料端點，真的抓一次，記回傳的結構（有沒有擔保維持率、有幾天的歷史）。"""
     log("probe:dashboard_consts", "success", detail=_clip("API 基底網址常數：" + (" ; ".join(f"{k} = {v}" for k, v in list(consts.items())[:12]) or "沒找到") + f"｜端點 {len(endpoints)} 個：" + " ; ".join(endpoints[:14])))
+    log("probe:dashboard_defs", "success", detail=_clip("名稱含 API／BASE／HOST 的定義（原文）：" + (" ## ".join(defs or []) or "沒找到")))
     bases = [v for v in consts.values() if v.startswith(("http://", "https://", "//"))]
     for ep in endpoints[: config.DASHBOARD_MAX_ENDPOINTS]:
         want = "tpex|otc" if ep.startswith("/dashboardOtc") else "twse|tse"
@@ -1126,6 +1134,36 @@ def probe_fin_coverage():
         types = Counter(str(r.get("type", "")) for r in j["data"] if isinstance(r, dict))
         log("probe:fin_finmind", "success", detail=_clip(f"{code} {names.get(code, '')}（{indmap.get(code) or '產業查不到'}）：FinMind 共 {len(j['data'])} 列；損益項目名稱：" + "、".join(t for t, _n in types.most_common(14))))
         time.sleep(config.FINMIND_SLEEP)
+
+
+def probe_nasdaq_access():
+    """只讀診斷：排程打 Nasdaq 回 HTTP 403（美股價格、SPY、QQQ、暴跌名單全部失敗）。
+    1) 記下這台機器的對外 IP；2) 同一個網址用幾組不同標頭各試一次，記狀態與回應開頭（看是不是被防護機制擋掉）；
+    3) 試兩個備援來源有沒有回應：Yahoo Finance 日線、Stooq 日線（CSV）。只記錄，不寫任何資料表，也不把這些資料拿去用。"""
+    ua = config.NASDAQ_UA
+    st, ct, body, err = fetch_raw("https://api.ipify.org?format=json", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "risk-pwa/1.0"})
+    ip = body.decode("utf-8", errors="replace")[:60] if st == 200 else f"查不到（HTTP {st} {err}）"
+    log("probe:nasdaq_access_ip", "success" if st == 200 else "no_new_data", detail=_clip(f"這台排程機器的對外 IP：{ip}"))
+    url = config.NASDAQ_QUOTE_URL.format(symbol="SPY", assetclass="etf")
+    chrome = {"User-Agent": ua, "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate", "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/market-activity/etf/spy",
+              "Connection": "keep-alive", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-site", "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"'}
+    variants = (("目前使用的標頭", NASDAQ_HEADERS), ("完整瀏覽器標頭（含 Sec-Fetch、sec-ch-ua）", chrome), ("只有 User-Agent", {"User-Agent": ua}), ("curl 風格", {"User-Agent": "curl/8.5.0", "Accept": "*/*"}))
+    for name, hdr in variants:
+        st, ct, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=hdr)
+        head = body[:110].decode("utf-8", errors="replace").replace("\n", " ") if body else ""
+        log("probe:nasdaq_access_hdr", "success" if st == 200 else "no_new_data", detail=_clip(f"{name}：HTTP {st}｜{ct}｜{len(body or b'')} 位元組｜開頭 {head!r}｜{err or ''}"))
+        time.sleep(1)
+    st, ct, body, err = fetch_raw("https://query1.finance.yahoo.com/v8/finance/chart/SPY?range=5d&interval=1d", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
+    pts = None
+    if st == 200:
+        try:
+            pts = parse_yahoo_chart(json.loads(body.decode("utf-8-sig")))
+        except (ValueError, UnicodeDecodeError):
+            pts = None
+    log("probe:nasdaq_access_yahoo", "success" if pts else "no_new_data", detail=_clip(f"Yahoo SPY 日線：HTTP {st}｜{(str(len(pts)) + ' 筆，最新 ' + str(pts[-1])) if pts else '沒有解析出資料'}｜{err or ''}"))
+    st, ct, body, err = fetch_raw("https://stooq.com/q/d/l/?s=spy.us&i=d", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)"})
+    lines = body.decode("utf-8", errors="replace").strip().splitlines() if st == 200 and body else []
+    log("probe:nasdaq_access_stooq", "success" if len(lines) > 2 else "no_new_data", detail=_clip(f"Stooq SPY 日線（CSV）：HTTP {st}｜{len(lines)} 行｜表頭 {lines[0] if lines else '無'}｜最新 {lines[-1] if lines else '無'}｜{err or ''}"))
 
 
 def probe_extra():
@@ -2724,12 +2762,12 @@ def tw_leaders_compute():
     return out
 
 
-def fred_history_rows(series_id, low, high):
-    """FRED 最近一段歷史（用各筆自己的日期）。回傳 [{series_id,label,as_of,value,source}]，失敗回傳 None。"""
+def fred_history_rows(series_id, low, high, days=None):
+    """FRED 最近一段歷史（用各筆自己的日期）。回傳 [{series_id,label,as_of,value,source}]，失敗回傳 None。days 不給就用 FRED_HISTORY_DAYS（約 1 年）。"""
     key = config.fred_key()
     if not key:
         return None
-    start = (date.today() - timedelta(days=config.FRED_HISTORY_DAYS)).isoformat()
+    start = (date.today() - timedelta(days=days or config.FRED_HISTORY_DAYS)).isoformat()
     url = f"{config.FRED_SERIES_URL}?series_id={series_id}&api_key={key}&file_type=json&sort_order=asc&observation_start={start}"
     data, err = fetch_json(url)
     if data is None or not isinstance(data, dict) or not isinstance(data.get("observations"), list):
@@ -2760,6 +2798,22 @@ def fred_history_backfill():
         if rows:
             out.extend(rows)
             log(f"fred_history:{sid}", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 筆（{rows[0]['as_of']} 到 {rows[-1]['as_of']}）")
+    return out
+
+
+def us_index_long_history():
+    """模組 M35：標普 500 與 Nasdaq 綜合的長期日資料（FRED，近 US_LONG_YEARS 年）→ macro_series。
+    用來做美股的「從 60 日高點回落到某個程度以後，過去發生過什麼」歷史對照（和台股那張同一個算法）。
+    FRED 官方收盤；用和每天更新一樣的合理範圍與日期檢查；抓不到只記錄，不讓工作變紅。寫入用 series_id,as_of 當主鍵，重跑不會重複。"""
+    out = []
+    for sid in config.US_LONG_SERIES:
+        low, high = config.FRED_MACRO[sid][1], config.FRED_MACRO[sid][2]
+        rows = fred_history_rows(sid, low, high, days=config.US_LONG_YEARS * 366)
+        if rows:
+            out.extend(rows)
+            log(f"us_index_long:{sid}", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 筆（{rows[0]['as_of']} 到 {rows[-1]['as_of']}）")
+        else:
+            log(f"us_index_long:{sid}", "no_new_data", detail="FRED 沒有回傳資料（沒設 API 金鑰、連線失敗或空的）")
     return out
 
 
@@ -3707,6 +3761,16 @@ def parse_nasdaq_profile(j, symbol):
     return {"symbol": symbol.upper(), "sector_en": sec, "industry_en": ind, "sector": zh, "source": "Nasdaq 公司簡介（分類和 GICS 不完全相同）"}, None
 
 
+def leveraged_underlying(name):
+    """槓桿 ETF 的名稱（例如「2倍做多MU ETF」「2倍做空TSLA ETF」「2X Long NVDA ETF」）→ 標的股票代號（MU、TSLA、NVDA）。
+    取名稱裡第一個全大寫的英文字（1 到 5 個字母，可有 .X），排除 ETF、ETN、X 這類不是代號的字；看不出來就回傳 None（不猜）。"""
+    skip = {"ETF", "ETN", "ETP", "X", "USD", "USA", "BULL", "BEAR", "LONG", "SHORT", "ULTRA"}
+    for tok in re.findall(r"(?<![A-Za-z])[A-Z]{1,5}(?:\.[A-Z])?(?![A-Za-z])", str(name or "")):
+        if tok not in skip:
+            return tok
+    return None
+
+
 def us_sector_lookup(holdings):
     """模組 M26：美股持股的產業，從 Nasdaq 公司簡介自動帶入（你在網頁自己指定的永遠優先）。已經查過、不到 45 天的不重查；
     ETF 沒有公司簡介，查不到只記沒有資料（不會讓工作變紅）。每檔之間間隔 1 秒。"""
@@ -3714,31 +3778,44 @@ def us_sector_lookup(holdings):
     if not syms:
         log("us_sector", "skipped", detail="沒有美股持股代號，不查產業")
         return []
+    target = {}                                                       # 槓桿 ETF 本身沒有產業：看它的標的股票（名稱裡的代號）屬於哪一個產業
+    for h in (holdings or []):
+        s = str(h.get("symbol") or "").strip().upper()
+        if h.get("market") == "US" and s and h.get("kind") == "leveraged_etf":
+            u = leveraged_underlying(h.get("name"))
+            if u and u != s:
+                target[s] = u
     fresh = set()
     if sb_ready():
         got, err = sb_request("GET", "us_sector_auto?select=symbol,fetched_at&limit=1000")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
         fresh = {r["symbol"] for r in (got or []) if str(r.get("fetched_at", "")) >= cutoff}
-    out, miss = [], []
+    out, miss, cache = [], [], {}
     for sym in syms:
         if sym in fresh:
             continue
-        status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/company/{sym}/company-profile", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
-        time.sleep(1)
-        if status != 200:
-            miss.append(f"{sym}（HTTP {status} {err}）".strip())
-            continue
-        try:
-            row, why = parse_nasdaq_profile(json.loads(body.decode("utf-8-sig")), sym)
-        except (ValueError, UnicodeDecodeError):
-            miss.append(f"{sym}（不是 JSON）")
-            continue
+        look = target.get(sym, sym)                                   # 實際去查哪一檔的公司簡介（槓桿 ETF 查它的標的）
+        if look in cache:
+            row, why = cache[look]
+        else:
+            status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/company/{look}/company-profile", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+            time.sleep(1)
+            if status != 200:
+                row, why = None, f"HTTP {status} {err}".strip()
+            else:
+                try:
+                    row, why = parse_nasdaq_profile(json.loads(body.decode("utf-8-sig")), look)
+                except (ValueError, UnicodeDecodeError):
+                    row, why = None, "不是 JSON"
+            cache[look] = (row, why)
         if row is None:
-            miss.append(f"{sym}（{why}）")
+            miss.append(f"{sym}" + (f"（標的 {look}：{why}）" if look != sym else f"（{why}）"))
+        elif look != sym:                                             # 槓桿 ETF：用標的的產業，來源寫明
+            out.append(dict(row, symbol=sym, source=f"依標的 {look} 的 Nasdaq 公司簡介（槓桿 ETF 本身沒有產業；分類和 GICS 不完全相同）"))
         else:
             out.append(row)
     log("us_sector", "success" if out else "no_new_data",
-        detail=_clip(f"{len(syms)} 檔美股持股：新查到 {len(out)} 檔（" + "、".join(f"{r['symbol']}→{r['sector_en']}" for r in out[:8]) + f"）；{len(fresh & set(syms))} 檔 45 天內查過" + (f"；查不到：{'、'.join(miss[:6])}" if miss else "")))
+        detail=_clip(f"{len(syms)} 檔美股持股：新查到 {len(out)} 檔（" + "、".join(f"{r['symbol']}→{r['sector_en']}" + (f"（依標的 {target[r['symbol']]}）" if r['symbol'] in target else "") for r in out[:8]) + f"）；{len(fresh & set(syms))} 檔 45 天內查過" + (f"；查不到：{'、'.join(miss[:6])}" if miss else "")))
     return out
 
 
@@ -5091,6 +5168,7 @@ def run_job(job, dry_run=False):
         probe_taifex_daily()
         probe_dashboard()
         probe_fin_coverage()
+        probe_nasdaq_access()
     if job == "us_probe":
         probe_earnings()
         probe_round3()
@@ -5107,7 +5185,7 @@ def run_job(job, dry_run=False):
         probe_round14()
         probe_round15()
         probe_round16()
-    inst_hist, pc_rows, margin_hist, index_long = [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
+    inst_hist, pc_rows, margin_hist, index_long, us_long = [], [], [], [], []                                  # 回補專用的變數；不能叫 inst_rows，否則會把每天抓到的外資買賣超清掉
     if job == "tw_backfill":
         res = tw_backfill(dry_run=dry_run) or {}
         tw_breadth_update(dry_run=dry_run, max_days=40)
@@ -5118,6 +5196,7 @@ def run_job(job, dry_run=False):
             pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
             margin_hist = _run_module("M19", "上市融資餘額歷史回補", tw_margin_backfill) or []
             index_long = _run_module("M24", "加權指數長期歷史回補", tw_index_long_history) or []
+            us_long = _run_module("M35", "美股指數長期歷史（標普 500、Nasdaq 綜合，FRED）", us_index_long_history) or []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
@@ -5166,6 +5245,7 @@ def run_job(job, dry_run=False):
         extra.append(("us_putcall", pc_rows, "as_of"))
         extra.append(("tw_margin", margin_hist, "as_of,source"))
         extra.append(("market_stats", index_long, "market,as_of,source"))
+        extra.append(("macro_series", us_long, "series_id,as_of"))
         if not dry_run:
             extra.append(("tw_industry", _run_module("M17", "台股產業別", tw_industry_collect) or [], "code"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
