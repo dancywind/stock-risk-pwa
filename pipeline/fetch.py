@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v74"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v75"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -148,6 +148,9 @@ def fetch_json(url, headers=None, timeout=None):
         if attempt < config.RETRIES:
             time.sleep((config.BLOCK_BACKOFF_SECONDS if blocked else config.BACKOFF_SECONDS) * attempt)
     return None, last_err
+
+
+DASH_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept": "text/html,application/json,*/*", "Accept-Language": "zh-TW,zh;q=0.9"}
 
 
 def fetch_swagger(url):
@@ -905,6 +908,74 @@ def probe_twse():
         if "漲跌" in str(t.get("title")):
             log("probe:breadth_table", "success",
                 detail=_clip(f"{t.get('title')}｜{t.get('fields')}｜{(t.get('data') or [])[:8]}"))
+
+
+def _dash_keywords_hit(text):
+    return [k for k in config.DASHBOARD_KEYWORDS if k in text]
+
+
+def probe_dashboard():
+    """只讀探測：官方「臺股儀表板」（2026/9/23 上線，有全市場擔保維持率）有沒有程式可以讀的資料來源。
+    1) 證交所與櫃買的開放資料說明文件（swagger）裡，有沒有含「維持率／儀表板／信用交易…」的端點；
+    2) 證交所首頁有沒有通往儀表板的連結，並看那一頁和它的程式檔裡出現哪些像是資料網址的字串。
+    只記錄結構與找到的網址，不寫任何市場資料表，也不把探測到的數字當成正式資料。任何一步失敗都只記一筆紀錄。"""
+    for name, url in (("twse", config.TWSE_SWAGGER), ("tpex", config.TPEX_SWAGGER)):
+        data, err = fetch_swagger(url)
+        if data is None:
+            log(f"probe:dashboard_swagger_{name}", "failure", detail=f"抓取失敗: {err}")
+            continue
+        paths = data.get("paths") or {}
+        hits = []
+        for path, methods in paths.items():
+            for m in (methods or {}).values():
+                if isinstance(m, dict):
+                    text = f"{m.get('summary', '')} {m.get('description', '')}"
+                    found = _dash_keywords_hit(text) or _dash_keywords_hit(path)
+                    if found:
+                        hits.append(f"{path} | {m.get('summary', '')}")
+        log(f"probe:dashboard_swagger_{name}", "success",
+            detail=_clip(f"共 {len(paths)} 個端點；含『{'／'.join(config.DASHBOARD_KEYWORDS)}』字樣的：" + (" ; ".join(hits[:12]) if hits else "無")))
+
+    links, seen = [], set()
+    for home in config.DASHBOARD_HOME_PAGES:
+        status, ctype, body, err = fetch_raw(home, timeout=config.PROBE_TIMEOUT, headers=DASH_HEADERS)
+        if status is None or status != 200:
+            log("probe:dashboard_home", "no_new_data", detail=_clip(f"{home}：HTTP {status}；{err}"))
+            continue
+        html = body.decode("utf-8", errors="replace")
+        for m in re.finditer(r"<a\b[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.{0,80}?)</a>", html, re.S | re.I):
+            href, txt = m.group(1).strip(), re.sub(r"<[^>]+>|\s+", " ", m.group(2)).strip()
+            if ("儀表板" in txt or re.search(r"dashboard|board", href, re.I)) and not href.startswith(("javascript", "#", "mailto")):
+                absu = urllib.parse.urljoin(home, href)
+                if absu not in seen:
+                    seen.add(absu)
+                    links.append((absu, txt))
+        log("probe:dashboard_home", "success", detail=_clip(f"{home}：HTTP {status}，{len(body)} 位元組；找到 {len(links)} 個疑似儀表板連結：" + " ; ".join(f"{t or '（無文字）'} → {u}" for u, t in links[:6])))
+        if links:
+            break
+    if not links:
+        log("probe:dashboard_pages", "no_new_data", detail="首頁沒有找到通往儀表板的連結（可能是動態產生的，需要人工把儀表板網址貼過來再探測）")
+        return
+    api_re = re.compile(r"[\"'`]((?:https?:)?//[^\"'`\s]{6,140}|/[A-Za-z0-9_./?=&%-]{4,120})[\"'`]")
+    for url, txt in links[: config.DASHBOARD_MAX_PAGES]:
+        status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=DASH_HEADERS)
+        if status is None or status != 200:
+            log("probe:dashboard_page", "no_new_data", detail=_clip(f"{url}：HTTP {status}；{err}"))
+            continue
+        html = body.decode("utf-8", errors="replace")
+        title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+        scripts = [urllib.parse.urljoin(url, s) for s in re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.I)]
+        found = sorted({u for u in api_re.findall(html) if re.search(r"\.(json|csv)\b|/rwd/|/api/|/v1/|dashboard|margin|credit", u, re.I)})
+        log("probe:dashboard_page", "success", detail=_clip(f"{url}｜標題 {(title.group(1).strip() if title else '（無）')[:60]}｜{status} {ctype}｜{len(body)} 位元組｜程式檔 {len(scripts)} 個：" + " ; ".join(scripts[:6]) + "｜頁面裡像資料網址的字串：" + (" ; ".join(found[:10]) if found else "無")))
+        for js in [s for s in scripts if urllib.parse.urlparse(s).netloc.endswith(("twse.com.tw", "tpex.org.tw"))][: config.DASHBOARD_MAX_SCRIPTS]:
+            st, ct, jb, er = fetch_raw(js, timeout=config.PROBE_TIMEOUT, headers=DASH_HEADERS)
+            if st is None or st != 200:
+                log("probe:dashboard_script", "no_new_data", detail=_clip(f"{js}：HTTP {st}；{er}"))
+                continue
+            text = jb[:2_000_000].decode("utf-8", errors="replace")
+            hits = sorted({u for u in api_re.findall(text) if re.search(r"\.(json|csv)\b|/rwd/|/api/|/v1/|dashboard|margin|credit|maint", u, re.I)})
+            kw = [k for k in config.DASHBOARD_KEYWORDS if k in text]
+            log("probe:dashboard_script", "success", detail=_clip(f"{js}｜{len(jb)} 位元組｜含關鍵字 {'、'.join(kw) if kw else '無'}｜像資料網址的字串：" + (" ; ".join(hits[:14]) if hits else "無")))
 
 
 def probe_extra():
@@ -4836,6 +4907,7 @@ def run_job(job, dry_run=False):
         probe_twse()
         probe_extra()
         probe_taifex_daily()
+        probe_dashboard()
     if job == "us_probe":
         probe_earnings()
         probe_round3()

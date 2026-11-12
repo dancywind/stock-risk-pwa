@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -4853,6 +4853,87 @@ def test_run_job_us_breadth_also_persists_spy_bars_and_isolates_m34():
     tables, st = go(False); assert ("us_daily_bars", [bar], "symbol,as_of") in tables and st["module:M34"] == "success" and st["module:M32"] == "success"
     reset(); tables, st = go(True); assert not [x for x in tables if x[0] == "us_daily_bars"] and "module:M34" not in st, "試跑不抓"
     reset(); tables, st = go(False, side_effect=RuntimeError("boom")); assert st["module:M34"] == "failure" and st["module:M32"] == "success" and [x for x in tables if x[0] == "us_daily_bars"][0][1] == [], "M34 壞了不影響 M32"
+
+
+def _dash_env(swagger=None, pages=None):
+    """探測用的假環境：swagger（網址→dict 或 None）與網頁（網址→(狀態, 內容)，沒列到的網址回 404）。回傳 (收到的請求網址清單, 修補清單)"""
+    asked = []
+    swagger = swagger or {}
+    pages = pages or {}
+    def fake_raw(url, timeout=None, headers=None):
+        asked.append(url)
+        st, body = pages.get(url, (404, ""))
+        return st, "text/html", body.encode("utf-8"), "" if st == 200 else f"HTTP {st}"
+    def fake_swagger(url):
+        d = swagger.get(url)
+        return (d, "") if d is not None else (None, "連線失敗")
+    return asked, [mock.patch.object(fetch, "fetch_raw", side_effect=fake_raw), mock.patch.object(fetch, "fetch_swagger", side_effect=fake_swagger), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "persist_extra")]
+
+
+def _run_dash(env):
+    asked, patches = env
+    reset()
+    for p in patches: p.start()
+    try:
+        REAL["probe_dashboard"]()
+    finally:
+        for p in patches: p.stop()
+    return asked, {x["source"] + "#" + str(i): x for i, x in enumerate(fetch.LOG) if x["source"].startswith("probe:dashboard")}, patches
+
+
+def test_probe_dashboard_finds_keyword_endpoints_links_and_data_urls():
+    home = "https://www.twse.com.tw/zh/"
+    sw_twse = {"paths": {"/exchangeReport/MI_MARGN": {"get": {"summary": "融資融券彙總"}}, "/credit/maintenance": {"get": {"summary": "全市場擔保維持率", "description": "每日"}}, "/x/y": {"get": {"summary": "無關的東西"}}}}
+    sw_tpex = {"paths": {"/openapi/v1/credit": {"get": {"summary": "信用交易統計"}}}}
+    html_home = '<html><a href="/zh/about.html">關於我們</a> <a href="/zh/dashboard/index.html"><span>臺股</span>儀表板</a> <a href="javascript:void(0)">儀表板</a> <a href="#top">儀表板</a> <a href="/zh/news">新聞</a></html>'
+    html_dash = '<html><title> 臺股儀表板 </title><script src="/assets/app.js"></script><script src="https://cdn.example.com/lib.js"></script><script>var u = "/rwd/zh/dashboard/credit?response=json"; var v = "/zh/logo.png";</script></html>'
+    js = 'fetch("/api/v1/margin/maintenance?d=1"); const t = "全市場擔保維持率"; const o = "https://www.twse.com.tw/rwd/zh/credit/MI_CREDIT.json"; var x = "/css/main.css";'
+    pages = {home: (200, html_home), "https://www.twse.com.tw/zh/dashboard/index.html": (200, html_dash), "https://www.twse.com.tw/assets/app.js": (200, js)}
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: sw_twse, config.TPEX_SWAGGER: sw_tpex}, pages))
+    by = {k.split("#")[0]: v for k, v in logs.items()}
+    assert "共 3 個端點" in by["probe:dashboard_swagger_twse"]["detail"] and "/credit/maintenance | 全市場擔保維持率" in by["probe:dashboard_swagger_twse"]["detail"] and "/x/y" not in by["probe:dashboard_swagger_twse"]["detail"] and "MI_MARGN" not in by["probe:dashboard_swagger_twse"]["detail"], "只列含關鍵字的端點: " + by["probe:dashboard_swagger_twse"]["detail"]
+    assert "/openapi/v1/credit | 信用交易統計" in by["probe:dashboard_swagger_tpex"]["detail"]
+    d = by["probe:dashboard_home"]["detail"]; assert by["probe:dashboard_home"]["status"] == "success" and "找到 1 個疑似儀表板連結" in d and "臺股 儀表板 → https://www.twse.com.tw/zh/dashboard/index.html" in d and "javascript" not in d and "about" not in d, "首頁：只收真的儀表板連結（排除 javascript、#、無關連結）: " + d
+    d = by["probe:dashboard_page"]["detail"]; assert "標題 臺股儀表板" in d and "程式檔 2 個" in d and "/rwd/zh/dashboard/credit?response=json" in d and "logo.png" not in d, "頁面：標題、程式檔、像資料網址的字串: " + d
+    d = by["probe:dashboard_script"]["detail"]; assert "含關鍵字 維持率" in d and "/api/v1/margin/maintenance?d=1" in d and "MI_CREDIT.json" in d and "main.css" not in d, "程式檔: " + d
+    assert "https://cdn.example.com/lib.js" not in asked, "外部網域的程式檔不抓"; assert asked.count("https://www.twse.com.tw/assets/app.js") == 1
+    assert all(x["status"] in ("success",) for x in by.values()) and not [x for x in fetch.LOG if x["status"] == "failure"], "全部成功、沒有失敗"
+
+
+def test_probe_dashboard_failures_are_logged_not_raised_and_never_write_tables():
+    home = "https://www.twse.com.tw/zh/"
+    # 全部連不上：每一步各記一筆，不丟例外
+    asked, logs, patches = _run_dash(_dash_env({}, {}))
+    by = {k.split("#")[0]: v for k, v in logs.items()}
+    assert by["probe:dashboard_swagger_twse"]["status"] == "failure" and by["probe:dashboard_swagger_tpex"]["status"] == "failure" and by["probe:dashboard_home"]["status"] == "no_new_data" and by["probe:dashboard_pages"]["status"] == "no_new_data" and "需要人工把儀表板網址貼過來" in by["probe:dashboard_pages"]["detail"], "全部失敗: " + str({k: v["status"] for k, v in by.items()})
+    assert len([u for u in asked if u in config.DASHBOARD_HOME_PAGES]) == 2, "兩個首頁網址都試"
+    # 首頁沒有儀表板連結
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, {home: (200, "<html><a href='/zh/news'>新聞</a></html>")}))
+    by = {k.split("#")[0]: v for k, v in logs.items()}; homes = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_home"]
+    assert any("找到 0 個疑似儀表板連結" in d for d in homes) and len(homes) == 2 and any("HTTP 404" in d for d in homes), "第一個首頁沒有連結、第二個首頁 404：兩個都記: " + str(homes)
+    assert by["probe:dashboard_pages"]["status"] == "no_new_data" and "共 0 個端點" in by["probe:dashboard_swagger_twse"]["detail"] and "：無" in by["probe:dashboard_swagger_twse"]["detail"]
+    # 儀表板頁 404、程式檔 500：記 no_new_data，其他照常
+    pages = {home: (200, '<a href="/d1">儀表板</a><a href="/d2">儀表板</a>'), "https://www.twse.com.tw/d1": (404, ""), "https://www.twse.com.tw/d2": (200, '<title>x</title><script src="/a.js"></script><script src="/b.js"></script>'), "https://www.twse.com.tw/a.js": (500, ""), "https://www.twse.com.tw/b.js": (200, 'var k = "/rwd/x.json"')}
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages))
+    statuses = [(v["source"], v["status"]) for v in logs.values()]; assert ("probe:dashboard_page", "no_new_data") in statuses and ("probe:dashboard_page", "success") in statuses and statuses.count(("probe:dashboard_script", "no_new_data")) == 1 and statuses.count(("probe:dashboard_script", "success")) == 1, "壞掉的那一頁、那一支程式檔只記一筆，其他照常: " + str(statuses)
+    # 數量上限：5 個連結只抓 3 頁；每頁最多 3 支程式檔
+    links = "".join(f'<a href="/p{i}">儀表板{i}</a>' for i in range(5)); pg = {home: (200, links)}
+    for i in range(5): pg[f"https://www.twse.com.tw/p{i}"] = (200, "<title>t</title>" + "".join(f'<script src="/s{j}.js"></script>' for j in range(6)))
+    for j in range(6): pg[f"https://www.twse.com.tw/s{j}.js"] = (200, "x")
+    asked, logs, patches = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pg))
+    assert len([u for u in asked if u.startswith("https://www.twse.com.tw/p")]) == 3 and len([u for u in asked if u.endswith(".js")]) == 9, "最多 3 頁、每頁最多 3 支程式檔: " + str(len(asked))
+
+
+def test_probe_dashboard_runs_only_in_tw_probe_job_and_never_persists():
+    reset()
+    called = []
+    with mock.patch.object(fetch, "probe_dashboard", side_effect=lambda: called.append(1)), mock.patch.object(fetch, "probe_twse"), mock.patch.object(fetch, "probe_extra"), mock.patch.object(fetch, "probe_taifex_daily"), mock.patch.object(fetch, "persist") as per, mock.patch.object(fetch, "persist_extra") as pe:
+        fetch.run_job("tw_probe", dry_run=False)
+    assert called == [1], "tw_probe 會跑儀表板探測"
+    assert per.call_args[0][1] == [] and all(a is None for a in per.call_args[0][2:]) and pe.call_args[0][1] == [], "探測不會多寫任何市場資料列（寫入的資料表參數都是空的）: " + str((per.call_args[0][1:4], pe.call_args[0][1]))
+    import inspect
+    src = inspect.getsource(fetch.run_job); a = src.index('if job == "tw_probe":'); b = src.index('if job == "us_probe":')
+    assert src.count("probe_dashboard()") == 1 and a < src.index("probe_dashboard()") < b, "只在 tw_probe 這個工作裡呼叫，其他工作不跑它"
 
 
 def test_breadth_hist_compute_full_in_windows_then_incremental_and_failures():
