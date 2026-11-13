@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -4011,6 +4011,73 @@ def test_us_sector_lookup_skips_fresh_handles_etfs_and_never_turns_red():
     assert REAL["us_sector_lookup"]([]) == [] and fetch.LOG[-1]["status"] == "skipped" and REAL["us_sector_lookup"]([{"market": "TW", "name": "台積電"}]) == []
 
 
+def _wk_days(n, end="2026-11-11"):
+    out, d_ = [], date.fromisoformat(end)
+    while len(out) < n:
+        if d_.weekday() < 5: out.append(d_.isoformat())
+        d_ -= timedelta(days=1)
+    return out[::-1]
+
+
+def _hist_rows(n=260, spike_at=200, spike_high=150.0, end="2026-11-11"):
+    days = _wk_days(n, end)
+    return [{"as_of": d_, "close": 100.0 + (i % 7), "high": spike_high if i == spike_at else 101.0 + (i % 7), "low": 99.0 + (i % 7)} for i, d_ in enumerate(days)]
+
+
+def _stats(hist, as_of="2026-11-12", close=120.0, err=None):
+    reset()
+    with mock.patch.object(fetch, "sb_request", return_value=(hist, err)) as sq:
+        out = fetch._watch_hist_stats("3189", "TWSE", as_of, close)
+    return out, sq
+
+
+def test_watch_hist_stats_computes_52w_high_with_date_change_and_20_day_return_with_sanity_checks():
+    hist = _hist_rows(); days = [r["as_of"] for r in hist]
+    out, sq = _stats(hist)
+    assert "tw_hist?select=as_of,close,high,low&market=eq.TWSE&code=eq.3189&as_of=gte.2025-11-12&order=as_of.asc" in sq.call_args[0][1], sq.call_args[0][1]
+    assert out["high_52w"] == 150.0 and out["high_52w_date"] == days[200] and out["low_52w"] == 99.0 and out["range_source"] == "自建歷史（260 個交易日）", out
+    prev = hist[-1]; assert out["prev_close"] == prev["close"] and out["chg_pct"] == round((120.0 / prev["close"] - 1) * 100, 2), "前一個交易日收盤與漲跌"
+    ref = hist[-20]; assert out["ret_20d"] == round((120.0 / ref["close"] - 1) * 100, 2), "近 20 個交易日：往前數第 20 筆"
+    # 今天的收盤價比歷史上所有高點都高：最高價就是今天
+    out, _s = _stats(hist, close=160.0); assert out["high_52w"] == 160.0 and out["high_52w_date"] == "2026-11-12"
+    # 今天收盤比最低價還低：最低價是今天
+    out, _s = _stats(hist, close=80.0); assert out["low_52w"] == 80.0
+    # 歷史已經包含資料日當天：前一筆是更早的一天，當天那筆不當成「前一日」
+    same = hist + [{"as_of": "2026-11-12", "close": 120.0, "high": 121.0, "low": 118.0}]
+    out, _s = _stats(same); assert out["prev_close"] == prev["close"] and out["high_52w"] == 150.0
+    # 歷史不夠長：不給 52 週，但漲跌照給；並記一筆說明
+    out, _s = _stats(hist[-100:]); assert "high_52w" not in out and "chg_pct" in out and "ret_20d" in out and "只有 100 個交易日" in [x for x in fetch.LOG if x["source"] == "watch_hist:3189"][0]["detail"]
+    # 前一筆太舊（超過 10 天）：不算漲跌；20 日前那筆日期對不上（歷史有缺漏）：不算 20 日
+    old = [dict(r) for r in hist[:-1]]; out, _s = _stats(old, as_of="2026-11-30"); assert "chg_pct" not in out
+    gap = [r for i, r in enumerate(hist) if not (len(hist) - 25 <= i <= len(hist) - 8)]; out, _s = _stats(gap); assert "ret_20d" not in out, out
+    # 空的、出錯、壞列：不拋例外
+    out, _s = _stats([]); assert out == {} and "沒有 3189" in fetch.LOG[-1]["detail"]
+    out, _s = _stats(None, err="HTTP 500"); assert out == {} and "HTTP 500" in fetch.LOG[-1]["detail"]
+    bad = [{"as_of": "2026-11-10", "close": "壞", "high": 1, "low": 1}, {"x": 1}, "字串"] + hist; out, _s = _stats(bad); assert out["high_52w"] == 150.0, "壞列略過、其他照算"
+    assert fetch._watch_hist_stats("X", "TWSE", "2026-11-12", None) == {} and fetch._watch_hist_stats("X", "TWSE", None, 5.0) == {}
+
+
+def test_watch_valuation_attaches_history_stats_to_each_candidate_row_and_one_failure_does_not_stop_the_others():
+    reset()
+    twse_px = [{"Code": "3189", "Name": "景碩", "ClosingPrice": "120.00", "Date": "1151112"}, {"Code": "8046", "Name": "南電", "ClosingPrice": "130.00", "Date": "1151112"}]
+    twse_pe = [{"Code": "3189", "Name": "景碩", "PEratio": "30.1", "PBratio": "4.2", "DividendYield": "1.0", "Date": "1151112"}, {"Code": "8046", "Name": "南電", "PEratio": "40.1", "PBratio": "5.2", "DividendYield": "0.8", "Date": "1151112"}]
+    def sbr(method, path, body=None, prefer=None):
+        if "private_watchlist" in path: return [{"code": "3189"}, {"code": "8046"}], None
+        if "code=eq.8046" in path: raise RuntimeError("boom")
+        return _hist_rows(), None
+    def fj(url, headers=None, timeout=None):
+        if url == config.TWSE_AVG_URL: return twse_px, ""
+        if "BWIBBU_ALL" in url: return twse_pe, ""
+        return [], "空的回應"
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=sbr), mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        rows = REAL["watch_valuation"]()
+    by = {r["code"]: r for r in rows}
+    assert sorted(by) == ["3189", "8046"] and by["3189"]["high_52w"] == 150.0 and by["3189"]["high_52w_date"] and by["3189"]["chg_pct"] is not None and by["3189"]["ret_20d"] is not None, by.get("3189")
+    assert by["8046"]["close"] == 130.0 and by["8046"]["pe"] == 40.1 and by["8046"]["high_52w"] is None and by["8046"]["chg_pct"] is None, "一檔行情統計出錯：只少那幾個欄位，其他欄位與其他檔照常"
+    assert any(x["source"] == "watch_hist:8046" and x["status"] == "failure" for x in fetch.LOG)
+    assert set(by["3189"]) == set(by["8046"]), "所有列欄位一致（一次寫入）"
+
+
 def test_leveraged_underlying_extracts_the_stock_ticker_from_the_etf_name_and_never_guesses():
     f = fetch.leveraged_underlying
     assert f("2倍做多MU ETF") == "MU" and f("2倍做多INTC ETF") == "INTC" and f("2倍做空TSLA ETF") == "TSLA" and f("2X Long NVDA ETF") == "NVDA" and f("3x BULL AAPL ETF") == "AAPL" and f("2倍做多BRK.B ETF") == "BRK.B"
@@ -5454,6 +5521,32 @@ def test_run_job_tw_close_persists_keep_rate_rows_and_isolates_a_crash():
         return got[0], {x["source"]: x["status"] for x in fetch.LOG}
     tables, st = go(return_value=rows_); assert ("tw_keep_rate", rows_, "as_of,source") in tables and st["module:M38"] == "success"
     reset(); tables, st = go(side_effect=RuntimeError("boom")); assert st["module:M38"] == "failure" and ("tw_keep_rate", rows_, "as_of,source") not in tables and "module:M27" in st
+
+
+def test_probe_chips_logs_the_shape_of_each_chip_source_with_the_three_stocks_rows_and_writes_nothing():
+    reset()
+    t86 = {"stat": "OK", "fields": ["證券代號", "證券名稱", "外陸資買進股數(不含外資自營商)", "投信買進股數"], "data": [["2330", "台積電", "1", "2"], ["3037", "欣興", "10", "20"], ["3189", "景碩", "30", "40"]]}
+    margin = {"stat": "OK", "date": "20261112", "tables": [{"fields": ["x"], "data": [["a"]]}, {"fields": ["代號", "名稱", "買進", "賣出", "現金償還", "前日餘額", "今日餘額", "限額"], "data": [["3037", "欣興", "1", "2", "3", "100", "99", "5000"], ["3189", "景碩", "1", "2", "3", "100", "99", "4000"], ["1101", "台泥", "0", "0", "0", "5", "5", "100"]]}]}
+    tdcc = "資料日期,證券代號,持股分級,人數,股數,占集保庫存數比例%\n" + "\n".join(f"20261106,{c},{lv},{10 * lv},{1000 * lv},{lv}.5" for c in ("3037", "3189", "1101", "1102", "1216", "2002", "2317", "2412", "2454", "2603") for lv in range(1, 16))
+    punish = {"stat": "OK", "fields": ["編號", "公布日期", "證券代號", "證券名稱"], "data": [["1", "115/11/10", "3189", "景碩"], ["2", "115/11/09", "9999", "某某"]]}
+    def raw(url, timeout=None, headers=None):
+        if "T86" in url: return 200, "application/json", json.dumps(t86 if "date=%s" % (date.today() - timedelta(days=0 if date.today().weekday() < 5 else date.today().weekday() - 4)).strftime("%Y%m%d") in url else {"stat": "很抱歉，沒有符合條件的資料!"}).encode(), ""
+        if "tdcc" in url: return 200, "text/csv", tdcc.encode("utf-8"), ""
+        if "punish" in url: return 200, "application/json", json.dumps(punish).encode(), ""
+        return None, "", b"", "unexpected"
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "fetch_json", return_value=(margin, "")), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "persist") as per, mock.patch.object(fetch, "persist_extra") as pe:
+        REAL["probe_chips"]()
+    by = {x["source"]: x for x in fetch.LOG}
+    assert "欄位 ['證券代號'" in by["probe:chips_t86"]["detail"] and "['3037', '欣興', '10', '20']" in by["probe:chips_t86"]["detail"] and "['3189', '景碩', '30', '40']" in by["probe:chips_t86"]["detail"] and "['2330'" not in by["probe:chips_t86"]["detail"] and "3 檔" in by["probe:chips_t86"]["detail"], by["probe:chips_t86"]["detail"]
+    assert "'限額'" in by["probe:chips_margin"]["detail"] and "['3037', '欣興'" in by["probe:chips_margin"]["detail"] and "3 檔" in by["probe:chips_margin"]["detail"] and "['a']" not in by["probe:chips_margin"]["detail"], "取最大的那張表、列出限額欄: " + by["probe:chips_margin"]["detail"]
+    assert "表頭 資料日期,證券代號,持股分級" in by["probe:chips_tdcc"]["detail"] and "資料日期 ['20261106']" in by["probe:chips_tdcc"]["detail"] and "共 30 行" in by["probe:chips_tdcc"]["detail"] and by["probe:chips_tdcc"]["status"] == "success", by["probe:chips_tdcc"]["detail"]
+    assert "2 筆" in by["probe:chips_punish"]["detail"] and "景碩" in by["probe:chips_punish"]["detail"] and by["probe:chips_punish"]["status"] == "success"
+    assert per.call_count == 0 and pe.call_count == 0, "只讀"
+    # 全部連不上：只記錄、不丟例外
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch.time, "sleep"):
+        REAL["probe_chips"]()
+    st = {x["source"]: x["status"] for x in fetch.LOG}; assert st == {"probe:chips_t86": "no_new_data", "probe:chips_margin": "no_new_data", "probe:chips_tdcc": "no_new_data", "probe:chips_punish": "no_new_data"}, st
 
 
 def test_probe_dashboard_stops_at_the_first_working_language_segment_and_logs_the_full_apipath_class():

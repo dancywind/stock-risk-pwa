@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v86"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v87"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1214,6 +1214,61 @@ def probe_nasdaq_access():
     st, ct, body, err = fetch_raw("https://stooq.com/q/d/l/?s=spy.us&i=d", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)"})
     lines = body.decode("utf-8", errors="replace").strip().splitlines() if st == 200 and body else []
     log("probe:nasdaq_access_stooq", "success" if len(lines) > 2 else "no_new_data", detail=_clip(f"Stooq SPY 日線（CSV）：HTTP {st}｜{len(lines)} 行｜表頭 {lines[0] if lines else '無'}｜最新 {lines[-1] if lines else '無'}｜{err or ''}"))
+
+
+def probe_chips():
+    """只讀診斷：候選股比較想加的「籌碼」資料有沒有、長什麼樣子（不寫任何資料表）。
+    1) 證交所三大法人買賣超日報 T86（逐檔外資、投信）；2) 逐檔融資表的欄位（有沒有融資限額）；
+    3) 集保戶股權分散表（TDCC 開放資料，400 張以上大戶持股比）；4) 證交所處置股票公告。
+    每一項記：HTTP 狀態、欄位名稱、筆數、以及 3037／3189／8046 這幾檔的那一列（沒有就記前兩列）。"""
+    hdr = dict(DASH_HEADERS)
+    pick = ("3037", "3189", "8046")
+
+    def show(rows):
+        hit = [r for r in rows if isinstance(r, (list, tuple)) and r and str(r[0]).strip() in pick] or [r for r in rows[:2]]
+        return " ## ".join(str(r)[:260] for r in hit[:3])
+    t86_done = False
+    for back in range(0, 7):                                                                                          # 往回找最近一個有資料的日子
+        d_ = date.today() - timedelta(days=back)
+        if d_.weekday() >= 5:
+            continue
+        st, ct, body, err = fetch_raw(f"https://www.twse.com.tw/rwd/zh/fund/T86?date={d_.strftime('%Y%m%d')}&selectType=ALLBUT0999&response=json", timeout=config.PROBE_TIMEOUT, headers=hdr)
+        time.sleep(1)
+        try:
+            j = json.loads(body.decode("utf-8-sig")) if st == 200 and body else None
+        except (ValueError, UnicodeDecodeError):
+            j = None
+        if isinstance(j, dict) and j.get("stat") == "OK" and j.get("data"):
+            log("probe:chips_t86", "success", as_of=d_.isoformat(), detail=_clip(f"日期 {d_}｜{len(j['data'])} 檔｜欄位 {j.get('fields')}｜{show(j['data'])}", 1500))
+            t86_done = True
+            break
+    if not t86_done:
+        log("probe:chips_t86", "no_new_data", detail="往回 7 天都查不到 T86（三大法人買賣超日報）")
+    data, err = fetch_json(config.TWSE_MI_MARGN_ALL, headers=hdr)
+    tabs = [t for t in ((data or {}).get("tables") or [])] if isinstance(data, dict) else []
+    big = max([t for t in tabs if t.get("data")], key=lambda t: len(t["data"]), default=None)
+    if big:
+        log("probe:chips_margin", "success", detail=_clip(f"日期 {data.get('date')}｜{len(big['data'])} 檔｜欄位 {big.get('fields')}｜{show(big['data'])}", 1500))
+    else:
+        log("probe:chips_margin", "no_new_data", detail=_clip(f"逐檔融資表沒有資料：{err or '格式非預期'}"))
+    st, ct, body, err = fetch_raw("https://opendata.tdcc.com.tw/getOD.ashx?id=1-5", timeout=config.PROBE_TIMEOUT, headers=hdr)
+    time.sleep(1)
+    if st == 200 and body:
+        lines = body.decode("utf-8-sig", errors="replace").splitlines()
+        mine = [l for l in lines[1:] if l.split(",")[1:2] and l.split(",")[1].strip() in pick]
+        dates = sorted({l.split(",")[0] for l in lines[1:300]})[:3]
+        log("probe:chips_tdcc", "success" if len(lines) > 100 else "no_new_data", detail=_clip(f"{len(lines)} 行｜表頭 {lines[0] if lines else ''}｜資料日期 {dates}｜3037／3189／8046 共 {len(mine)} 行：{' ## '.join(mine[:8])}", 1500))
+    else:
+        log("probe:chips_tdcc", "no_new_data", detail=_clip(f"集保開放資料：HTTP {st} {err or ''}"))
+    st, ct, body, err = fetch_raw("https://www.twse.com.tw/rwd/zh/announcement/punish?response=json", timeout=config.PROBE_TIMEOUT, headers=hdr)
+    try:
+        j = json.loads(body.decode("utf-8-sig")) if st == 200 and body else None
+    except (ValueError, UnicodeDecodeError):
+        j = None
+    if isinstance(j, dict) and j.get("data") is not None:
+        log("probe:chips_punish", "success", detail=_clip(f"{len(j['data'])} 筆｜欄位 {j.get('fields')}｜前兩筆 {[str(r)[:300] for r in j['data'][:2]]}", 1500))
+    else:
+        log("probe:chips_punish", "no_new_data", detail=_clip(f"處置股票公告：HTTP {st} {err or ''}｜開頭 {(body or b'')[:100]!r}"))
 
 
 def probe_extra():
@@ -3939,6 +3994,39 @@ def _in_range(raw, lo, hi, lo_open=False):
     return v if v is not None and (lo < v if lo_open else lo <= v) and v <= hi else None
 
 
+def _watch_hist_stats(code, market, as_of, close):
+    """候選股的行情統計（用自建歷史 tw_hist：整個市場每天一筆，約一年）：52 週最高／最低價與最高價那一天、前一個交易日收盤與漲跌、近 20 個交易日漲跌。
+    每一項都要通過檢查才給：52 週要有足夠的天數與涵蓋範圍；前一筆不能比資料日早超過 10 天；20 日前那一筆要在 25 到 45 個日曆天之前（歷史有缺漏就不算）。
+    今天的收盤價如果還沒進歷史（歷史晚一天），就用證交所／櫃買的收盤價補進去比較。"""
+    if close is None or not as_of:
+        return {}
+    since = (date.fromisoformat(as_of) - timedelta(days=365)).isoformat()
+    hist, err = sb_request("GET", f"tw_hist?select=as_of,close,high,low&market=eq.{market}&code=eq.{code}&as_of=gte.{since}&order=as_of.asc&limit=1000")
+    rows = []
+    for r in (hist if isinstance(hist, list) else []):
+        try:
+            rows.append({"as_of": str(r["as_of"]), "close": float(r["close"]), "high": float(r["high"]), "low": float(r["low"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not rows:
+        log(f"watch_hist:{code}", "no_new_data", detail=_clip(f"自建歷史裡沒有 {code}（{err or '空的'}）：不算 52 週與漲跌"))
+        return {}
+    out, d0 = {}, date.fromisoformat(as_of)
+    prior = [r for r in rows if r["as_of"] < as_of]
+    if prior and prior[-1]["close"] > 0 and (d0 - date.fromisoformat(prior[-1]["as_of"])).days <= 10:
+        out["prev_close"], out["chg_pct"] = prior[-1]["close"], round((close / prior[-1]["close"] - 1) * 100, 2)
+    if len(prior) >= 20 and prior[-20]["close"] > 0 and 25 <= (d0 - date.fromisoformat(prior[-20]["as_of"])).days <= 45:
+        out["ret_20d"] = round((close / prior[-20]["close"] - 1) * 100, 2)
+    span = (date.fromisoformat(rows[-1]["as_of"]) - date.fromisoformat(rows[0]["as_of"])).days
+    if len(rows) >= config.RANGE52_MIN_ROWS and span >= config.RANGE52_MIN_COVERAGE_DAYS:
+        hi_row = max(rows, key=lambda r: r["high"]); lo = min(r["low"] for r in rows)
+        hi, hi_date = (hi_row["high"], hi_row["as_of"]) if hi_row["high"] >= close else (close, as_of)
+        out.update({"high_52w": hi, "high_52w_date": hi_date, "low_52w": min(lo, close), "range_source": f"自建歷史（{len(rows)} 個交易日）"})
+    else:
+        log(f"watch_hist:{code}", "no_new_data", detail=f"歷史只有 {len(rows)} 個交易日、涵蓋 {span} 天，不足以算 52 週高低")
+    return out
+
+
 def watch_valuation():
     """模組 M30：候選股（你在網站輸入的 private_watchlist）的收盤價、本益比、殖利率、股價淨值比，用證交所與櫃買中心的全市場表查。
     本益比是用過去四季盈餘算的（不是預估）；虧損的公司沒有本益比，留空。代號兩個市場都查不到就列出來（可能是興櫃、已下市或代號打錯），不寫入。
@@ -3988,9 +4076,15 @@ def watch_valuation():
         if not as_of or as_of > today or (v_as_of and v_as_of > today):
             bad_date.append(code)
             continue
-        out.append({"code": code, "name": name, "market": mk, "as_of": as_of, "close": _in_range(close, 0, 1e6, True), "val_as_of": v_as_of,
-                    "pe": _in_range(pev, 0, 1000, True), "pb": _in_range(pbv, 0, 100, True), "dividend_yield": _in_range(yv, 0, 50),
-                    "source": "證交所／櫃買中心開放資料（本益比用過去四季盈餘算，不是預估）"})
+        row = {"code": code, "name": name, "market": mk, "as_of": as_of, "close": _in_range(close, 0, 1e6, True), "val_as_of": v_as_of,
+               "pe": _in_range(pev, 0, 1000, True), "pb": _in_range(pbv, 0, 100, True), "dividend_yield": _in_range(yv, 0, 50),
+               "source": "證交所／櫃買中心開放資料（本益比用過去四季盈餘算，不是預估）",
+               "prev_close": None, "chg_pct": None, "ret_20d": None, "high_52w": None, "high_52w_date": None, "low_52w": None, "range_source": None}
+        try:
+            row.update(_watch_hist_stats(code, mk, as_of, row["close"]))                                  # 52 週、漲跌、近 20 日（一檔出錯不影響其他檔）
+        except Exception as e:
+            log(f"watch_hist:{code}", "failure", detail=_clip(f"行情統計出錯：{type(e).__name__}: {e}"))
+        out.append(row)
     notes = ([f"查不到：{'、'.join(missing)}（可能是興櫃、已下市或代號打錯）"] if missing else []) + ([f"日期異常略過：{'、'.join(bad_date)}"] if bad_date else []) + ([f"來源失敗：{'、'.join(errs)}"] if errs else [])
     log("watch", "success" if out else "no_new_data", detail=_clip(f"{len(out)} / {len(codes)} 檔有資料" + ("｜" + "；".join(notes) if notes else "")))
     return out
@@ -5341,6 +5435,7 @@ def run_job(job, dry_run=False):
         probe_dashboard()
         probe_fin_coverage()
         probe_nasdaq_access()
+        probe_chips()
     if job == "us_probe":
         probe_earnings()
         probe_round3()
