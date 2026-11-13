@@ -60,7 +60,7 @@ YAHOO_DXY = ("DX-Y.NYB", "DXY", (70.0, 130.0))
 YAHOO_FILL = (("^GSPC", "SP500", 0.005), ("CL=F", "DCOILWTICO", 0.04), ("BZ=F", "DCOILBRENTEU", 0.04),
               ("^VIX", "VIXCLS", 0.01), ("^VXN", "VXNCLS", 0.01), ("^IXIC", "NASDAQCOM", 0.005))        # 後三個：FRED 常落後約一個營業日以上；有和 FRED 重疊的日子核對過才補
 FRED_HISTORY_DAYS = 400
-US_LONG_SERIES = ("SP500", "NASDAQCOM")        # 美股歷史對照用的長期日資料
+US_LONG_SERIES = ("SP500", "NASDAQCOM", "VIXCLS", "VXNCLS")        # 美股歷史對照與情緒溫度計歷史驗證用的長期日資料（指數與 VIX、VXN）
 US_LONG_YEARS = 10                           # FRED 的 SP500 只提供近 10 年；NASDAQCOM 可以更長，這裡也取 10 年，兩邊口徑一致
 TWD_FRED_SERIES = "DEXTAUS"
 TWSE_RWD_BASE = "https://www.twse.com.tw/rwd/zh"   # 臺股儀表板頁面程式的 API 前綴（ApiPath("/rwd", lan)）
@@ -175,7 +175,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v87"
+PIPELINE_VERSION = "v88"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

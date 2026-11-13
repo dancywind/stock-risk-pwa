@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -427,7 +427,12 @@ def test_probe_extra_failures_logged():
     reset()
     with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 403")):
         fetch.probe_extra()
-    assert [x["status"] for x in fetch.LOG].count("failure") == 3
+    st_ = [x["status"] for x in fetch.LOG]; assert st_.count("no_new_data") == len(config.PROBE_URLS) and st_.count("failure") == 1 and [x for x in fetch.LOG if x["status"] == "failure"][0]["source"] == "probe:taifex_swagger", "迴圈裡的端點抓不到：記成「沒有新資料」，不讓整個工作變紅；期交所 swagger 那段維持原樣: " + str(st_)
+    # 一個探測回 307（沒有目標網址）：同樣只記錄，不丟例外、不記失敗
+    reset()
+    with mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP Error 307: Temporary Redirect")):
+        fetch.probe_extra()
+    assert [x["source"] for x in fetch.LOG if x["status"] == "failure"] == ["probe:taifex_swagger"] and any("307" in x["detail"] and x["status"] == "no_new_data" for x in fetch.LOG), "307 的那些端點只記錄"
 
 
 # ---------------------------------------------------------------- 外資買賣超、融資（真實格式）
@@ -4085,6 +4090,21 @@ def test_leveraged_underlying_extracts_the_stock_ticker_from_the_etf_name_and_ne
         assert f(bad) is None, bad
 
 
+def test_fetch_json_treats_an_unfollowable_307_or_308_like_a_temporary_block_and_waits_longer():
+    import urllib.error
+    for code in (307, 308, 403):
+        sleeps = []
+        err = urllib.error.HTTPError("https://x.test/a", code, "Temporary Redirect", {}, None)
+        with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=err), mock.patch.object(fetch.time, "sleep", side_effect=sleeps.append):
+            data, why = fetch.fetch_json("https://x.test/a")
+        assert data is None and str(code) in why and sleeps and all(s >= config.BLOCK_BACKOFF_SECONDS for s in sleeps), "%d：等得比較久（被擋）: %s" % (code, sleeps)
+    sleeps = []
+    err = urllib.error.HTTPError("https://x.test/a", 404, "Not Found", {}, None)
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=err), mock.patch.object(fetch.time, "sleep", side_effect=sleeps.append):
+        fetch.fetch_json("https://x.test/a")
+    assert sleeps and all(s < config.BLOCK_BACKOFF_SECONDS for s in sleeps), "404 不當成被擋: " + str(sleeps)
+
+
 def test_us_index_long_history_fetches_ten_years_for_both_indexes_and_never_turns_the_job_red():
     reset()
     seen = []
@@ -4093,9 +4113,9 @@ def test_us_index_long_history_fetches_ten_years_for_both_indexes_and_never_turn
         return [{"series_id": sid, "label": "x", "as_of": "2016-11-14", "value": 2100.0, "source": "FRED"}, {"series_id": sid, "label": "x", "as_of": "2026-11-10", "value": 6800.0, "source": "FRED"}] if sid == "SP500" else None
     with mock.patch.object(fetch, "fred_history_rows", side_effect=fr):
         rows = REAL["us_index_long_history"]()
-    assert [s for s, _d in seen] == ["SP500", "NASDAQCOM"] and all(d == config.US_LONG_YEARS * 366 for _s, d in seen), "兩個指數都要 10 年: " + str(seen)
+    assert [s for s, _d in seen] == ["SP500", "NASDAQCOM", "VIXCLS", "VXNCLS"] and all(d == config.US_LONG_YEARS * 366 for _s, d in seen), "兩個指數與 VIX、VXN 都要 10 年: " + str(seen)
     assert len(rows) == 2 and {r["series_id"] for r in rows} == {"SP500"}
-    st = {x["source"]: x["status"] for x in fetch.LOG}; assert st["us_index_long:SP500"] == "success" and st["us_index_long:NASDAQCOM"] == "no_new_data" and not [x for x in fetch.LOG if x["status"] == "failure"], "抓不到的只記沒有資料"
+    st = {x["source"]: x["status"] for x in fetch.LOG}; assert st["us_index_long:SP500"] == "success" and st["us_index_long:NASDAQCOM"] == "no_new_data" and st["us_index_long:VIXCLS"] == "no_new_data" and not [x for x in fetch.LOG if x["status"] == "failure"], "抓不到的只記沒有資料"
     # fred_history_rows 的 days 參數：不給就是約一年，給了就用給的
     captured = []
     def fj(url, **k):
@@ -5547,6 +5567,69 @@ def test_probe_chips_logs_the_shape_of_each_chip_source_with_the_three_stocks_ro
     with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch, "fetch_json", return_value=(None, "HTTP 403")), mock.patch.object(fetch.time, "sleep"):
         REAL["probe_chips"]()
     st = {x["source"]: x["status"] for x in fetch.LOG}; assert st == {"probe:chips_t86": "no_new_data", "probe:chips_margin": "no_new_data", "probe:chips_tdcc": "no_new_data", "probe:chips_punish": "no_new_data"}, st
+
+
+def _summary(pe="33.7", fw="29.6", eps="$6.7", prev="$225.89", keys=True, label_only=False):
+    d = {"Exchange": {"label": "Exchange", "value": "NASDAQ-GS"}}
+    items = {"PERatio": ("P/E Ratio", pe), "ForwardPE1Yr": ("Forward P/E 1 Yr.", fw), "EarningsPerShare": ("Earnings Per Share(EPS)", eps), "PreviousClose": ("Previous Close", prev)}
+    for k, (lab, v) in items.items():
+        d[("X_" + k) if label_only else k] = {"label": lab, "value": v}
+    return {"data": {"symbol": "AMD", "summaryData": d}, "status": {"rCode": 200}}
+
+
+def test_parse_nasdaq_summary_reads_pe_forward_pe_eps_by_key_or_label_and_rejects_bad_numbers():
+    p = fetch.parse_nasdaq_summary
+    v, why = p(_summary()); assert why is None and v == {"pe": 33.7, "forward_pe": 29.6, "eps": 6.7, "prev_close": 225.89}, v
+    v, _w = p(_summary(label_only=True)); assert v["pe"] == 33.7 and v["forward_pe"] == 29.6 and v["eps"] == 6.7, "鍵名改了：用標籤文字也找得到: " + str(v)
+    v, _w = p(_summary(pe="N/A", fw="", eps="-1.25", prev="--")); assert v == {"pe": None, "forward_pe": None, "eps": -1.25, "prev_close": None}, "N/A、空的、--：當作沒有；負的每股盈餘保留: " + str(v)
+    v, _w = p(_summary(pe="0", fw="99999", eps="壞", prev="$-5")); assert v["pe"] is None and v["forward_pe"] is None and v["eps"] is None and v["prev_close"] is None, "不合理的數字不收: " + str(v)
+    v, _w = p(_summary(pe="1,234.5")); assert v["pe"] == 1234.5, "千分位"
+    for bad in (None, {}, {"data": None}, {"data": {"summaryData": None}}, {"data": {"summaryData": {}}}, [], "x"):
+        v, why = p(bad); assert v is None and "summaryData" in why, bad
+
+
+def test_us_valuation_fetches_each_stock_summary_skips_etfs_and_logs_what_is_missing():
+    reset()
+    hold = [{"market": "US", "symbol": "AMD", "kind": "stock"}, {"market": "US", "symbol": "MUU", "kind": "leveraged_etf"}, {"market": "US", "symbol": "SPY", "kind": "etf"}, {"market": "US", "symbol": "ORCL", "kind": "stock"},
+            {"market": "US", "symbol": "LOSS", "kind": "stock"}, {"market": "US", "symbol": "BAD", "kind": "stock"}, {"market": "US", "symbol": "NOJ", "kind": "stock"}, {"market": "TW", "symbol": None, "kind": "stock"}]
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        sym = url.split("/quote/")[1].split("/")[0]; seen.append(sym)
+        if sym == "AMD": return 200, "application/json", json.dumps(_summary()).encode(), ""
+        if sym == "ORCL": return 200, "application/json", json.dumps(_summary(pe="41.2", fw="31.0", eps="$5.1")).encode(), ""
+        if sym == "LOSS": return 200, "application/json", json.dumps(_summary(pe="N/A", fw="N/A", eps="-2.1")).encode(), ""
+        if sym == "BAD": return 404, "text/html", b"x", "HTTP 404"
+        return 200, "application/json", b"not json", ""
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        rows = REAL["us_valuation"](hold)
+    assert sorted(seen) == ["AMD", "BAD", "LOSS", "NOJ", "ORCL"], "只查個股（ETF 與台股不查）: " + str(seen)
+    by = {r["symbol"]: r for r in rows}; assert sorted(by) == ["AMD", "LOSS", "ORCL"], sorted(by)
+    assert by["AMD"]["pe"] == 33.7 and by["AMD"]["forward_pe"] == 29.6 and by["AMD"]["eps"] == 6.7 and "不是共識中位數" in by["AMD"]["source"]
+    assert by["LOSS"]["pe"] is None and by["LOSS"]["forward_pe"] is None and by["LOSS"]["eps"] == -2.1, "虧損：摘要有拿到、本益比留空，仍寫一列"
+    lg = [x for x in fetch.LOG if x["source"] == "us_valuation"][0]; assert lg["status"] == "success" and "摘要有 3 檔（有本益比 2、有預估本益比 2）" in lg["detail"] and "BAD（HTTP 404" in lg["detail"] and "NOJ（不是 JSON）" in lg["detail"], lg["detail"]
+    reset(); assert REAL["us_valuation"]([{"market": "US", "symbol": "SPY", "kind": "etf"}]) == [] and fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(403, "", b"", "HTTP 403")), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["us_valuation"]([{"market": "US", "symbol": "AMD", "kind": "stock"}]) == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and "AMD（HTTP 403" in fetch.LOG[-1]["detail"] and not [x for x in fetch.LOG if x["status"] == "failure"], "被擋：只記錄、不變紅"
+
+
+def test_run_job_tw_close_persists_us_valuation_rows_and_isolates_a_crash():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    rows_ = [{"symbol": "AMD", "pe": 33.7, "forward_pe": 29.6, "eps": 6.7, "prev_close": 225.89, "source": "Nasdaq 個股摘要"}]
+    def go(**kw):
+        got, seen = [], []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "load_us_watch", return_value=["AMD"]), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "us_valuation", side_effect=lambda h: (seen.append(h), kw["ret"])[1] if "ret" in kw else (_ for _ in ()).throw(RuntimeError("boom"))), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
+        for p_ in ps: p_.start()
+        try:
+            fetch.run_job("tw_close", dry_run=False)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}, seen
+    tables, st, seen = go(ret=rows_); assert ("us_valuation", rows_, "symbol") in tables and st["module:M39"] == "success" and [h["symbol"] for h in seen[0]] == ["AMD"], "候選股也一起查、主鍵是 symbol"
+    reset(); tables, st, _s = go(); assert st["module:M39"] == "failure" and ("us_valuation", rows_, "symbol") not in tables and "module:M26" in st, "壞掉不影響其他模組"
 
 
 def test_probe_dashboard_stops_at_the_first_working_language_segment_and_logs_the_full_apipath_class():

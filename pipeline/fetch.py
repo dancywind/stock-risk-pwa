@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v87"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v88"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -142,7 +142,7 @@ def fetch_json(url, headers=None, timeout=None):
                     raise ValueError(f"不是 JSON（{len(raw)} 位元組；開頭是 {head!r}）")           # 讓你一眼看出收到的是 HTML 錯誤頁還是別的東西
         except urllib.error.HTTPError as e:
             last_err = _scrub(e)
-            blocked = e.code in (403, 429, 503)
+            blocked = e.code in (403, 429, 503, 307, 308)                                    # 307／308 而且沒有可以跟隨的目標網址（urllib 才會丟錯）：對方的防護機制暫時擋住，和 403 一樣等久一點再試
         except Exception as e:  # noqa: BLE001
             last_err = _scrub(e)
         if attempt < config.RETRIES:
@@ -1273,14 +1273,15 @@ def probe_chips():
 
 def probe_extra():
     """只讀探測：外資買賣超(BFI82U)、融資餘額(MI_MARGN)、期交所外資期貨部位的真實格式。
-    只把「結構與前幾列範例」寫進紀錄，不寫任何市場資料表。"""
+    只把「結構與前幾列範例」寫進紀錄，不寫任何市場資料表。
+    迴圈裡的各個端點抓不到、或格式不是預期的，本身就是診斷資訊，記成「沒有新資料」，不讓整個 tw_probe 變紅（以前記成失敗，證交所偶爾回 307 就讓整個工作變紅）。"""
     for name, url in config.PROBE_URLS.items():
         data, err = fetch_json(url)
         if data is None:
-            log(f"probe:{name}", "failure", detail=f"抓取失敗: {err}")
+            log(f"probe:{name}", "no_new_data", detail=f"抓取失敗: {err}")
             continue
         if not isinstance(data, dict):
-            log(f"probe:{name}", "failure", detail=_clip(f"非預期格式: {type(data).__name__}"))
+            log(f"probe:{name}", "no_new_data", detail=_clip(f"非預期格式: {type(data).__name__}"))
             continue
         if data.get("stat") != "OK":
             log(f"probe:{name}", "no_new_data", detail=f"stat={data.get('stat')}")
@@ -3866,6 +3867,66 @@ def parse_nasdaq_profile(j, symbol):
     return {"symbol": symbol.upper(), "sector_en": sec, "industry_en": ind, "sector": zh, "source": "Nasdaq 公司簡介（分類和 GICS 不完全相同）"}, None
 
 
+def parse_nasdaq_summary(j):
+    """Nasdaq 個股摘要（/api/quote/{代號}/summary）→ (本益比、1 年預估本益比、每股盈餘、前一日收盤)。
+    摘要裡每個項目是 {label, value}。先用已知的鍵名找，找不到再用標籤文字找（P/E Ratio、Forward P/E、Earnings Per Share、Previous Close），
+    所以鍵名改了也不會整個壞掉；數字是 "N/A"、空的、不合理（超出範圍）的都當作沒有，不冒充。回傳 (dict, None) 或 (None, 原因)。"""
+    sd = (((j or {}).get("data") or {}).get("summaryData")) if isinstance(j, dict) else None
+    if not isinstance(sd, dict) or not sd:
+        return None, "沒有 summaryData（ETF、代號不存在或格式變了）"
+
+    def pick(keys, label_re):
+        for k in keys:
+            it = sd.get(k)
+            if isinstance(it, dict) and "value" in it:
+                return it.get("value")
+        for it in sd.values():
+            if isinstance(it, dict) and re.search(label_re, str(it.get("label", "")), re.I):
+                return it.get("value")
+        return None
+
+    def num(v, lo, hi):
+        t = re.sub(r"[$,\s]", "", str(v if v is not None else ""))
+        if t.upper() in ("", "N/A", "NA", "--", "-"):
+            return None
+        try:
+            x = float(t)
+        except ValueError:
+            return None
+        return x if lo < x <= hi else None
+    return {"pe": num(pick(("PERatio",), r"^P/?E\s*Ratio"), 0, 3000), "forward_pe": num(pick(("ForwardPE1Yr",), r"Forward\s*P/?E"), 0, 3000),
+            "eps": num(pick(("EarningsPerShare",), r"Earnings Per Share|\bEPS\b"), -1000, 100000), "prev_close": num(pick(("PreviousClose",), r"Previous Close"), 0, 1e7)}, None
+
+
+def us_valuation(holdings):
+    """模組 M39：美股持股與候選股的本益比（過去四季）與 1 年預估本益比、每股盈餘（Nasdaq 個股摘要，資料商提供）。
+    只查個股（ETF、槓桿 ETF 沒有）；預估本益比是資料商的預估，不是共識中位數，也不是你自己輸入的。查不到就不寫；
+    摘要有拿到但本益比是 N/A（例如虧損）也寫一列，欄位留空，讓網站能分辨「Nasdaq 沒提供」和「還沒抓過」。"""
+    syms = sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol") and h.get("kind") not in ("etf", "leveraged_etf")})
+    if not syms:
+        log("us_valuation", "skipped", detail="沒有美股個股代號，不查本益比")
+        return []
+    out, miss = [], []
+    for sym in syms:
+        status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/quote/{sym}/summary?assetclass=stocks", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+        time.sleep(1)
+        if status != 200:
+            miss.append(f"{sym}（HTTP {status} {err}）".strip())
+            continue
+        try:
+            vals, why = parse_nasdaq_summary(json.loads(body.decode("utf-8-sig")))
+        except (ValueError, UnicodeDecodeError):
+            miss.append(f"{sym}（不是 JSON）")
+            continue
+        if vals is None:
+            miss.append(f"{sym}（{why}）")
+            continue
+        out.append({"symbol": sym, **vals, "source": "Nasdaq 個股摘要（本益比用過去四季盈餘；預估本益比是資料商的 1 年預估，不是共識中位數）"})
+    n_pe, n_fw = sum(1 for r in out if r["pe"] is not None), sum(1 for r in out if r["forward_pe"] is not None)
+    log("us_valuation", "success" if out else "no_new_data", detail=_clip(f"{len(syms)} 檔個股：摘要有 {len(out)} 檔（有本益比 {n_pe}、有預估本益比 {n_fw}）" + (f"；沒有：{'、'.join(miss[:8])}" if miss else "")))
+    return out
+
+
 def leveraged_underlying(name):
     """槓桿 ETF 的名稱（例如「2倍做多MU ETF」「2倍做空TSLA ETF」「2X Long NVDA ETF」）→ 標的股票代號（MU、TSLA、NVDA）。
     取名稱裡第一個全大寫的英文字（1 到 5 個字母，可有 .X），排除 ETF、ETN、X 這類不是代號的字；看不出來就回傳 None（不猜）。"""
@@ -5508,6 +5569,7 @@ def run_job(job, dry_run=False):
             extra.append(("twd_rates", twd_hist, "layer,source,as_of"))
             extra.append(("twd_rates", _run_module("M36", "Yahoo 補美元兌台幣落後的天數（非官方）", yahoo_twd_fill, twd_hist) or [], "layer,source,as_of"))
             extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, with_us_watch(hold or [], us_watch)) or [], "symbol"))
+            extra.append(("us_valuation", _run_module("M39", "美股本益比（Nasdaq 個股摘要）", us_valuation, with_us_watch(hold or [], us_watch)) or [], "symbol"))
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
