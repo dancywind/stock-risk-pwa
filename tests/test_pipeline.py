@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -5314,6 +5314,9 @@ def test_yahoo_twd_fill_adds_only_newer_days_in_a_separate_unofficial_layer_afte
     assert not [x for x in fetch.LOG if x["status"] == "failure"]
     # FRED 已經是最新：不需要補
     reset(); rows = _with(_twd_env(fred, [(d_, v) for d_, v in same if d_ <= dd(7)]), lambda: REAL["yahoo_twd_fill"]()); assert rows == [] and "FRED 已經是最新" in fetch.LOG[-1]["detail"]
+    # 資料庫裡的 FRED 太稀疏（只有 2 筆）：同一次執行剛抓到的每日歷史（extra_fred）也算進核對
+    reset(); extra = [{"as_of": dd(12 - i), "value": v} for i, v in enumerate(vals)]
+    rows = _with(_twd_env(fred[:2], same), lambda: REAL["yahoo_twd_fill"](extra)); assert [r["as_of"] for r in rows] == [dd(5), dd(3), dd(1)], "資料庫稀疏、但本次歷史夠：照樣核對並補"
 
 
 def test_run_job_tw_close_persists_yahoo_twd_rows_in_their_own_layer_and_isolates_a_crash():
@@ -5332,6 +5335,55 @@ def test_run_job_tw_close_persists_yahoo_twd_rows_in_their_own_layer_and_isolate
         return got[0], {x["source"]: x["status"] for x in fetch.LOG}
     tables, st = go(return_value=rows_); assert ("twd_rates", rows_, "layer,source,as_of") in tables and st["module:M36"] == "success", "寫進 twd_rates，主鍵是 layer,source,as_of"
     reset(); tables, st = go(side_effect=RuntimeError("boom")); assert st["module:M36"] == "failure" and ("twd_rates", rows_, "layer,source,as_of") not in tables and "module:M27" in st, "壞掉不影響其他模組"
+
+
+def test_twd_fred_history_writes_daily_official_rows_in_the_same_shape_as_the_daily_row_and_never_turns_red():
+    reset()
+    seen = []
+    def fr(sid, low, high, days=None):
+        seen.append((sid, low, high, days))
+        return [{"series_id": sid, "label": sid, "as_of": "2026-10-29", "value": 31.4, "source": "FRED"}, {"series_id": sid, "label": sid, "as_of": "2026-10-30", "value": 31.3, "source": "FRED"}]
+    with mock.patch.object(fetch, "fred_history_rows", side_effect=fr):
+        rows = REAL["twd_fred_history"]()
+    assert seen == [(config.TWD_FRED_SERIES, config.TWD_RANGE[0], config.TWD_RANGE[1], config.TWD_HISTORY_DAYS)] and config.TWD_HISTORY_DAYS >= 300
+    assert rows == [{"as_of": d_, "value": v, "kind": "official_close", "source": "FRED DEXTAUS", "layer": 3, "is_close_history": True} for d_, v in (("2026-10-29", 31.4), ("2026-10-30", 31.3))], "和每天更新的那一筆同一種列（才會用同一個主鍵蓋過去）: " + str(rows)
+    lg = [x for x in fetch.LOG if x["source"] == "twd_history"][0]; assert lg["status"] == "success" and "2 筆每日收盤" in lg["detail"]
+    reset()
+    with mock.patch.object(fetch, "fred_history_rows", return_value=None):
+        assert REAL["twd_fred_history"]() == []
+    assert fetch.LOG[-1]["status"] == "no_new_data" and not [x for x in fetch.LOG if x["status"] == "failure"]
+    # fred_history_rows 本身：台幣不在 FRED_MACRO 裡也不會出錯（標籤用代號）
+    with mock.patch.object(fetch, "fetch_json", return_value=({"observations": [{"date": (date.today() - timedelta(days=3)).isoformat(), "value": "31.25"}, {"date": (date.today() - timedelta(days=4)).isoformat(), "value": "."}]}, "")), mock.patch.object(config, "fred_key", return_value="k"):
+        got = fetch.fred_history_rows("DEXTAUS", 20.0, 45.0, days=400)
+    assert len(got) == 1 and got[0]["label"] == "DEXTAUS" and got[0]["value"] == 31.25, got
+
+
+def test_run_job_tw_close_persists_twd_history_and_lets_the_yahoo_fill_check_against_it_in_the_same_run():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    hist = [{"as_of": "2026-10-29", "value": 31.4, "kind": "official_close", "source": "FRED DEXTAUS", "layer": 3, "is_close_history": True}]
+    yh = [{"as_of": "2026-11-10", "value": 31.0, "kind": "spot_aggregator", "source": "Yahoo Finance（非官方，補 FRED 落後的天數）", "layer": 4, "is_close_history": False}]
+    got, passed = [], []
+    ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+          mock.patch.object(fetch, "twd_fred_history", return_value=hist), mock.patch.object(fetch, "yahoo_twd_fill", side_effect=lambda extra=None: (passed.append(extra), yh)[1]), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
+    for p_ in ps: p_.start()
+    try:
+        fetch.run_job("tw_close", dry_run=False)
+    finally:
+        for p_ in ps: p_.stop()
+    tables = got[0]; st = {x["source"]: x["status"] for x in fetch.LOG}
+    assert ("twd_rates", hist, "layer,source,as_of") in tables and ("twd_rates", yh, "layer,source,as_of") in tables and passed == [hist], "歷史與補充都寫入；補充用同一次抓到的歷史核對: " + str(passed)
+    assert st["module:M37"] == "success" and st["module:M36"] == "success"
+    # 歷史壞掉：不影響 Yahoo 補充（它還有資料庫裡的可以用）與其他模組
+    reset(); got.clear(); passed.clear()
+    ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+          mock.patch.object(fetch, "twd_fred_history", side_effect=RuntimeError("boom")), mock.patch.object(fetch, "yahoo_twd_fill", side_effect=lambda extra=None: (passed.append(extra), [])[1]), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
+    for p_ in ps: p_.start()
+    try:
+        fetch.run_job("tw_close", dry_run=False)
+    finally:
+        for p_ in ps: p_.stop()
+    st = {x["source"]: x["status"] for x in fetch.LOG}; assert st["module:M37"] == "failure" and st["module:M36"] == "no_new_data" and passed == [[]] and "module:M27" in st, "歷史壞掉：Yahoo 補充照常執行（沒產出資料就是 no_new_data）、其他模組照常: " + str(st)
 
 
 def test_probe_dashboard_falls_back_to_the_twse_rwd_base_for_margin_endpoints():

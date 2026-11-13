@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v83"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v84"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2817,7 +2817,7 @@ def fred_history_rows(series_id, low, high, days=None):
     if data is None or not isinstance(data, dict) or not isinstance(data.get("observations"), list):
         log(f"fred_history:{series_id}", "failure", detail=_clip(f"FRED 歷史抓取失敗: {err}"))
         return None
-    label = config.FRED_MACRO[series_id][0]
+    label = config.FRED_MACRO.get(series_id, (series_id,))[0]                                   # 台幣（DEXTAUS）不在 FRED_MACRO 裡
     out, bad = [], 0
     for obs in data["observations"]:
         v, why = validate_value(obs.get("value"), low, high)
@@ -4595,7 +4595,21 @@ def yahoo_fill():
     return out
 
 
-def yahoo_twd_fill():
+def twd_fred_history():
+    """模組 M37：把 FRED 的美元兌台幣（DEXTAUS）每日收盤歷史（約 TWD_HISTORY_DAYS 天）寫進 twd_rates（layer 3、kind official_close、is_close_history = true，和每天更新的那一筆同一種列）。
+    為什麼要：每天的更新只存「FRED 當下最新的一筆」，而 FRED 的台幣大約每週才更新一次，所以資料庫裡的台幣收盤很稀疏，算不出「連續回落幾天」，也沒辦法和 Yahoo 核對。
+    主鍵是 layer,source,as_of，重跑只會更新、不會重複。抓不到只記錄，不讓工作變紅。"""
+    low, high = config.TWD_RANGE
+    rows = fred_history_rows(config.TWD_FRED_SERIES, low, high, days=config.TWD_HISTORY_DAYS)
+    if not rows:
+        log("twd_history", "no_new_data", detail="FRED 沒有回傳台幣歷史（沒設 API 金鑰、連線失敗或空的）")
+        return []
+    out = [{"as_of": r["as_of"], "value": r["value"], "kind": "official_close", "source": "FRED DEXTAUS", "layer": 3, "is_close_history": True} for r in rows]
+    log("twd_history", "success", as_of=out[-1]["as_of"], detail=f"{len(out)} 筆每日收盤（{out[0]['as_of']} 到 {out[-1]['as_of']}）")
+    return out
+
+
+def yahoo_twd_fill(extra_fred=None):
     """模組 M36：美元兌台幣較新的天數（Yahoo Finance 的 TWD=X，非官方）。FRED 的台幣收盤（DEXTAUS）常落後約一週，這個補上之後的日子，
     存進 twd_rates 的另一層（layer 4、kind spot_aggregator、is_close_history = false，來源明寫「非官方」），不動 FRED 那些列；FRED 之後補上同一天，網頁以 FRED 為準。
     安全做法：1) 只補比 FRED 最新一天更新、而且早於今天的日子；2) 先拿重疊的日子和 FRED 比：至少 3 天、平均差不超過 0.5%、最大差不超過 1%，
@@ -4605,6 +4619,9 @@ def yahoo_twd_fill():
         return []
     have, err = sb_request("GET", "twd_rates?is_close_history=eq.true&order=as_of.desc&limit=15&select=as_of,value")
     fred = {str(r["as_of"]): float(r["value"]) for r in (have or []) if parse_number(r.get("value")) is not None}
+    for r in (extra_fred or []):                                          # 同一次執行剛抓到、還沒寫進資料庫的 FRED 每日歷史（M37）也一起核對
+        if parse_number(r.get("value")) is not None:
+            fred[str(r["as_of"])] = float(r["value"])
     if len(fred) < 3:
         log("yahoo_twd", "no_new_data", detail=_clip(f"資料庫裡的 FRED 台幣收盤不到 3 筆，沒辦法核對，不補（{err or '資料不足'}）"))
         return []
@@ -5334,7 +5351,9 @@ def run_job(job, dry_run=False):
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
-            extra.append(("twd_rates", _run_module("M36", "Yahoo 補美元兌台幣落後的天數（非官方）", yahoo_twd_fill) or [], "layer,source,as_of"))
+            twd_hist = _run_module("M37", "美元兌台幣每日歷史（FRED）", twd_fred_history) or []
+            extra.append(("twd_rates", twd_hist, "layer,source,as_of"))
+            extra.append(("twd_rates", _run_module("M36", "Yahoo 補美元兌台幣落後的天數（非官方）", yahoo_twd_fill, twd_hist) or [], "layer,source,as_of"))
             extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, with_us_watch(hold or [], us_watch)) or [], "symbol"))
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
