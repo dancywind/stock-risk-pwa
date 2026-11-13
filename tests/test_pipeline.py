@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -5630,6 +5630,39 @@ def test_run_job_tw_close_persists_us_valuation_rows_and_isolates_a_crash():
         return got[0], {x["source"]: x["status"] for x in fetch.LOG}, seen
     tables, st, seen = go(ret=rows_); assert ("us_valuation", rows_, "symbol") in tables and st["module:M39"] == "success" and [h["symbol"] for h in seen[0]] == ["AMD"], "候選股也一起查、主鍵是 symbol"
     reset(); tables, st, _s = go(); assert st["module:M39"] == "failure" and ("us_valuation", rows_, "symbol") not in tables and "module:M26" in st, "壞掉不影響其他模組"
+
+
+def test_probe_vix_otc_logs_pages_links_files_swagger_candidates_and_yahoo_writes_nothing_and_never_raises():
+    reset()
+    page = '<html><a href="/cht/7/vixDaily3MNew">x</a><a href="/file/taifex/Dailydownload/vix/log2data/2026/vix_202610.csv">2026/10</a><a href="javascript:void(0)">y</a><a href="/file/a.zip">z</a><table><tr><td>臺指選擇權波動率指數</td></tr><tr><td>1</td></tr></table></html>'.encode("utf-8")
+    csv = "日期,臺指選擇權波動率指數\n20261112,22.5\n20261111,23.1\n".encode("big5")
+    chart = json.dumps({"chart": {"result": [{"timestamp": [1762300800, 1762387200, 1762473600], "indicators": {"quote": [{"close": [440.1, 441.2, 442.3]}]}}]}}).encode()
+    seen = []
+    def raw(url, timeout=None, headers=None):
+        seen.append(url)
+        if "vixDaily3MNew" in url or "vixMinNew" in url: return 200, "text/html", page, ""
+        if url.endswith("vix_202610.csv"): return 200, "text/csv", csv, ""
+        if url.endswith("a.zip"): return 404, "", b"", "HTTP 404"
+        if "TWOII" in url: return 200, "application/json", chart, ""
+        return None, "", b"", "unexpected"
+    swagger = {"paths": {"/tpex_index": {"get": {"summary": "櫃買指數每日收盤歷史", "description": ""}}, "/other": {"get": {"summary": "上櫃股票行情", "description": ""}}, "/tpex_50": {"get": {"summary": "櫃買富櫃50指數當日收盤", "description": "櫃買指數"}}}}
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch, "fetch_swagger", return_value=(swagger, "")), mock.patch.object(fetch, "fetch_json", return_value=([{"Date": "1151112", "Index": "300.5"}, {"Date": "1151111", "Index": "299.1"}], "")), mock.patch.object(fetch.time, "sleep"), \
+            mock.patch.object(fetch, "persist") as per, mock.patch.object(fetch, "persist_extra") as pe:
+        REAL["probe_vix_otc"]()
+    by = {}
+    for x in fetch.LOG: by.setdefault(x["source"], []).append(x)
+    d = by["probe:vix_daily3m"][0]; assert d["status"] == "success" and "有「臺指選擇權波動率指數」字樣 True" in d["detail"] and "vix_202610.csv" in d["detail"] and "javascript" not in d["detail"] and "<tr> 2 列" in d["detail"], d["detail"]
+    files = by["probe:vix_daily3m_file"]; assert any(x["status"] == "success" and "20261112,22.5" in x["detail"] and "big5" not in x["detail"] for x in files) and any(x["status"] == "no_new_data" and "HTTP 404" in x["detail"] for x in files), "csv 用 Big5 解碼、404 的記錄原因: " + str([x["detail"][:90] for x in files])
+    sw = by["probe:otc_swagger"][0]; assert "含「櫃買指數收盤／歷史」字樣的 2 個" in sw["detail"] and "/tpex_index" in sw["detail"] and "/other" not in sw["detail"], sw["detail"]
+    ep = by["probe:otc_endpoint"]; assert ep and ep[0]["status"] == "success" and "/tpex_index" in ep[0]["detail"] and "2 筆" in ep[0]["detail"] and "Index" in ep[0]["detail"], ep[0]["detail"]
+    assert by["probe:otc_yahoo"][0]["status"] == "success" and "3 筆" in by["probe:otc_yahoo"][0]["detail"]
+    assert per.call_count == 0 and pe.call_count == 0, "只讀"
+    # 全部失敗：只記錄、不丟例外、不記失敗
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "逾時")), mock.patch.object(fetch, "fetch_swagger", return_value=(None, "HTTP 503")), mock.patch.object(fetch.time, "sleep"):
+        REAL["probe_vix_otc"]()
+    srcs = [x for x in fetch.LOG if x["source"].startswith("probe:vix") or x["source"].startswith("probe:otc")]
+    assert srcs and all(x["status"] == "no_new_data" for x in srcs) and not [x for x in fetch.LOG if x["status"] == "failure"], str([(x["source"], x["status"]) for x in srcs])
 
 
 def test_probe_dashboard_stops_at_the_first_working_language_segment_and_logs_the_full_apipath_class():

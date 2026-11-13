@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v88"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v89"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1214,6 +1214,74 @@ def probe_nasdaq_access():
     st, ct, body, err = fetch_raw("https://stooq.com/q/d/l/?s=spy.us&i=d", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)"})
     lines = body.decode("utf-8", errors="replace").strip().splitlines() if st == 200 and body else []
     log("probe:nasdaq_access_stooq", "success" if len(lines) > 2 else "no_new_data", detail=_clip(f"Stooq SPY 日線（CSV）：HTTP {st}｜{len(lines)} 行｜表頭 {lines[0] if lines else '無'}｜最新 {lines[-1] if lines else '無'}｜{err or ''}"))
+
+
+def _obj_shape(obj, n=2):
+    """把一包 JSON 描述成短短一段文字（筆數、欄位、前幾筆），給探測紀錄用。"""
+    if isinstance(obj, list):
+        recs = [r for r in obj if isinstance(r, dict)]
+        return f"{len(obj)} 筆；欄位 {list(recs[0].keys())[:12] if recs else '（不是物件）'}；前 {n} 筆 {json.dumps(recs[:n], ensure_ascii=False)[:420]}"
+    if isinstance(obj, dict):
+        return f"頂層鍵 {list(obj.keys())[:12]}；{json.dumps(obj, ensure_ascii=False)[:420]}"
+    return f"不是預期的格式（{type(obj).__name__}）"
+
+
+def probe_vix_otc():
+    """只讀探測（不寫任何資料表）：1) 期交所網站的「臺指選擇權波動率指數（TAIWAN VIX）」每日收盤頁與下載檔；
+    2) 櫃買指數：櫃買中心開放資料裡有沒有櫃買指數的歷史、Yahoo 的 ^TWOII 能不能用。
+    用途：台指波動率（OpenAPI 沒有，但期交所網站有公布）和「個股對大盤（上市＝加權、上櫃＝櫃買指數）」的比較都需要先知道實際格式。每一項失敗都只記錄。"""
+    hdr = dict(DASH_HEADERS)
+    for name, url in (("vix_daily3m", "https://www.taifex.com.tw/cht/7/vixDaily3MNew"), ("vix_month", "https://www.taifex.com.tw/cht/7/vixMinNew")):
+        st, ct, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=hdr)
+        time.sleep(1)
+        if st != 200 or not body:
+            log(f"probe:{name}", "no_new_data", detail=_clip(f"{url}：HTTP {st} {err or ''}".strip()))
+            continue
+        html = body.decode("utf-8", errors="replace")
+        links = []
+        for m in re.finditer(r'href=["\']([^"\']+)["\']', html):
+            h = m.group(1)
+            if re.search(r"vix|csv|zip|download|Dailydownload|\.xls", h, re.I) and h not in links and not h.startswith(("javascript", "#")):
+                links.append(h)
+        rows = len(re.findall(r"<tr", html))
+        log(f"probe:{name}", "success", detail=_clip(f"{url}｜{len(body)} 位元組｜有「臺指選擇權波動率指數」字樣 {('臺指選擇權波動率指數' in html)}｜<tr> {rows} 列｜可能的資料連結 {len(links)} 個：" + " ## ".join(links[:14]), 1400))
+        data_links = [l_ for l_ in links if re.search(r"\.(csv|zip|txt|xls)|download", l_, re.I)][:2]
+        for l_ in data_links:
+            full = urllib.parse.urljoin(url, l_)
+            st2, ct2, b2, e2 = fetch_raw(full, timeout=config.PROBE_TIMEOUT, headers=hdr)
+            time.sleep(1)
+            if st2 == 200 and b2:
+                try:
+                    sample = b2[:600].decode("utf-8")
+                except UnicodeDecodeError:
+                    sample = b2[:600].decode("big5", errors="replace")                                           # 期交所的檔案常是 Big5
+                log(f"probe:{name}_file", "success", detail=_clip(f"{full}｜{ct2}｜{len(b2)} 位元組｜開頭 {sample!r}", 900))
+            else:
+                log(f"probe:{name}_file", "no_new_data", detail=_clip(f"{full}：HTTP {st2} {e2 or ''}".strip()))
+    sw, serr = fetch_swagger(config.TPEX_SWAGGER)
+    cands = []
+    for path, methods in ((sw or {}).get("paths") or {}).items():
+        for m in (methods or {}).values():
+            if isinstance(m, dict):
+                text = f"{m.get('summary', '')} {m.get('description', '')}"
+                if "指數" in text and ("櫃買" in text or "OTC" in text.upper()) and ("收盤" in text or "歷史" in text or "加權" in text):
+                    cands.append((path, str(m.get("summary", ""))[:50]))
+    if sw is None:
+        log("probe:otc_swagger", "no_new_data", detail=_clip(f"櫃買中心說明文件抓不到：{serr}"))
+    else:
+        log("probe:otc_swagger", "success", detail=_clip(f"{len((sw or {}).get('paths') or {})} 個端點；含「櫃買指數收盤／歷史」字樣的 {len(cands)} 個：" + " ## ".join(f"{p}｜{s}" for p, s in cands[:15]), 1400))
+        for path, _s in [c for c in cands if "櫃買指數" in c[1] or "櫃買指數" in c[0]][:2] or cands[:1]:
+            obj, e3 = fetch_json(config.TPEX_DEFAULT_BASE + path, headers=hdr)
+            time.sleep(1)
+            log("probe:otc_endpoint", "success" if obj else "no_new_data", detail=_clip(f"{path}：" + (_obj_shape(obj) if obj else f"抓不到（{e3}）"), 900))
+    st4, ct4, b4, e4 = fetch_raw("https://query1.finance.yahoo.com/v8/finance/chart/%5ETWOII?range=3mo&interval=1d", timeout=config.PROBE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
+    pts = None
+    if st4 == 200 and b4:
+        try:
+            pts = parse_yahoo_chart(json.loads(b4.decode("utf-8-sig")))
+        except (ValueError, UnicodeDecodeError):
+            pts = None
+    log("probe:otc_yahoo", "success" if pts else "no_new_data", detail=_clip(f"Yahoo ^TWOII（櫃買指數）日線：HTTP {st4}｜" + (f"{len(pts)} 筆，最近 3 筆 {pts[-3:]}" if pts else f"沒有解析出資料 {e4 or ''}")))
 
 
 def probe_chips():
@@ -5497,6 +5565,7 @@ def run_job(job, dry_run=False):
         probe_fin_coverage()
         probe_nasdaq_access()
         probe_chips()
+        probe_vix_otc()
     if job == "us_probe":
         probe_earnings()
         probe_round3()
