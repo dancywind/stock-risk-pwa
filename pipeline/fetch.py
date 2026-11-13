@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v84"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v85"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1039,10 +1039,15 @@ def probe_dashboard():
     def_re = re.compile(r"(?<![\w$.])((?:const|let|var)\s+)?([A-Za-z_$][\w$]*(?:API|Api|BASE|Base|HOST|Host|ORIGIN|Origin)[\w$]*)\s*=\s*([^;\n]{1,140})")
 
     snips = []                                                                                                      # 指定名稱（TPEX_API、TWSE_API、ApiPath）後面 260 個字原文：壓縮過的程式碼會把好幾個定義黏成一長串，上面那種只取 140 字會被截斷
-    snip_re = re.compile(r"(?:TPEX_API|TWSE_API|class\s+ApiPath|function\s+ApiPath|ApiPath\s*=|new\s+ApiPath)[^\n]{0,260}")
+    snip_re = re.compile(r"(?:TPEX_API|TWSE_API|ApiPath\s*=|new\s+ApiPath)[^\n]{0,150}")
+    cls_re = re.compile(r"(?:class|function)\s+ApiPath[^\n]{0,520}")                                               # ApiPath 這個類別的完整定義（它決定網址怎麼組；上一版和其他片段擠在一起被截斷）
+    apicls = []
     assign_re = re.compile(r"(?:TPEX_API|TWSE_API)\s*=(?!=)[^\n]{0,240}")                                       # 「賦值」那一段（用到的地方很多，會把名額用完，所以另外抓）
 
     def collect(text):
+        for m in cls_re.finditer(text):
+            if len(apicls) < 2 and m.group(0) not in apicls:
+                apicls.append(m.group(0))
         for m in assign_re.finditer(text):
             if len(snips) < 8 and m.group(0) not in snips:
                 snips.insert(0, m.group(0))
@@ -1071,7 +1076,7 @@ def probe_dashboard():
                 visited.add(sub)
                 inspect_page(sub, "subpage")
     if consts or endpoints:
-        probe_dashboard_data(consts, endpoints, defs, snips)
+        probe_dashboard_data(consts, endpoints, defs, snips, apicls)
 
 
 def _shape(j, depth=0):
@@ -1087,23 +1092,24 @@ def _shape(j, depth=0):
     return repr(j)[:40]
 
 
-def probe_dashboard_data(consts, endpoints, defs=None, snips=None):
+def probe_dashboard_data(consts, endpoints, defs=None, snips=None, apicls=None):
     """只讀探測：儀表板頁面的程式讀的資料端點，真的抓一次，記回傳的結構（有沒有擔保維持率、有幾天的歷史）。"""
     log("probe:dashboard_consts", "success", detail=_clip("API 基底網址常數：" + (" ; ".join(f"{k} = {v}" for k, v in list(consts.items())[:12]) or "沒找到") + f"｜端點 {len(endpoints)} 個：" + " ; ".join(endpoints[:14])))
     log("probe:dashboard_defs", "success", detail=_clip("名稱含 API／BASE／HOST 的定義（原文）：" + (" ## ".join(defs or []) or "沒找到")))
+    log("probe:dashboard_apipath", "success", detail=_clip("ApiPath 類別的完整定義：" + (" ## ".join(apicls or []) or "沒找到"), 1200))
     log("probe:dashboard_snips", "success", detail=_clip("TPEX_API／TWSE_API／ApiPath 後面的原文：" + (" ## ".join(snips or []) or "沒找到"), 1800))
     bases = [v for v in consts.values() if v.startswith(("http://", "https://", "//"))]
     for ep in endpoints[: config.DASHBOARD_MAX_ENDPOINTS]:
         want = "tpex|otc" if ep.startswith("/dashboardOtc") else "twse|tse"
         pick = [v for k, v in consts.items() if re.search(want, k, re.I) and v.startswith(("http", "//"))] or bases
         if not pick and not ep.startswith("/dashboardOtc"):
-            pick = [config.TWSE_RWD_BASE]                                                                   # 頁面程式 new ApiPath("/rwd", lan)：證交所的路徑是 /rwd/zh/…；網址後面再加 ?response=json
+            pick = [config.TWSE_RWD_BASE.rsplit("/", 1)[0] + "/" + seg if seg else config.TWSE_RWD_BASE.rsplit("/", 1)[0] for seg in ("zh", "any", "en", "")]       # 頁面程式 new ApiPath("/rwd", lan)：語言段可能是 zh、any、en 或沒有，依序試；網址後面再加 ?response=json
         if not pick:
             log("probe:dashboard_api", "no_new_data", detail=_clip(f"{ep}：找不到 API 基底網址，沒抓"))
             continue
-        for base in pick[:2]:
+        for base in pick[:4]:
             base = ("https:" + base) if base.startswith("//") else base
-            url = base.rstrip("/") + ep + ("?response=json" if base == config.TWSE_RWD_BASE and "?" not in ep else "")             # 只有用 /rwd/zh 這個基底時才補（頁面程式就是這樣組的）
+            url = base.rstrip("/") + ep + ("?response=json" if base.startswith(config.TWSE_RWD_BASE.rsplit("/", 1)[0]) and "?" not in ep else "")             # 只有用 /rwd/zh 這個基底時才補（頁面程式就是這樣組的）
             st, ct, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=dict(DASH_HEADERS, **{"Referer": "https://www.twse.com.tw/dashboard/zh/credit/margin.html", "Accept": "application/json, text/plain, */*"}))
             if st != 200:
                 log("probe:dashboard_api", "no_new_data", detail=_clip(f"{url}：HTTP {st}；{err}"))

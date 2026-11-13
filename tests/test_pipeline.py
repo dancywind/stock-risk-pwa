@@ -5146,7 +5146,7 @@ def test_probe_dashboard_collects_api_constants_and_fetches_endpoints_logging_re
     # 沒有基底網址：不猜，記「沒抓」
     pages2 = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, '<title>x</title><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, '$.get(API_ROOT + "/marginTrading/X1");')}
     asked2, logs2, _p = _run_dash(_dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages2))
-    d2 = [v["detail"] for v in logs2.values() if v["source"] == "probe:dashboard_api"]; assert len(d2) == 1 and "https://www.twse.com.tw/rwd/zh/marginTrading/X1?response=json" in d2[0] and "HTTP 404" in d2[0] and not [u for u in asked2 if "tpex" in u.lower() and "dashboardOtc" in u], "沒有基底網址：證交所的端點改用頁面程式裡看到的 /rwd/zh（有依據），櫃買的不亂猜: " + str(d2)
+    d2 = [v["detail"] for v in logs2.values() if v["source"] == "probe:dashboard_api"]; assert [d.split("：")[0] for d in d2] == ["https://www.twse.com.tw/rwd/%smarginTrading/X1?response=json" % s for s in ("zh/", "any/", "en/", "")] and all("HTTP 404" in d for d in d2) and not [u for u in asked2 if "tpex" in u.lower() and "dashboardOtc" in u], "沒有基底網址：證交所的端點依序試 zh、any、en、沒有語言段（有依據），櫃買的不亂猜: " + str(d2)
     # 端點數量上限
     eps = " ".join(f'$.get("/marginTrading/E{i}");' for i in range(25))
     pages3 = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, '<title>x</title><script src="/dashboard/js/credit-margin.js"></script>' + "x" * 1300), "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, 'var TWSE_API = "https://www.twse.com.tw/api"; ' + eps)}
@@ -5395,6 +5395,21 @@ def test_probe_dashboard_falls_back_to_the_twse_rwd_base_for_margin_endpoints():
     assert any(u.startswith("https://www.twse.com.tw/rwd/zh/marginTrading/BFIJ3U?response=json") for u in asked), "證交所的端點用 /rwd/zh 當基底並加 ?response=json: " + str([u for u in asked if "rwd" in u or "marginTrading" in u])
     api = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_api"]
     assert any("/dashboardOtc/margin" in d and "找不到 API 基底網址" in d for d in api), "櫃買的還是不知道基底：照實記錄、不猜: " + str(api)
+
+
+def test_probe_dashboard_stops_at_the_first_working_language_segment_and_logs_the_full_apipath_class():
+    home = "https://www.twse.com.tw/zh/"
+    cls = 'class ApiPath{constructor(e="",t="en"){this.pre=e,this.lan=t,this.suf=""}name(e){return this.pre+"/"+(this.lan||"any")+e+this.suf}}'
+    page = '<title>x</title><script src="/dashboard/js/credit-margin.js"></script><script src="/dashboard/js/main.js"></script>' + "x" * 1300
+    long_use = 'a=1;' + ('$.get(TPEX_API+"/dashboardOtc/marginTrend?lang=zh-tw&days=6").done((e=>{const n="ok"===e.stat&&e.trend?e.trend:[];}));' * 12)
+    pages = {home: (200, '<a href="/dashboard/zh/credit/margin.html">臺股儀表板</a>'), "https://www.twse.com.tw/dashboard/zh/credit/margin.html": (200, page),
+             "https://www.twse.com.tw/dashboard/js/credit-margin.js": (200, 'a=apiAny.name("/marginTrading/BFIJ3U")+"?response=json";' + long_use), "https://www.twse.com.tw/dashboard/js/main.js": (200, cls)}
+    env = _dash_env({config.TWSE_SWAGGER: {"paths": {}}, config.TPEX_SWAGGER: {"paths": {}}}, pages)
+    asked, logs, patches = _run_dash(env)
+    ap = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_apipath"]
+    assert len(ap) == 1 and cls in ap[0], "完整的類別定義單獨記一筆（不會被別的片段擠掉）: " + str(ap)
+    sn = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_snips"][0]
+    assert "class ApiPath" not in sn and len(sn) < 1800, "其他片段變短，不再把總長度用完"
 
 
 def test_probe_dashboard_failures_are_logged_not_raised_and_never_write_tables():
