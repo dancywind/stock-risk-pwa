@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v85"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v86"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4601,6 +4601,57 @@ def yahoo_fill():
     return out
 
 
+def tw_keep_rate():
+    """模組 M38：證交所臺股儀表板的「全市場擔保維持率」（官方，每日）。
+    來源（探測 tw_probe 確認過的 API）：…/rwd/zh/marginTrading/BFIJ3U（最新一天）與 BFIJ3U_TREND（最近幾天）。
+    欄位 keepRate 就是維持率（%）；其他欄位（crdAmt、belowAccNum、callAccNum、callAmt、exeAccNum、exeAmt、marginAccNum、marginAccRate）
+    這裡只原樣存起來，還沒確認每個欄位的白話意思，所以畫面上不顯示、也不拿來判斷。
+    每一天都要驗證：日期是 YYYYMMDD、不在未來、維持率是 KEEP_RATE_RANGE 內的數字，否則略過那一天。stat 不是 OK（例如假日）就記「沒有新資料」。"""
+    base = config.TWSE_RWD_BASE + "/marginTrading"
+    cur, err1 = fetch_json(base + "/BFIJ3U?response=json", headers=DASH_HEADERS)
+    trend, err2 = fetch_json(base + f"/BFIJ3U_TREND?response=json&days={config.KEEP_RATE_DAYS}", headers=DASH_HEADERS)
+    if cur is None and trend is None:
+        log("tw_keep_rate", "failure", detail=_clip(f"證交所儀表板（全市場擔保維持率）抓取失敗：{err1}；{err2}"))
+        return []
+    low, high = config.KEEP_RATE_RANGE
+    today, rows, skipped = date.today(), {}, 0
+
+    def take(rec):
+        nonlocal skipped
+        try:
+            d_ = datetime.strptime(str(rec.get("date")), "%Y%m%d").date()
+        except (ValueError, TypeError):
+            skipped += 1
+            return
+        kr = parse_number(rec.get("keepRate"))
+        if d_ > today or kr is None or not (low <= kr <= high):
+            skipped += 1
+            return
+        num = lambda k: parse_number(rec.get(k))
+        rows[d_.isoformat()] = {"as_of": d_.isoformat(), "keep_rate": kr, "credit_amt": num("crdAmt"), "below_acc": num("belowAccNum"), "call_acc": num("callAccNum"), "call_amt": num("callAmt"),
+                                "exe_acc": num("exeAccNum"), "exe_amt": num("exeAmt"), "margin_acc": num("marginAccNum"), "margin_acc_rate": num("marginAccRate"), "source": "TWSE 臺股儀表板 BFIJ3U"}
+    stat_bad = []
+    for name, obj, is_list in (("BFIJ3U_TREND", trend, True), ("BFIJ3U", cur, False)):                      # 趨勢先放、最新一天後放（同一天以最新一天為準）
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("stat") != "OK":
+            stat_bad.append(f"{name} stat={obj.get('stat')}")
+            continue
+        if is_list:
+            for rec in (obj.get("data") or []):
+                if isinstance(rec, dict):
+                    take(rec)
+        else:
+            take(dict(obj))
+    out = [rows[k] for k in sorted(rows)]
+    if not out:
+        log("tw_keep_rate", "no_new_data", detail=_clip("沒有可用的維持率資料" + (f"（{'；'.join(stat_bad)}）" if stat_bad else "") + (f"；略過 {skipped} 筆格式或範圍不符的" if skipped else "")))
+        return []
+    last = out[-1]
+    log("tw_keep_rate", "success", as_of=last["as_of"], detail=_clip(f"全市場擔保維持率 {last['keep_rate']:.2f}%（{last['as_of']}）；共 {len(out)} 天（{out[0]['as_of']} 到 {last['as_of']}）" + (f"；略過 {skipped} 筆不符的" if skipped else "")))
+    return out
+
+
 def twd_fred_history():
     """模組 M37：把 FRED 的美元兌台幣（DEXTAUS）每日收盤歷史（約 TWD_HISTORY_DAYS 天）寫進 twd_rates（layer 3、kind official_close、is_close_history = true，和每天更新的那一筆同一種列）。
     為什麼要：每天的更新只存「FRED 當下最新的一筆」，而 FRED 的台幣大約每週才更新一次，所以資料庫裡的台幣收盤很稀疏，算不出「連續回落幾天」，也沒辦法和 Yahoo 核對。
@@ -5357,6 +5408,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
+            extra.append(("tw_keep_rate", _run_module("M38", "臺股儀表板：全市場擔保維持率（官方）", tw_keep_rate) or [], "as_of,source"))
             twd_hist = _run_module("M37", "美元兌台幣每日歷史（FRED）", twd_fred_history) or []
             extra.append(("twd_rates", twd_hist, "layer,source,as_of"))
             extra.append(("twd_rates", _run_module("M36", "Yahoo 補美元兌台幣落後的天數（非官方）", yahoo_twd_fill, twd_hist) or [], "layer,source,as_of"))

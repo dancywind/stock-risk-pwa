@@ -64,6 +64,8 @@ US_LONG_SERIES = ("SP500", "NASDAQCOM")        # 美股歷史對照用的長期�
 US_LONG_YEARS = 10                           # FRED 的 SP500 只提供近 10 年；NASDAQCOM 可以更長，這裡也取 10 年，兩邊口徑一致
 TWD_FRED_SERIES = "DEXTAUS"
 TWSE_RWD_BASE = "https://www.twse.com.tw/rwd/zh"   # 臺股儀表板頁面程式的 API 前綴（ApiPath("/rwd", lan)）
+KEEP_RATE_DAYS = 30                         # 全市場擔保維持率：向儀表板要最近幾天（伺服器不支援時只會回 5 天，也沒關係，每天累積）
+KEEP_RATE_RANGE = (60.0, 400.0)             # 全市場擔保維持率的合理範圍（%）
 TWD_HISTORY_DAYS = 400                      # 台幣每日收盤歷史回補的天數
 TWD_RANGE = (20.0, 45.0)  # 美元兌台幣合理範圍
 
@@ -173,7 +175,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v85"
+PIPELINE_VERSION = "v86"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

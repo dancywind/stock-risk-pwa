@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -5395,6 +5395,65 @@ def test_probe_dashboard_falls_back_to_the_twse_rwd_base_for_margin_endpoints():
     assert any(u.startswith("https://www.twse.com.tw/rwd/zh/marginTrading/BFIJ3U?response=json") for u in asked), "證交所的端點用 /rwd/zh 當基底並加 ?response=json: " + str([u for u in asked if "rwd" in u or "marginTrading" in u])
     api = [v["detail"] for v in logs.values() if v["source"] == "probe:dashboard_api"]
     assert any("/dashboardOtc/margin" in d and "找不到 API 基底網址" in d for d in api), "櫃買的還是不知道基底：照實記錄、不猜: " + str(api)
+
+
+def _keep_rec(n, kr, **kw):
+    d_ = (date.today() - timedelta(days=n)).strftime("%Y%m%d")
+    r = {"date": d_, "crdAmt": 142552753320, "keepRate": kr, "belowAccNum": 3382, "callAccNum": 3085, "callAmt": 3806099400, "exeAccNum": 171, "exeAmt": 516535190, "marginAccNum": 85123, "marginAccRate": 0.31}
+    r.update(kw); return r
+
+
+def _with_keep(cur, trend):
+    seen = []
+    def fj(url, headers=None, timeout=None):
+        seen.append(url)
+        if "BFIJ3U_TREND" in url: return trend if isinstance(trend, tuple) else (trend, "")
+        return cur if isinstance(cur, tuple) else (cur, "")
+    with mock.patch.object(fetch, "fetch_json", side_effect=fj):
+        rows = REAL["tw_keep_rate"]()
+    return rows, seen
+
+
+def test_tw_keep_rate_reads_the_official_dashboard_api_validates_each_day_and_prefers_the_latest_call():
+    reset()
+    trend = {"stat": "OK", "days": 5, "data": [_keep_rec(6, 158.05), _keep_rec(5, 160.5), _keep_rec(4, 165.2), _keep_rec(3, 170.0), _keep_rec(2, 171.0)]}
+    cur = dict(_keep_rec(2, 173.99, crdAmt=128232305040, belowAccNum=238, callAccNum=102, callAmt=89224800, exeAccNum=56, exeAmt=29619157, marginAccNum=71213, marginAccRate=0.26), stat="OK")
+    rows, seen = _with_keep((cur, ""), (trend, ""))
+    assert [r["keep_rate"] for r in rows] == [158.05, 160.5, 165.2, 170.0, 173.99], "由舊到新；同一天以最新一天的呼叫為準（171.0 被 173.99 蓋掉）: " + str([r["keep_rate"] for r in rows])
+    assert seen[0].startswith(config.TWSE_RWD_BASE + "/marginTrading/BFIJ3U?response=json") and "BFIJ3U_TREND?response=json&days=%d" % config.KEEP_RATE_DAYS in seen[1], seen
+    last = rows[-1]; assert last["credit_amt"] == 128232305040 and last["below_acc"] == 238 and last["call_acc"] == 102 and last["call_amt"] == 89224800 and last["exe_acc"] == 56 and last["exe_amt"] == 29619157 and last["margin_acc"] == 71213 and last["margin_acc_rate"] == 0.26 and last["source"] == "TWSE 臺股儀表板 BFIJ3U", last
+    assert last["as_of"] == (date.today() - timedelta(days=2)).isoformat() and all(set(r) == set(last) for r in rows), "日期轉成 ISO、欄位一致"
+    lg = [x for x in fetch.LOG if x["source"] == "tw_keep_rate"][0]; assert lg["status"] == "success" and "全市場擔保維持率 173.99%" in lg["detail"] and "共 5 天" in lg["detail"], lg["detail"]
+    # 每一天都驗證：未來日期、範圍外、非數字、壞日期、空值都略過（並記下略過幾筆）
+    reset(); bad = {"stat": "OK", "data": [_keep_rec(3, 160.0), _keep_rec(-2, 170.0), _keep_rec(2, 5.0), _keep_rec(2, 999.0), _keep_rec(2, "壞"), _keep_rec(2, None), dict(_keep_rec(2, 165.0), date="2026-13-45"), "不是字典", _keep_rec(1, 168.0)]}
+    rows, _s = _with_keep((None, "x"), (bad, "")); assert [r["keep_rate"] for r in rows] == [160.0, 168.0], [r["keep_rate"] for r in rows]
+    assert "略過 6 筆不符的" in [x for x in fetch.LOG if x["source"] == "tw_keep_rate"][0]["detail"], fetch.LOG[-1]["detail"]
+    # 趨勢抓不到、只有最新一天：照樣收
+    reset(); rows, _s = _with_keep((cur, ""), (None, "HTTP 503")); assert len(rows) == 1 and rows[0]["keep_rate"] == 173.99 and fetch.LOG[-1]["status"] == "success"
+    # stat 不是 OK（例如休市）：沒有新資料，不算壞掉
+    reset(); rows, _s = _with_keep(({"stat": "很抱歉，沒有符合條件的資料!"}, ""), ({"stat": "很抱歉，沒有符合條件的資料!", "data": []}, "")); assert rows == [] and fetch.LOG[-1]["status"] == "no_new_data" and "BFIJ3U stat=" in fetch.LOG[-1]["detail"]
+    # 兩個都抓不到：failure（要看得到）
+    reset(); rows, _s = _with_keep((None, "HTTP 403"), (None, "逾時")); assert rows == [] and fetch.LOG[-1]["status"] == "failure" and "HTTP 403" in fetch.LOG[-1]["detail"] and "逾時" in fetch.LOG[-1]["detail"]
+    # 非預期的格式（不是 dict／data 不是 list）不丟例外
+    reset(); rows, _s = _with_keep((["x"], ""), ({"stat": "OK", "data": "壞"}, "")); assert rows == [] and fetch.LOG[-1]["status"] == "no_new_data"
+
+
+def test_run_job_tw_close_persists_keep_rate_rows_and_isolates_a_crash():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    rows_ = [{"as_of": "2026-11-12", "keep_rate": 173.99, "credit_amt": 1.0, "below_acc": 1, "call_acc": 1, "call_amt": 1.0, "exe_acc": 1, "exe_amt": 1.0, "margin_acc": 1, "margin_acc_rate": 0.26, "source": "TWSE 臺股儀表板 BFIJ3U"}]
+    def go(**kw):
+        got = []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "tw_keep_rate", **kw), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
+        for p_ in ps: p_.start()
+        try:
+            fetch.run_job("tw_close", dry_run=False)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go(return_value=rows_); assert ("tw_keep_rate", rows_, "as_of,source") in tables and st["module:M38"] == "success"
+    reset(); tables, st = go(side_effect=RuntimeError("boom")); assert st["module:M38"] == "failure" and ("tw_keep_rate", rows_, "as_of,source") not in tables and "module:M27" in st
 
 
 def test_probe_dashboard_stops_at_the_first_working_language_segment_and_logs_the_full_apipath_class():
