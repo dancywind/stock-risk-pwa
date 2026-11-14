@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "cboe_pc_csv_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength", "stock_risk_stats", "tw_breadth_long_backfill", "tw_margin_ratio_backfill", "aaii_csv_import")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "cboe_pc_csv_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength", "stock_risk_stats", "tw_breadth_long_backfill", "tw_margin_ratio_backfill", "aaii_csv_import", "tw_retail_ratio_backfill")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -6751,3 +6751,18 @@ def test_parse_aaii_csv_accepts_fractions_percent_and_skips_bad_rows():
     rows, sk = fetch.parse_aaii_csv(txt)
     assert [r["as_of"] for r in rows] == ["2026-11-05", "2026-10-29"] and rows[0]["bullish"] == 38.0 and rows[1]["bearish"] == 30.0 and sk == 3, (rows, sk)
     assert fetch.parse_aaii_csv("a,b\n1,2")[0] == []
+
+
+def test_tw_retail_ratio_backfill_computes_per_day_and_stops_on_bad_format():
+    reset()
+    inv = "日期,商品名稱,身份別,多方交易口數,多方未平倉口數,多方未平倉契約金額,空方未平倉口數\n" + "".join(f"2026/11/12,小型臺指期貨,{n},1,{l},5,{s}\n" for n, l, s in (("自營商", 100, 300), ("投信", 0, 0), ("外資及陸資", 1000, 2600)))
+    fut = "交易日期,契約,到期月份(週別),未沖銷契約數,交易時段\n2026/11/12,MTX,202611,10000,一般\n2026/11/12,MTX,202611W2,999,一般\n"
+    i, f_, why = fetch.parse_taifex_hist_rows(inv, fut); assert why == "" and len(i) == 3 and len(f_) == 2
+    def raw(url, **k): return 200, "text/csv", (inv if "futContracts" in url else fut).encode("cp950"), ""
+    with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_raw", raw), mock.patch.object(fetch.time, "sleep", lambda s: None), mock.patch.object(fetch.config, "RR_BACKFILL_MONTHS", 1), mock.patch.object(fetch, "validate_close_date", lambda d: (True, "")):
+        out = REAL["tw_retail_ratio_backfill"]()
+    assert len(out) == 1 and out[0]["as_of"] == "2026-11-12" and out[0]["inst_long"] == 1100 and out[0]["inst_short"] == 2900 and out[0]["ratio"] == 18.0, out
+    reset()
+    with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (200, "", "亂,碼\n1,2".encode(), "")), mock.patch.object(fetch.time, "sleep", lambda s: None):
+        assert REAL["tw_retail_ratio_backfill"]() == []
+    assert "欄位不符" in [x for x in fetch.LOG if x["source"] == "rr_backfill"][0]["detail"]

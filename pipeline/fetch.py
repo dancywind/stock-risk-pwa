@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v98"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v99"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1011,6 +1011,84 @@ def aaii_csv_import():
     log("aaii_csv", "success" if rows else "failure", as_of=rows[0]["as_of"] if rows else None,
         detail=_clip(f"讀到 {len(rows)} 週" + (f"（{rows[-1]['as_of']} 到 {rows[0]['as_of']}）" if rows else "：找不到 Date、Bullish、Neutral、Bearish 這幾欄，或全部驗證不過") + f"；略過 {skipped} 列"))
     return rows
+
+
+def _decode_tw_csv(body):
+    for enc in ("utf-8-sig", "cp950"):
+        try:
+            return body.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return body.decode("utf-8", errors="replace")
+
+
+def parse_taifex_hist_rows(inv_text, fut_text):
+    """期交所歷史下載（CSV）→ 轉成和 OpenAPI 同樣格式的列，讓 compute_retail_ratio 直接用。欄位用標題找，不用位置：
+    法人檔要有「日期、商品名稱、身份別」與「多方…未平倉…口數」「空方…未平倉…口數」；行情檔要有「交易日期、契約、到期月份、未沖銷契約數、交易時段」。
+    欄位對不上回傳 (None, None, 原因)。"""
+    import csv as _csv, io as _io
+    def table(text):
+        rows = [[c.strip() for c in r] for r in _csv.reader(_io.StringIO(text.lstrip("\ufeff"))) if any(c.strip() for c in r)]
+        return (rows[0], rows[1:]) if rows else ([], [])
+    h1, r1 = table(inv_text)
+    def col(h, *need, bad=("金額", "淨額")):
+        for i, c in enumerate(h):
+            if all(n in c for n in need) and not any(b in c for b in bad):
+                return i
+        return None
+    i_d, i_n, i_i = col(h1, "日期"), col(h1, "商品名稱"), col(h1, "身份別")
+    i_l, i_s = col(h1, "多方", "未平倉", "口數"), col(h1, "空方", "未平倉", "口數")
+    if None in (i_d, i_n, i_i, i_l, i_s):
+        return None, None, f"法人檔欄位不符：{h1[:12]}"
+    inv = [{"Date": re.sub(r"\D", "", r[i_d]), "ContractCode": r[i_n].replace("台", "臺"), "Item": r[i_i], "OpenInterest(Long)": r[i_l].replace(",", ""), "OpenInterest(Short)": r[i_s].replace(",", "")} for r in r1 if len(r) > max(i_d, i_n, i_i, i_l, i_s)]
+    h2, r2 = table(fut_text)
+    j_d, j_c, j_m, j_o, j_s = col(h2, "交易日期"), col(h2, "契約"), col(h2, "到期月份"), col(h2, "未沖銷"), col(h2, "交易時段")
+    if None in (j_d, j_c, j_m, j_o):
+        return None, None, f"行情檔欄位不符：{h2[:12]}"
+    fut = [{"Date": re.sub(r"\D", "", r[j_d]), "Contract": r[j_c], "ContractMonth(Week)": r[j_m], "TradingSession": (r[j_s] if j_s is not None and len(r) > j_s else ""), "OpenInterest": r[j_o].replace(",", "")} for r in r2 if len(r) > max(j_d, j_c, j_m, j_o)]
+    return inv, fut, ""
+
+
+def tw_retail_ratio_backfill():
+    """模組 M49：小台指散戶多空比往前回補（期交所網站的歷史下載，CSV，一次一個月）。
+    每一天都交給和每日更新同一個 compute_retail_ratio 驗證（法人三個身份都要有、日期對得上、數字合理）。
+    歷史下載抓不到、欄位對不上就整批停止並把原因寫進紀錄，不寫任何數字。每次最多補 RR_BACKFILL_MONTHS 個月，由新到舊；已經有的日期不重補。"""
+    if not sb_ready():
+        log("rr_backfill", "skipped", detail="未設定 Supabase，不回補")
+        return []
+    have_rows, err = sb_request("GET", "tw_retail_ratio?select=as_of&order=as_of.desc&limit=2000")
+    if have_rows is None:
+        log("rr_backfill", "failure", detail=_clip(f"讀取已有的散戶多空比失敗：{err}（請先執行 new_tables_v55.sql）"))
+        return []
+    have = {r["as_of"] for r in have_rows}
+    oldest = date.today() - timedelta(days=config.HIST_WINDOW_DAYS)
+    out, first_err, months_done, end = [], "", 0, date.today()
+    while months_done < config.RR_BACKFILL_MONTHS and end >= oldest:
+        start = max(end - timedelta(days=30), oldest)
+        qs = f"queryStartDate={start.strftime('%Y/%m/%d')}&queryEndDate={end.strftime('%Y/%m/%d')}"
+        s1, c1, b1, e1 = fetch_raw(f"https://www.taifex.com.tw/cht/3/futContractsDateDown?{qs}&commodityId=MXF", timeout=config.OPTIONS_TIMEOUT, headers={"User-Agent": "risk-pwa/1.0"})
+        time.sleep(config.HIST_SLEEP)
+        s2, c2, b2, e2 = fetch_raw(f"https://www.taifex.com.tw/cht/3/dlFutDailyMarketData?{qs}&commodity_id=MTX&down_type=1", timeout=config.OPTIONS_TIMEOUT, headers={"User-Agent": "risk-pwa/1.0"})
+        time.sleep(config.HIST_SLEEP)
+        if s1 != 200 or s2 != 200 or not b1 or not b2:
+            first_err = f"歷史下載失敗：法人 HTTP {s1} {e1 or ''}；行情 HTTP {s2} {e2 or ''}".strip()
+            break
+        inv, fut, why = parse_taifex_hist_rows(_decode_tw_csv(b1), _decode_tw_csv(b2))
+        if inv is None:
+            first_err = why
+            break
+        for d in sorted({r["Date"] for r in inv if len(r["Date"]) == 8}, reverse=True):
+            iso = twse_ymd_to_iso(d)
+            if iso in have:
+                continue
+            row, w = compute_retail_ratio([r for r in inv if r["Date"] == d], [r for r in fut if r["Date"] == d])
+            if row is not None:
+                out.append(row)
+        months_done += 1
+        end = start - timedelta(days=1)
+    log("rr_backfill", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
+        detail=_clip(f"補了 {len(out)} 天（{months_done} 個月份）" + (f"；停止原因：{first_err}" if first_err else "") + ("" if out or first_err else "；沒有新的日期")))
+    return out
 
 
 def _norm_ymd(text):
@@ -6361,6 +6439,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_industry", _run_module("M17", "台股產業別", tw_industry_collect) or [], "code"))
             extra.append(("tw_breadth_hist", _run_module("M46", "上市漲跌家數長期回補（10 年）", tw_breadth_long_backfill) or [], "as_of,market"))
             extra.append(("us_aaii", _run_module("M48", "AAII 完整歷史匯入（你下載的檔案）", aaii_csv_import) or [], "as_of"))
+            extra.append(("tw_retail_ratio", _run_module("M49", "小台指散戶多空比回補（期交所歷史下載）", tw_retail_ratio_backfill) or [], "as_of"))
             extra.append(("tw_margin_ratio", _run_module("M47", "上市融資維持率估算回補", tw_margin_ratio_backfill) or [], "as_of"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
