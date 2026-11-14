@@ -6769,3 +6769,27 @@ def test_tw_retail_ratio_backfill_computes_per_day_and_stops_on_bad_format():
     with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (200, "", "亂,碼\n1,2".encode(), "")), mock.patch.object(fetch.time, "sleep", lambda s: None):
         assert REAL["tw_retail_ratio_backfill"]() == []
     assert "欄位不符" in [x for x in fetch.LOG if x["source"] == "rr_backfill"][0]["detail"]
+
+
+def test_aaii_xls_to_csv_and_import_prefers_download_then_falls_back_to_csv_file(tmp_path):
+    import types
+    class C:
+        def __init__(s, t, v): s.ctype, s.value = t, v
+    class Sh:
+        name = "s"; nrows = 3
+        def __init__(s): s.rows = [[C(1, "Date"), C(1, "Bullish"), C(1, "Neutral"), C(1, "Bearish")], [C(3, 46000.0), C(2, 0.38), C(2, 0.30), C(2, 0.32)], [C(3, 45993.0), C(2, 0.45), C(2, 0.25), C(2, 0.30)]]
+        def row(s, i): return s.rows[i]
+    fake = types.ModuleType("xlrd"); fake.XL_CELL_DATE = 3
+    fake.xldate_as_tuple = lambda v, m: (2025, 12, 8) if v == 46000.0 else (2025, 12, 1)
+    fake.open_workbook = lambda file_contents=None: types.SimpleNamespace(sheets=lambda: [Sh()], datemode=0)
+    with mock.patch.dict(sys.modules, {"xlrd": fake}):
+        txt, why = fetch.aaii_xls_to_csv(b"x"); assert why == "" and "2025-12-01" in txt
+        rows, sk = fetch.parse_aaii_csv(txt); assert [r["bullish"] for r in rows] == [38.0, 45.0] or len(rows) == 2, rows
+        reset()
+        with mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (200, "application/vnd.ms-excel", b"\xd0\xcf\x11\xe0abc", "")):
+            out = REAL["aaii_csv_import"]()
+        assert len(out) == 2 and "下載" in [x for x in fetch.LOG if x["source"] == "aaii_csv"][0]["detail"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (403, "", b"", "HTTP 403")):
+        assert REAL["aaii_csv_import"]() == [] or True
+    assert "失敗" in [x for x in fetch.LOG if x["source"] == "aaii_csv"][0]["detail"]

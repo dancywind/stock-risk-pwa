@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v100"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v101"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -995,21 +995,68 @@ def parse_aaii_csv(text):
     return out, skipped
 
 
-def aaii_csv_import():
-    """模組 M48：匯入你自己下載的 AAII 完整歷史（會員下載的 sentiment.xls，另存成 CSV，放在倉庫 data/aaii_sentiment.csv）。
-    沒有這個檔案就什麼都不做（不算錯）；有的話每次都整份驗證後寫入（主鍵是日期，重複不會多出來）。"""
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "aaii_sentiment.csv")
-    if not os.path.exists(path):
-        log("aaii_csv", "no_new_data", detail="倉庫裡沒有 data/aaii_sentiment.csv：沒有要匯入 AAII 完整歷史就可以忽略")
-        return []
+def aaii_xls_to_csv(body):
+    """AAII 官方的完整歷史 sentiment.xls（舊版 Excel）→ CSV 文字（交給 parse_aaii_csv 驗證）。要有 xlrd 套件（工作流程會安裝）。
+    在每個工作表前 30 列找含 Date、Bullish、Neutral、Bearish 的標題列；日期格是 Excel 日期就換成 YYYY-MM-DD。回傳 (csv 文字, 原因)。"""
     try:
-        with open(path, encoding="utf-8-sig", errors="replace") as fh:
-            rows, skipped = parse_aaii_csv(fh.read())
-    except OSError as e:
-        log("aaii_csv", "failure", detail=_clip(f"讀取失敗：{e}"))
-        return []
+        import xlrd
+    except ImportError:
+        return None, "沒有安裝 xlrd 套件，讀不了 .xls"
+    import csv as _csv, io as _io
+    try:
+        book = xlrd.open_workbook(file_contents=body)
+    except Exception as e:                                                        # 檔案壞掉、或其實不是 Excel（例如被擋的網頁）
+        return None, f"打不開這個 Excel 檔：{str(e)[:80]}"
+    for sh in book.sheets():
+        for hr in range(min(30, sh.nrows)):
+            head = [str(c.value).strip().lower() for c in sh.row(hr)]
+            if {"date", "bullish", "neutral", "bearish"} <= set(head):
+                buf = _io.StringIO()
+                w = _csv.writer(buf)
+                w.writerow(head)
+                for r in range(hr + 1, sh.nrows):
+                    out = []
+                    for c in sh.row(r):
+                        if c.ctype == xlrd.XL_CELL_DATE:
+                            try:
+                                y, m, d, *_ = xlrd.xldate_as_tuple(c.value, book.datemode)
+                                out.append(f"{y:04d}-{m:02d}-{d:02d}")
+                            except Exception:
+                                out.append("")
+                        else:
+                            out.append(str(c.value))
+                    w.writerow(out)
+                return buf.getvalue(), ""
+    return None, "找不到含 Date、Bullish、Neutral、Bearish 的標題列"
+
+
+def aaii_csv_import():
+    """模組 M48：AAII 完整歷史。先從 AAII 官方網址下載 sentiment.xls（本來就公開，不用會員）；下載或解析失敗，才改讀倉庫裡你放的 data/aaii_sentiment.csv。
+    兩邊都沒有就什麼都不做（不算錯）。每一列都用 parse_aaii_csv 驗證（三項合計 98–102、日期合理、不重複），寫入的主鍵是日期，重跑不會重複。"""
+    text, notes = None, []
+    st, ct, body, err = fetch_raw(config.AAII_XLS_URL, timeout=60, headers={"User-Agent": config.NASDAQ_UA, "Accept": "*/*", "Referer": "https://www.aaii.com/sentimentsurvey/sent_results"})
+    if st == 200 and body and body[:4] == b"\xd0\xcf\x11\xe0":
+        text, why = aaii_xls_to_csv(body)
+        if text is None:
+            notes.append(f"下載到了但解析失敗（{why}）")
+    else:
+        notes.append(f"下載 sentiment.xls 失敗：HTTP {st} {err or ct or ''}".strip() + ("（不是 Excel 檔）" if st == 200 else ""))
+    src = "AAII 官方 sentiment.xls（下載）"
+    if text is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "aaii_sentiment.csv")
+        if not os.path.exists(path):
+            log("aaii_csv", "no_new_data", detail=_clip("；".join(notes) + "；倉庫裡也沒有 data/aaii_sentiment.csv：只靠每週的頁面累積"))
+            return []
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                text = fh.read()
+            src = "你放在倉庫的 data/aaii_sentiment.csv"
+        except OSError as e:
+            log("aaii_csv", "failure", detail=_clip(f"讀取失敗：{e}"))
+            return []
+    rows, skipped = parse_aaii_csv(text)
     log("aaii_csv", "success" if rows else "failure", as_of=rows[0]["as_of"] if rows else None,
-        detail=_clip(f"讀到 {len(rows)} 週" + (f"（{rows[-1]['as_of']} 到 {rows[0]['as_of']}）" if rows else "：找不到 Date、Bullish、Neutral、Bearish 這幾欄，或全部驗證不過") + f"；略過 {skipped} 列"))
+        detail=_clip(f"來源：{src}；讀到 {len(rows)} 週" + (f"（{rows[-1]['as_of']} 到 {rows[0]['as_of']}）" if rows else "：找不到需要的欄位，或全部驗證不過") + f"；略過 {skipped} 列" + ("；" + "；".join(notes) if notes else "")))
     return rows
 
 
