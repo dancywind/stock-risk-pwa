@@ -4946,7 +4946,8 @@ def test_us_breadth_ndx_counts_above_50_and_200_day_averages_and_skips_doubtful_
     for i in range(96, 101): spec[i] = ("up", 260)
     ps, last = _ndx_env(spec); reset()
     rows = _with(ps, lambda: REAL["us_breadth_ndx"]())
-    assert len(rows) == 1; r = rows[0]
+    assert len(rows) > 1 and [x["as_of"] for x in rows] == sorted({x["as_of"] for x in rows}), "最後一列是最新一天，前面是用同一批歷史往前補的"; r = rows[-1]
+    assert all(x["n_ok50"] >= config.BREADTH_NDX_MIN_OK for x in rows[:-1])
     assert r["as_of"] == last.isoformat() and r["n_total"] == 101 and r["n_ok50"] == 95 and r["above50"] == 60 and r["n_ok200"] == 85 and r["above200"] == 55, r
     assert r["pct50"] == round(60 / 95 * 100, 2) == 63.16 and r["pct200"] == round(55 / 85 * 100, 2) == 64.71 and "不是 S&P 500" in r["source"]
     lg = [x for x in fetch.LOG if x["source"] == "us_breadth_ndx"][-1]; assert lg["status"] == "success" and "站上 50 日線 60 / 95 檔（63.16%）" in lg["detail"] and "抓不到 3 檔（SDM、SDN、SDO）、日期不同 2 檔（SDP、SDQ）、疑似分割 1 檔（SDR）" in lg["detail"], lg["detail"]

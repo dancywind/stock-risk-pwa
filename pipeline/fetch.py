@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v101"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v102"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3991,7 +3991,7 @@ def us_breadth_ndx():
         return []
     last = bench[-1][0]
     ok50 = ok200 = a50 = a200 = 0
-    skipped = {}
+    skipped, series = {}, []
     for sym in syms:
         pts, w_ = _nasdaq_history(sym, "stocks", config.BREADTH_NDX_DAYS)
         time.sleep(config.BREADTH_NDX_SLEEP)
@@ -4000,6 +4000,7 @@ def us_breadth_ndx():
             skipped.setdefault(why_skip, []).append(sym)
             continue
         c = [p[1] for p in pts]
+        series.append(pts)
         if len(c) >= 50:
             ok50 += 1
             a50 += 1 if c[-1] > sum(c[-50:]) / 50 else 0
@@ -4014,8 +4015,35 @@ def us_breadth_ndx():
     row = {"as_of": last.isoformat(), "n_total": len(syms), "n_ok50": ok50, "above50": a50, "n_ok200": ok200, "above200": a200, "pct50": round(a50 / ok50 * 100, 2),
            "pct200": round(a200 / ok200 * 100, 2) if ok200 >= config.BREADTH_NDX_MIN_OK else None,
            "source": "Nasdaq 官方成分股清單與歷史行情（自己計算；涵蓋 Nasdaq-100，不是 S&P 500）"}
-    log("us_breadth_ndx", "success", as_of=row["as_of"], detail=f"站上 50 日線 {a50} / {ok50} 檔（{row['pct50']}%）；站上 200 日線 {a200} / {ok200} 檔" + (f"（{row['pct200']}%）" if row["pct200"] is not None else "（有效檔數不到 80，不算比例）") + note)
-    return [row]
+    hist_rows = _ndx_breadth_history(series, last, len(syms))
+    log("us_breadth_ndx", "success", as_of=row["as_of"], detail=f"站上 50 日線 {a50} / {ok50} 檔（{row['pct50']}%）；站上 200 日線 {a200} / {ok200} 檔；同時用同一批歷史補了前 {len(hist_rows)} 天" + (f"（{row['pct200']}%）" if row["pct200"] is not None else "（有效檔數不到 80，不算比例）") + note)
+    return hist_rows + [row]
+
+
+def _ndx_breadth_history(series, last, n_total):
+    """用同一批成分股歷史（不多打請求）往前算每一天「站上 50 日線」的比例：那一天要有至少 BREADTH_NDX_MIN_OK 檔有 50 筆以上的收盤價才採用。
+    200 日線只在有效檔數夠的日子才給。回傳不含最後一天（最後一天由主程式算）的列，由舊到新。"""
+    dates = sorted({d for pts in series for d, _ in pts if d < last})
+    maps = [({d: i for i, (d, _c) in enumerate(pts)}, [c for _d, c in pts]) for pts in series]
+    out = []
+    for d in dates:
+        o50 = o200 = b50 = b200 = 0
+        for idx, c in maps:
+            i = idx.get(d)
+            if i is None:
+                continue
+            if i + 1 >= 50:
+                o50 += 1
+                b50 += 1 if c[i] > sum(c[i - 49:i + 1]) / 50 else 0
+            if i + 1 >= 200:
+                o200 += 1
+                b200 += 1 if c[i] > sum(c[i - 199:i + 1]) / 200 else 0
+        if o50 < config.BREADTH_NDX_MIN_OK:
+            continue
+        out.append({"as_of": d.isoformat(), "n_total": n_total, "n_ok50": o50, "above50": b50, "n_ok200": o200, "above200": b200, "pct50": round(b50 / o50 * 100, 2),
+                    "pct200": round(b200 / o200 * 100, 2) if o200 >= config.BREADTH_NDX_MIN_OK else None,
+                    "source": "Nasdaq 官方成分股清單與歷史行情（自己計算，往前補；涵蓋 Nasdaq-100，不是 S&P 500）"})
+    return out
 
 
 def probe_round15():
