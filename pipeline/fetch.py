@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v105"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v106"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -947,7 +947,8 @@ def tw_margin_ratio_backfill(max_days=None):
                 missing += 1
         if not units or missing / len(units) > 0.05 or not total.get("margin_balance"):
             bad += 1
-            first_err = first_err or f"{d}：{len(units)} 檔裡 {missing} 檔查不到收盤價（或融資金額缺）"
+            miss_codes = sorted((c_ for c_ in units if c_ not in close), key=lambda c_: -units[c_])[:12]
+            first_err = first_err or f"{d}：{len(units)} 檔裡 {missing} 檔查不到收盤價（或融資金額缺）；自建行情當天有 {len(close)} 檔；缺價的前幾檔（融資張數多的先列）：" + "、".join(f"{c_}({int(units[c_])}張)" for c_ in miss_codes) + f"；融資金額 {total.get('margin_balance')}"
             continue
         ratio = value / total["margin_balance"] * 100
         if not (80 <= ratio <= 400):
