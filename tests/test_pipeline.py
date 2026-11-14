@@ -1715,7 +1715,7 @@ def test_run_job_breadth_update_wiring():
 def test_workflow_has_nightly_backfill_and_serial_concurrency():
     y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
     assert '- cron: "0 20 * * *"' in y and '"0 20 * * *")  echo "job=tw_backfill"' in y
-    assert "concurrency:" in y and "cancel-in-progress: false" in y and "timeout-minutes: 90" in y
+    assert "concurrency:" in y and "cancel-in-progress: false" in y and "timeout-minutes: 60" in y
 
 
 # ---------------------------------------------------------------- 台幣：FRED 落後時另存較新的即期參考價
@@ -3810,10 +3810,10 @@ def test_run_job_tw_backfill_persists_long_index_history_and_isolates_m24():
                   mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
         for p_ in patches: p_.start()
         try:
-            fetch.run_job("tw_backfill", dry_run=False)
+            fetch.run_job("tw_backfill", dry_run=False); fetch.run_job("tw_backfill2", dry_run=False)
         finally:
             for p_ in patches: p_.stop()
-        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+        return [t for g in got for t in g], {x["source"]: x["status"] for x in fetch.LOG}
     tables, st = go()
     assert ("market_stats", [row], "market,as_of,source") in tables and st["module:M24"] == "success"
     reset(); tables, st = go(side_effect=RuntimeError("boom"))
@@ -4136,10 +4136,10 @@ def test_run_job_tw_backfill_persists_us_index_long_history_and_isolates_a_crash
                   mock.patch.object(fetch, "us_index_long_history", **kw), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
         for p_ in patches: p_.start()
         try:
-            fetch.run_job("tw_backfill", dry_run=False)
+            fetch.run_job("tw_backfill", dry_run=False); fetch.run_job("tw_backfill2", dry_run=False)
         finally:
             for p_ in patches: p_.stop()
-        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+        return [t for g in got for t in g], {x["source"]: x["status"] for x in fetch.LOG}
     tables, st = go(return_value=long_rows)
     assert ("macro_series", long_rows, "series_id,as_of") in tables and st["module:M35"] == "success", "寫進 macro_series，主鍵是 series_id,as_of"
     reset(); tables, st = go(side_effect=RuntimeError("boom"))
@@ -5941,10 +5941,13 @@ def test_run_job_tw_backfill_runs_history_modules_and_persists_institutional_row
         mock.patch.object(fetch, "persist_extra", side_effect=lambda dry, tables: got.append((dry, [(n, rows_, c) for n, rows_, c in tables])))]
     for p_ in patches: p_.start()
     try:
-        fetch.run_job("tw_backfill", dry_run=False)
+        fetch.run_job("tw_backfill", dry_run=False); fetch.run_job("tw_backfill2", dry_run=False)
         st = {x["source"]: x["status"] for x in fetch.LOG}
         assert st["module:M12"] == "success" and st["module:M13"] == "success"
-        tables = dict((n, (r, c)) for n, r, c in got[0][1])
+        tables = {}
+        for g_ in got:
+            for n_, r_, c_ in g_[1]:
+                if r_ or n_ not in tables: tables[n_] = (r_, c_)
         assert tables["tw_institutional"] == ([row], "as_of,source"), "外資歷史要寫進 tw_institutional，用 (as_of, source) 去重"
         assert tables["us_putcall"][1] == "as_of" and tables["us_putcall"][0][0]["total_pc"] == 0.9 and st["module:M14"] == "success", "Put/Call 歷史要寫進 us_putcall，用 as_of 去重"
         got.clear(); fetch.LOG.clear()
@@ -6232,7 +6235,7 @@ def test_run_job_wires_exright_history_and_industry_modules_with_isolation():
     reset(); tables, st = go("tw_close", False, hist={"side_effect": RuntimeError("boom")})
     assert st["module:M16"] == "failure" and st["module:M08"] in ("success", "no_new_data"), "歷史除權息壞了不影響其他模組"
     reset(); tables, st = go("tw_backfill", False, indfn={"side_effect": RuntimeError("boom")})
-    assert st["module:M17"] == "failure" and "module:M12" in st and "module:M14" in st, "產業別壞了不影響夜間的其他模組"
+    assert st["module:M17"] == "failure" and "module:M12" in st, "產業別壞了不影響夜間的其他模組"
 
 
 def test_probe_round6_logs_listed_industry_otc_paths_prepost_and_history_without_writing():
@@ -6481,7 +6484,7 @@ def test_run_job_tw_backfill_persists_margin_history_and_isolates_m19():
                   mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, tables: got.append([(n, r, c) for n, r, c in tables]))]
         for p_ in patches: p_.start()
         try:
-            fetch.run_job("tw_backfill", dry_run=False)
+            fetch.run_job("tw_backfill", dry_run=False); fetch.run_job("tw_backfill2", dry_run=False)
         finally:
             for p_ in patches: p_.stop()
         return got[0], {x["source"]: x["status"] for x in fetch.LOG}

@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v99"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v100"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -6371,12 +6371,13 @@ def run_job(job, dry_run=False):
         if not dry_run:
             _run_module("M13", "漲跌家數歷史（自建）", tw_breadth_hist_compute)
             inst_hist = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
-            pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
             margin_hist = _run_module("M19", "上市融資餘額歷史回補", tw_margin_backfill) or []
-            pc_rows = (pc_rows or []) + (_run_module("M44", "Put/Call 舊版歷史檔（CBOE totalpc.csv）", cboe_pc_csv_history) or [])
-            margin_hist = margin_hist + (_run_module("M43", "上市融資餘額長期回補（10 年）", tw_margin_long_backfill) or [])
-            index_long = _run_module("M24", "加權指數長期歷史回補", tw_index_long_history) or []
-            us_long = _run_module("M35", "美股指數長期歷史（標普 500、Nasdaq 綜合，FRED）", us_index_long_history) or []
+    if job == "tw_backfill2" and not dry_run:                                                     # 長回補另開一個工作：一個工作塞太多會超過時間上限而被取消、什麼都沒寫入
+        pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
+        pc_rows = (pc_rows or []) + (_run_module("M44", "Put/Call 舊版歷史檔（CBOE totalpc.csv）", cboe_pc_csv_history) or [])
+        margin_hist = _run_module("M43", "上市融資餘額長期回補（10 年）", tw_margin_long_backfill) or []
+        index_long = _run_module("M24", "加權指數長期歷史回補", tw_index_long_history) or []
+        us_long = _run_module("M35", "美股指數長期歷史（標普 500、Nasdaq 綜合，FRED）", us_index_long_history) or []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
         tw_breadth_update(dry_run=False, max_days=10)
@@ -6429,6 +6430,16 @@ def run_job(job, dry_run=False):
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
         extra.append(("macro_series", _run_module("M42", "費城半導體指數 SOX 歷史（Nasdaq）", sox_history) or [], "series_id,as_of"))
+    if job == "tw_backfill2":
+        extra.append(("us_putcall", pc_rows, "as_of"))
+        extra.append(("tw_margin", margin_hist, "as_of,source"))
+        extra.append(("market_stats", index_long, "market,as_of,source"))
+        extra.append(("macro_series", us_long, "series_id,as_of"))
+        if not dry_run:
+            extra.append(("tw_breadth_hist", _run_module("M46", "上市漲跌家數長期回補（10 年）", tw_breadth_long_backfill) or [], "as_of,market"))
+            extra.append(("tw_retail_ratio", _run_module("M49", "小台指散戶多空比回補（期交所歷史下載）", tw_retail_ratio_backfill) or [], "as_of"))
+            extra.append(("us_aaii", _run_module("M48", "AAII 完整歷史匯入（你下載的檔案）", aaii_csv_import) or [], "as_of"))
+            extra.append(("tw_margin_ratio", _run_module("M47", "上市融資維持率估算回補", tw_margin_ratio_backfill) or [], "as_of"))
     if job == "tw_backfill":
         extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))
@@ -6437,10 +6448,6 @@ def run_job(job, dry_run=False):
         extra.append(("macro_series", us_long, "series_id,as_of"))
         if not dry_run:
             extra.append(("tw_industry", _run_module("M17", "台股產業別", tw_industry_collect) or [], "code"))
-            extra.append(("tw_breadth_hist", _run_module("M46", "上市漲跌家數長期回補（10 年）", tw_breadth_long_backfill) or [], "as_of,market"))
-            extra.append(("us_aaii", _run_module("M48", "AAII 完整歷史匯入（你下載的檔案）", aaii_csv_import) or [], "as_of"))
-            extra.append(("tw_retail_ratio", _run_module("M49", "小台指散戶多空比回補（期交所歷史下載）", tw_retail_ratio_backfill) or [], "as_of"))
-            extra.append(("tw_margin_ratio", _run_module("M47", "上市融資維持率估算回補", tw_margin_ratio_backfill) or [], "as_of"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
         if not dry_run:

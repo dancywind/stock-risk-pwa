@@ -187,7 +187,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v99"
+PIPELINE_VERSION = "v100"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -247,7 +247,7 @@ EXRIGHT_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT48U?response=json"
 EXRIGHT_HIST_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT49U?{pa}={a}&{pb}={b}&response=json"   # 除權除息計算結果表（歷史）；參數名稱探測中
 PRICE_LIMIT = 100000.0            # 單一股價合理上限，超過視為壞資料
 
-JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill", "tw_events", "us_options")
+JOBS = ("full", "tw_close", "us_breadth", "tw_probe", "us_probe", "tw_backfill", "tw_backfill2", "tw_events", "us_options")
 
 
 def fred_key():
