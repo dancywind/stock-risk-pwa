@@ -4920,7 +4920,7 @@ def _ndx_env(spec, last=None, list_resp=None):
             pts = _series("up", last); pts[-30] = (pts[-30][0], pts[-30][1] * 3); return pts, ""
         return _series(k[0], last, k[1]), ""
     resp = list_resp if list_resp is not None else (200, "application/json", json.dumps(_ndx_json()).encode(), "")
-    return [mock.patch.object(fetch, "fetch_raw", return_value=resp), mock.patch.object(fetch, "_nasdaq_history", side_effect=hist), mock.patch.object(fetch.time, "sleep")], last
+    return [mock.patch.object(fetch, "fetch_raw", return_value=resp), mock.patch.object(fetch, "_nasdaq_history", side_effect=hist), mock.patch.object(fetch, "_nasdaq_history_long", side_effect=hist), mock.patch.object(fetch.time, "sleep")], last
 
 
 def test_parse_ndx_constituents_finds_the_list_and_validates_symbols_and_count():

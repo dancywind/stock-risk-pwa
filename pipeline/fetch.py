@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v102"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v103"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3326,6 +3326,25 @@ def _nasdaq_history(sym, assetclass="etf", days=75):
     return [(r["date"], r["close"]) for r in rows], ""
 
 
+def _nasdaq_history_long(sym, assetclass="stocks", days=3700, chunk=540):
+    """Nasdaq 一次最多回 400 筆，所以每 chunk 個日曆天（約 370 個交易日）分段往前抓，湊成長歷史。
+    第一段失敗就回傳 (None, 原因)；後面的段落失敗就用已經抓到的，不讓整檔作廢。"""
+    out, end, got, why = {}, date.today(), 0, ""
+    while got < days:
+        span = min(chunk, days - got)
+        rows, why = _nasdaq_rows(sym, assetclass, span, end=end)
+        time.sleep(config.BREADTH_NDX_SLEEP)
+        if rows is None:
+            if not out:
+                return None, why
+            break
+        for r in rows:
+            out[r["date"]] = r["close"]
+        got += span + 1
+        end = end - timedelta(days=span + 1)
+    return sorted(out.items()), ""
+
+
 def us_daily_bars():
     """模組 M34：美股 ETF（目前只有 SPY）近約 130 天的日線收盤價與成交量，給「量價成本（估算）」用。
     只收「已經收盤」的日子（美東 16:30 以前，今天那一筆是盤中的、成交量還不完整，不收）；成交量要在合理範圍；至少 60 天有成交量；最新一天不能超過 7 天前。
@@ -3993,9 +4012,9 @@ def us_breadth_ndx():
     ok50 = ok200 = a50 = a200 = 0
     skipped, series = {}, []
     for sym in syms:
-        pts, w_ = _nasdaq_history(sym, "stocks", config.BREADTH_NDX_DAYS)
+        pts, w_ = _nasdaq_history_long(sym, "stocks", config.BREADTH_NDX_HIST_DAYS)
         time.sleep(config.BREADTH_NDX_SLEEP)
-        why_skip = "抓不到" if not pts else "日期不同" if pts[-1][0] != last else "疑似分割" if any(b[1] / a[1] >= 1.5 or b[1] / a[1] <= 0.67 for a, b in zip(pts, pts[1:])) else None
+        why_skip = "抓不到" if not pts else "日期不同" if pts[-1][0] != last else "疑似分割" if any(b[1] / a[1] >= 1.5 or b[1] / a[1] <= 0.67 for a, b in zip(pts[-200:], pts[-199:])) else None   # 只看最近 200 筆；更早的分割由歷史計算自己避開
         if why_skip:
             skipped.setdefault(why_skip, []).append(sym)
             continue
@@ -4024,18 +4043,20 @@ def _ndx_breadth_history(series, last, n_total):
     """用同一批成分股歷史（不多打請求）往前算每一天「站上 50 日線」的比例：那一天要有至少 BREADTH_NDX_MIN_OK 檔有 50 筆以上的收盤價才採用。
     200 日線只在有效檔數夠的日子才給。回傳不含最後一天（最後一天由主程式算）的列，由舊到新。"""
     dates = sorted({d for pts in series for d, _ in pts if d < last})
-    maps = [({d: i for i, (d, _c) in enumerate(pts)}, [c for _d, c in pts]) for pts in series]
+    def _splits(pts):
+        return [i + 1 for i, (a_, b_) in enumerate(zip(pts, pts[1:])) if b_[1] / a_[1] >= 1.5 or b_[1] / a_[1] <= 0.67]
+    maps = [({d: i for i, (d, _c) in enumerate(pts)}, [c for _d, c in pts], _splits(pts)) for pts in series]
     out = []
     for d in dates:
         o50 = o200 = b50 = b200 = 0
-        for idx, c in maps:
+        for idx, c, sp in maps:
             i = idx.get(d)
             if i is None:
                 continue
-            if i + 1 >= 50:
+            if i + 1 >= 50 and not any(i - 49 < s <= i for s in sp):          # 50 日窗口內有疑似分割的那天，這檔不算
                 o50 += 1
                 b50 += 1 if c[i] > sum(c[i - 49:i + 1]) / 50 else 0
-            if i + 1 >= 200:
+            if i + 1 >= 200 and not any(i - 199 < s <= i for s in sp):
                 o200 += 1
                 b200 += 1 if c[i] > sum(c[i - 199:i + 1]) / 200 else 0
         if o50 < config.BREADTH_NDX_MIN_OK:
