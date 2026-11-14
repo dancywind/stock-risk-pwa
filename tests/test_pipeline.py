@@ -1715,7 +1715,7 @@ def test_run_job_breadth_update_wiring():
 def test_workflow_has_nightly_backfill_and_serial_concurrency():
     y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
     assert '- cron: "0 20 * * *"' in y and '"0 20 * * *")  echo "job=tw_backfill"' in y
-    assert "concurrency:" in y and "cancel-in-progress: false" in y and "timeout-minutes: 30" in y
+    assert "concurrency:" in y and "cancel-in-progress: false" in y and "timeout-minutes: 90" in y
 
 
 # ---------------------------------------------------------------- 台幣：FRED 落後時另存較新的即期參考價
