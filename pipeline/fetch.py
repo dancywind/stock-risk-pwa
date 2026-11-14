@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v106"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v107"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -175,6 +175,28 @@ def _fetch_raw_once(url, timeout=None, headers=None):
         return e.code, ctype, e.read()[:2000], f"HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
         return None, "", b"", _scrub(e)
+
+
+def fetch_post_raw(url, form, timeout=None, headers=None):
+    """表單 POST（期交所的歷史下載要用 POST）→ (HTTP 狀態, Content-Type, 位元組, 錯誤)。"""
+    h = _with_gzip(dict(headers or {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)"}))
+    h["Content-Type"] = "application/x-www-form-urlencoded"
+    try:
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), headers=h, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout or config.TIMEOUT_SECONDS) as resp:
+            return resp.status, resp.headers.get("Content-Type", ""), _read_body(resp), ""
+    except urllib.error.HTTPError as e:
+        return e.code, (e.headers.get("Content-Type", "") if e.headers else ""), e.read()[:2000], f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return None, "", b"", _scrub(e)
+
+
+def _html_hint(body):
+    """回傳的是網頁不是 CSV 時，抓出 <title> 和一小段文字，讓紀錄看得出是什麼頁面。"""
+    t = _decode_tw_csv(body or b"")
+    m = re.search(r"<title>(.*?)</title>", t, re.S | re.I)
+    txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(r"(?is)<(script|style).*?</\1>", " ", t)))
+    return f"標題 {m.group(1).strip()[:60] if m else '無'}；內文 {txt.strip()[:160]}"
 
 
 _NASDAQ_GUARD = {"blocked_until": 0.0, "last": None}               # Nasdaq 被擋時的「冷卻」狀態（整個執行共用）
@@ -1117,9 +1139,11 @@ def tw_retail_ratio_backfill():
     while months_done < config.RR_BACKFILL_MONTHS and end >= oldest:
         start = max(end - timedelta(days=30), oldest)
         qs = f"queryStartDate={start.strftime('%Y/%m/%d')}&queryEndDate={end.strftime('%Y/%m/%d')}"
-        s1, c1, b1, e1 = fetch_raw(f"https://www.taifex.com.tw/cht/3/futContractsDateDown?{qs}&commodityId=MXF", timeout=config.OPTIONS_TIMEOUT, headers={"User-Agent": "risk-pwa/1.0"})
+        hdr = {"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Referer": "https://www.taifex.com.tw/cht/3/futContractsDate"}
+        form = {"queryStartDate": start.strftime("%Y/%m/%d"), "queryEndDate": end.strftime("%Y/%m/%d")}
+        s1, c1, b1, e1 = fetch_post_raw("https://www.taifex.com.tw/cht/3/futContractsDateDown", dict(form, commodityId="MXF"), timeout=config.OPTIONS_TIMEOUT, headers=hdr)
         time.sleep(config.HIST_SLEEP)
-        s2, c2, b2, e2 = fetch_raw(f"https://www.taifex.com.tw/cht/3/dlFutDailyMarketData?{qs}&commodity_id=MTX&down_type=1", timeout=config.OPTIONS_TIMEOUT, headers={"User-Agent": "risk-pwa/1.0"})
+        s2, c2, b2, e2 = fetch_post_raw("https://www.taifex.com.tw/cht/3/dlFutDailyMarketData", dict(form, commodity_id="MTX", down_type="1"), timeout=config.OPTIONS_TIMEOUT, headers=dict(hdr, Referer="https://www.taifex.com.tw/cht/3/dailyFuturesMarketReport"))
         time.sleep(config.HIST_SLEEP)
         if s1 != 200 or s2 != 200 or not b1 or not b2:
             first_err = f"歷史下載失敗：法人 HTTP {s1} {e1 or ''}；行情 HTTP {s2} {e2 or ''}".strip()
@@ -1127,6 +1151,10 @@ def tw_retail_ratio_backfill():
         inv, fut, why = parse_taifex_hist_rows(_decode_tw_csv(b1), _decode_tw_csv(b2))
         if inv is None:
             first_err = why
+            if (b1 or b"")[:20].lstrip().lower().startswith((b"<!doctype", b"<html")):
+                first_err += "｜法人下載回傳網頁：" + _html_hint(b1)
+            if (b2 or b"")[:20].lstrip().lower().startswith((b"<!doctype", b"<html")):
+                first_err += "｜行情下載回傳網頁：" + _html_hint(b2)
             break
         for d in sorted({r["Date"] for r in inv if len(r["Date"]) == 8}, reverse=True):
             iso = twse_ymd_to_iso(d)

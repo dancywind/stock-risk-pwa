@@ -6762,12 +6762,12 @@ def test_tw_retail_ratio_backfill_computes_per_day_and_stops_on_bad_format():
     inv = "日期,商品名稱,身份別,多方交易口數,多方未平倉口數,多方未平倉契約金額,空方未平倉口數\n" + "".join(f"2026/11/12,小型臺指期貨,{n},1,{l},5,{s}\n" for n, l, s in (("自營商", 100, 300), ("投信", 0, 0), ("外資及陸資", 1000, 2600)))
     fut = "交易日期,契約,到期月份(週別),未沖銷契約數,交易時段\n2026/11/12,MTX,202611,10000,一般\n2026/11/12,MTX,202611W2,999,一般\n"
     i, f_, why = fetch.parse_taifex_hist_rows(inv, fut); assert why == "" and len(i) == 3 and len(f_) == 2
-    def raw(url, **k): return 200, "text/csv", (inv if "futContracts" in url else fut).encode("cp950"), ""
-    with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_raw", raw), mock.patch.object(fetch.time, "sleep", lambda s: None), mock.patch.object(fetch.config, "RR_BACKFILL_MONTHS", 1), mock.patch.object(fetch, "validate_close_date", lambda d: (True, "")):
+    def raw(url, form=None, **k): return 200, "text/csv", (inv if "futContracts" in url else fut).encode("cp950"), ""
+    with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_post_raw", raw), mock.patch.object(fetch.time, "sleep", lambda s: None), mock.patch.object(fetch.config, "RR_BACKFILL_MONTHS", 1), mock.patch.object(fetch, "validate_close_date", lambda d: (True, "")):
         out = REAL["tw_retail_ratio_backfill"]()
     assert len(out) == 1 and out[0]["as_of"] == "2026-11-12" and out[0]["inst_long"] == 1100 and out[0]["inst_short"] == 2900 and out[0]["ratio"] == 18.0, out
     reset()
-    with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (200, "", "亂,碼\n1,2".encode(), "")), mock.patch.object(fetch.time, "sleep", lambda s: None):
+    with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_post_raw", lambda *a, **k: (200, "", "亂,碼\n1,2".encode(), "")), mock.patch.object(fetch.time, "sleep", lambda s: None):
         assert REAL["tw_retail_ratio_backfill"]() == []
     assert "欄位不符" in [x for x in fetch.LOG if x["source"] == "rr_backfill"][0]["detail"]
 
