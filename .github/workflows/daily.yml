@@ -4,8 +4,9 @@ on:
     # GitHub 用 UTC。新加坡時間(SGT) = UTC+8
     - cron: "15 23 * * *"   # 07:15 SGT 完整更新（job=full）
     - cron: "35 6 * * *"    # 14:35 SGT 台股收盤後（job=tw_close）
-    - cron: "10 21 * * *"   # 05:10 SGT 美股廣度（job=us_breadth）
+    - cron: "30 22 * * *"   # 06:30 SGT 美股廣度（job=us_breadth）：美股收盤後 90 分鐘以上（冬令 05:00 SGT 收盤、夏令 04:00 SGT），Nasdaq 的日資料才確定；太早跑會只拿到前一天
     - cron: "0 20 * * *"    # 04:00 SGT 夜間自動回補台股歷史（job=tw_backfill），回補完成後幾乎不花時間
+    - cron: "0 21 * * *"    # 05:00 SGT 夜間長回補（job=tw_backfill2）：10 年歷史、維持率、散戶多空比等；和上面的回補分開，避免一個工作超過時間上限
     - cron: "30 12 * * *"   # 20:30 SGT 傍晚查台股法說會公告（job=tw_events）：公司常在收盤後才發公告
     - cron: "15 15 * * *"   # 23:15 SGT 午夜前再查一次（午夜之後每日重大訊息會換成隔天的）
     - cron: "45 12 * * 2-6" # 20:45 SGT（週二到週六）美股選擇權快照（job=us_options）：美東早上，OCC 已更新前一天的未平倉量
@@ -15,7 +16,7 @@ on:
         description: "要跑哪個工作"
         default: "full"
         type: choice
-        options: [full, tw_close, us_breadth, tw_probe, us_probe, tw_backfill, tw_events, us_options]
+        options: [full, tw_close, us_breadth, tw_probe, us_probe, tw_backfill, tw_backfill2, tw_events, us_options]
       dry_run:
         description: "只測試、不寫資料庫"
         default: false
@@ -28,7 +29,7 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -40,8 +41,9 @@ jobs:
           case "${{ github.event.schedule }}" in
             "15 23 * * *") echo "job=full" >> $GITHUB_OUTPUT ;;
             "35 6 * * *")  echo "job=tw_close" >> $GITHUB_OUTPUT ;;
-            "10 21 * * *") echo "job=us_breadth" >> $GITHUB_OUTPUT ;;
+            "30 22 * * *") echo "job=us_breadth" >> $GITHUB_OUTPUT ;;
             "0 20 * * *")  echo "job=tw_backfill" >> $GITHUB_OUTPUT ;;
+            "0 21 * * *")  echo "job=tw_backfill2" >> $GITHUB_OUTPUT ;;
             "30 12 * * *") echo "job=tw_events" >> $GITHUB_OUTPUT ;;
             "15 15 * * *") echo "job=tw_events" >> $GITHUB_OUTPUT ;;
             "45 12 * * 2-6") echo "job=us_options" >> $GITHUB_OUTPUT ;;
