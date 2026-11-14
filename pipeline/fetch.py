@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v103"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v104"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -902,7 +902,10 @@ def tw_margin_ratio_backfill(max_days=None):
         log("ratio_backfill", "no_new_data", detail=f"近 {config.HIST_WINDOW_DAYS} 天 {len(days)} 個交易日的維持率估算都已經補齊")
         return []
     out, skipped, bad, first_err, tried = [], 0, 0, "", 0
+    t0 = time.time()
     for d in todo_all[:max_days]:
+        if time.time() - t0 > config.RATIO_BACKFILL_MINUTES * 60:
+            break
         tried += 1
         data, err = fetch_json(config.TWSE_MI_MARGN_ALL + "&date=" + d.replace("-", ""))
         time.sleep(config.HIST_SLEEP)

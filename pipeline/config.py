@@ -154,7 +154,8 @@ PC_SLEEP = 1.0                    # CBOE 每次請求之間等幾秒
 BREADTH_LONG_BATCH = 250                 # 漲跌家數長期回補（M46）每次最多補幾個交易日
 BREADTH_LONG_MINUTES = 10
 RR_BACKFILL_MONTHS = 14                 # 散戶多空比回補（M49）每次最多補幾個月份
-RATIO_BACKFILL_BATCH = 60                # 融資維持率估算回補（M47）每次最多補幾個交易日
+RATIO_BACKFILL_MINUTES = 14              # 每次最多跑幾分鐘（每天約 5 秒，一次約 150 天）
+RATIO_BACKFILL_BATCH = 250                # 融資維持率估算回補（M47）每次最多補幾個交易日
 MARGIN_LONG_BATCH = 250                  # 融資長期回補（M38）每次最多補幾個交易日
 MARGIN_LONG_MINUTES = 10                 # 融資長期回補每次最多跑幾分鐘（工作上限 90 分鐘）
 MARGIN_BATCH_DAYS = 70             # 上市融資餘額歷史每次最多補幾個交易日（每天 1 次請求）
@@ -187,7 +188,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v103"
+PIPELINE_VERSION = "v104"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
