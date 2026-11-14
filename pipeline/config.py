@@ -148,7 +148,8 @@ TPEX_HIST_URLS = {
 # 台股歷史回補：每個交易日向證交所（上市）、櫃買中心（上櫃）各查一次全部個股行情，存最高、最低、收盤
 TPEX_DAY_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={slash}&type=EW&response=json"
 HIST_SLEEP = 3.0                  # 每次請求之間等幾秒，避免被交易所限流
-PC_BATCH_DAYS = 80                 # Put/Call 歷史每次最多補幾個美股交易日
+PC_BATCH_DAYS = 250                # Put/Call 歷史每次最多補幾個美股交易日
+PC_WINDOW_DAYS = 3700                 # Put/Call 回補到幾天前（CBOE 每日檔不一定保留，連續沒資料就會停）
 PC_SLEEP = 1.0                    # CBOE 每次請求之間等幾秒
 MARGIN_LONG_BATCH = 250                  # 融資長期回補（M38）每次最多補幾個交易日
 MARGIN_LONG_MINUTES = 12                 # 融資長期回補每次最多跑幾分鐘（工作上限 30 分鐘）
@@ -182,7 +183,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v94"
+PIPELINE_VERSION = "v95"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

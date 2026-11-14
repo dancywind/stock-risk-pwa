@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v94"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v95"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -738,7 +738,7 @@ def tw_margin_backfill(max_days=None):
 
 
 def tw_margin_long_backfill(max_days=None):
-    """模組 M38：把上市融資餘額往前回補到 INDEX_LONG_YEARS 年前（給計分卡歷史驗證用，M19 只補近 400 天）。
+    """模組 M43：把上市融資餘額往前回補到 INDEX_LONG_YEARS 年前（給計分卡歷史驗證用，M19 只補近 400 天）。
     交易日以資料庫裡加權指數的歷史（market_stats，M05／M24 寫入）為準，扣掉 tw_margin 已經有的；每次最多 MARGIN_LONG_BATCH 天、最多跑 MARGIN_LONG_MINUTES 分鐘，
     由新到舊補。每一天的驗證和每日更新相同（日期要對、前日＋買進－賣出－償還＝今日、餘額在合理範圍）。
     連線失敗就整批停止；某天沒有資料或驗證不過只略過那一天（太舊的日期證交所格式不同時會被略過，不會寫進錯的數字）。重跑不會重複（主鍵是日期）。"""
@@ -2638,17 +2638,29 @@ def cboe_putcall_backfill(max_days=None):
     if not sb_ready():
         log("pc_backfill", "skipped", detail="未設定 Supabase，無法判斷哪些日期已經補過，不回補")
         return []
-    start = date.today() - timedelta(days=config.HIST_WINDOW_DAYS)
-    days, err = sb_request("GET", f"macro_series?select=as_of&series_id=eq.SP500&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000")
+    start = date.today() - timedelta(days=config.PC_WINDOW_DAYS)
+    days, err = [], None
+    for off in range(0, 3000, 1000):                                                              # 一頁最多 1000 筆，10 年要分頁
+        got, err = sb_request("GET", f"macro_series?select=as_of&series_id=eq.SP500&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000&offset={off}")
+        if got is None:
+            days = None
+            break
+        days.extend(got)
+        if len(got) < 1000:
+            break
     if not days:
         log("pc_backfill", "failure" if days is None else "no_new_data", detail=_clip(f"讀不到美股交易日清單（FRED 標普 500 歷史）：{err or '沒有資料'}；請先跑 tw_backfill 補 FRED 歷史"))
         return []
-    have_rows, err = sb_request("GET", f"us_putcall?select=as_of&as_of=gte.{start.isoformat()}&limit=2000")
-    have = {r["as_of"] for r in (have_rows or [])}
+    have = set()
+    for off in range(0, 3000, 1000):
+        have_rows, err = sb_request("GET", f"us_putcall?select=as_of&as_of=gte.{start.isoformat()}&limit=1000&offset={off}")
+        have.update(r["as_of"] for r in (have_rows or []))
+        if not have_rows or len(have_rows) < 1000:
+            break
     todo_all = [r["as_of"] for r in days if r["as_of"] not in have]
     todo = todo_all[:max_days]
     if not todo:
-        log("pc_backfill", "no_new_data", detail=f"近 {config.HIST_WINDOW_DAYS} 天的 {len(days)} 個美股交易日，Put/Call 都已經補齊")
+        log("pc_backfill", "no_new_data", detail=f"近 {config.PC_WINDOW_DAYS} 天的 {len(days)} 個美股交易日，Put/Call 都已經補齊")
         return []
     out, miss_run, missing, bad, stopped = [], 0, 0, 0, ""
     for d in todo:
@@ -2674,6 +2686,62 @@ def cboe_putcall_backfill(max_days=None):
     log("pc_backfill", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
         detail=_clip(f"本次補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") + f"；沒有資料 {missing} 天、格式不符 {bad} 天" +
                      (f"；{stopped}" if stopped else f"；還有 {max(len(todo_all) - len(todo), 0)} 天下次繼續")))
+    return out
+
+
+def parse_cboe_totalpc_csv(text):
+    """CBOE 舊版 Put/Call 歷史檔（totalpc.csv）→ [{as_of, total_pc}]。檔案前面有說明文字，從含「Date」與「P/C Ratio」的標題列開始讀；
+    日期可以是 m/d/yyyy 或 yyyy-mm-dd；比率要在 0–20 內；讀不出來的列略過，不編。"""
+    rows, hdr, di, ri = [], None, None, None
+    for line in str(text).splitlines():
+        cells = [c.strip().strip('"') for c in line.split(",")]
+        low = [c.lower() for c in cells]
+        if hdr is None:
+            if "date" in low and any("p/c" in c for c in low):
+                hdr, di = True, low.index("date")
+                ri = next(i for i, c in enumerate(low) if "p/c" in c)
+            continue
+        if len(cells) <= max(di, ri):
+            continue
+        raw = cells[di]
+        m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw)
+        try:
+            d_ = date(int(m.group(3)), int(m.group(1)), int(m.group(2))) if m else date.fromisoformat(raw[:10])
+        except ValueError:
+            continue
+        v = parse_number(cells[ri])
+        if v is None or not (0 < v < 20):
+            continue
+        rows.append({"as_of": d_.isoformat(), "total_pc": v})
+    return rows
+
+
+def cboe_pc_csv_history():
+    """模組 M44：CBOE 舊版 Put/Call 歷史檔（totalpc.csv，只有總比率）補進 us_putcall 還沒有的日期，讓美股谷底卡的歷史驗證有更早的資料。
+    每日 JSON 的資料（有指數、股票、ETP 比率）永遠優先：資料庫已有的日期不動。抓不到或格式不符只記錄（附前幾行，方便看真實格式），不讓工作變紅。"""
+    status, ctype, body, err = fetch_raw(config.CBOE_PC_URLS["totalpc_csv"], timeout=config.PROBE_TIMEOUT)
+    if status != 200 or not body:
+        log("cboe_pc_csv", "no_new_data", detail=_clip(f"totalpc.csv 取得失敗：{'HTTP ' + str(status) if status else err}"))
+        return []
+    try:
+        text = body.decode("utf-8-sig", errors="replace")
+    except AttributeError:
+        text = str(body)
+    rows = parse_cboe_totalpc_csv(text)
+    if not rows:
+        log("cboe_pc_csv", "no_new_data", detail=_clip("totalpc.csv 讀不出資料；前幾行：" + " | ".join(text.splitlines()[:4])))
+        return []
+    have = set()
+    if sb_ready():
+        for off in range(0, 6000, 1000):
+            got, _e = sb_request("GET", f"us_putcall?select=as_of&limit=1000&offset={off}")
+            have.update(r["as_of"] for r in (got or []))
+            if not got or len(got) < 1000:
+                break
+    out = [{"as_of": r["as_of"], "total_pc": r["total_pc"], "index_pc": None, "equity_pc": None, "etp_pc": None, "source": "CBOE 舊版歷史檔（totalpc.csv，只有總比率）"}
+           for r in rows if r["as_of"] not in have and r["as_of"] <= date.today().isoformat()]
+    log("cboe_pc_csv", "success" if out else "no_new_data", as_of=max((r["as_of"] for r in out), default=None),
+        detail=_clip(f"檔案 {len(rows)} 天（{min(r['as_of'] for r in rows)} 到 {max(r['as_of'] for r in rows)}），新補 {len(out)} 天"))
     return out
 
 
@@ -2948,7 +3016,7 @@ def us_daily_bars():
 
 
 def sox_history():
-    """模組 M39：費城半導體指數（SOX）的每日收盤歷史（Nasdaq 官方行情，index 分類）→ macro_series（series_id=SOX），給「SOX 從高點回落」用。
+    """模組 M42：費城半導體指數（SOX）的每日收盤歷史（Nasdaq 官方行情，index 分類）→ macro_series（series_id=SOX），給「SOX 從高點回落」用。
     每次：近 SOX_WINDOW_DAYS 天（每天更新）＋從資料庫最早的一天再往前補最多 SOX_BACK_WINDOWS 段（每段 SOX_WINDOW_DAYS 天），最多補到 SOX_YEARS 年前。
     只收美東已經收盤的日子；價格要在合理範圍；Nasdaq 一次最多回 400 列，所以分段。抓不到只記「沒有資料」，不讓工作變紅；不用 ETF 代替（SOXX 有分割，會讓回落算錯）。
     主鍵是 series_id,as_of，重跑不會重複。"""
@@ -5858,7 +5926,8 @@ def run_job(job, dry_run=False):
             inst_hist = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
             pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
             margin_hist = _run_module("M19", "上市融資餘額歷史回補", tw_margin_backfill) or []
-            margin_hist = margin_hist + (_run_module("M38", "上市融資餘額長期回補（10 年）", tw_margin_long_backfill) or [])
+            pc_rows = (pc_rows or []) + (_run_module("M44", "Put/Call 舊版歷史檔（CBOE totalpc.csv）", cboe_pc_csv_history) or [])
+            margin_hist = margin_hist + (_run_module("M43", "上市融資餘額長期回補（10 年）", tw_margin_long_backfill) or [])
             index_long = _run_module("M24", "加權指數長期歷史回補", tw_index_long_history) or []
             us_long = _run_module("M35", "美股指數長期歷史（標普 500、Nasdaq 綜合，FRED）", us_index_long_history) or []
     if job in ("full", "tw_close") and not dry_run:
@@ -5911,7 +5980,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
-        extra.append(("macro_series", _run_module("M39", "費城半導體指數 SOX 歷史（Nasdaq）", sox_history) or [], "series_id,as_of"))
+        extra.append(("macro_series", _run_module("M42", "費城半導體指數 SOX 歷史（Nasdaq）", sox_history) or [], "series_id,as_of"))
     if job == "tw_backfill":
         extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))

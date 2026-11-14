@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "cboe_pc_csv_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -763,7 +763,7 @@ def test_nasdaq_probe_no_breadth_fields_says_so():
 
 def test_us_probe_job_only_probes():
     reset()
-    with mock.patch.object(fetch, "probe_round16"), mock.patch.object(fetch, "probe_round15"), mock.patch.object(fetch, "probe_round14"), mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
+    with mock.patch.object(fetch, "probe_us_pe"), mock.patch.object(fetch, "probe_round16"), mock.patch.object(fetch, "probe_round15"), mock.patch.object(fetch, "probe_round14"), mock.patch.object(fetch, "probe_round13"), mock.patch.object(fetch, "probe_round12"), mock.patch.object(fetch, "probe_round11"), mock.patch.object(fetch, "probe_round10"), mock.patch.object(fetch, "probe_round9"), mock.patch.object(fetch, "probe_round8"), mock.patch.object(fetch, "probe_round7"), mock.patch.object(fetch, "probe_round6"), mock.patch.object(fetch, "probe_round5"), mock.patch.object(fetch, "probe_round4"), mock.patch.object(fetch, "probe_round3"), mock.patch.object(fetch, "probe_earnings") as pn, mock.patch.object(fetch, "fred_latest") as f, \
             mock.patch.object(fetch, "twse_market") as tw, mock.patch.object(fetch, "sb_upsert") as up:
         fetch.run_job("us_probe", dry_run=False)
     pn.assert_called_once(); f.assert_not_called(); tw.assert_not_called(); up.assert_not_called()
@@ -6623,3 +6623,23 @@ def test_sox_history_keeps_closed_days_in_range_and_never_raises():
     with mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "_nasdaq_rows", return_value=(None, "連線失敗")), mock.patch.object(fetch.time, "sleep"):
         assert REAL["sox_history"]() == []
     assert [x for x in fetch.LOG if x["source"] == "sox_history"][0]["status"] == "no_new_data"
+
+
+def test_parse_cboe_totalpc_csv_skips_preamble_and_bad_rows():
+    text = "CBOE Total Put/Call\n\nDATE,CALLS,PUTS,TOTAL,P/C Ratio\n11/1/2006,976510,623929,1600439,0.64\n2006-11-02,1,1,2,0.80\n11/3/2006,1,1,2,abc\nbad,1,1,2,0.5\n11/6/2006,1,1,2,99\n"
+    rows = fetch.parse_cboe_totalpc_csv(text)
+    assert rows == [{"as_of": "2006-11-01", "total_pc": 0.64}, {"as_of": "2006-11-02", "total_pc": 0.8}]
+    assert fetch.parse_cboe_totalpc_csv("no header here\n1,2,3") == []
+
+
+def test_cboe_pc_csv_history_only_adds_missing_dates_and_never_raises():
+    reset()
+    body = "DATE,CALLS,PUTS,TOTAL,P/C Ratio\n11/1/2006,1,1,2,0.64\n11/2/2006,1,1,2,0.7\n".encode()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "text/csv", body, "")), mock.patch.object(fetch, "sb_ready", return_value=True), \
+         mock.patch.object(fetch, "sb_request", side_effect=lambda m, p, *a, **k: ([{"as_of": "2006-11-01"}], "")):
+        out = REAL["cboe_pc_csv_history"]()
+    assert [r["as_of"] for r in out] == ["2006-11-02"] and out[0]["total_pc"] == 0.7 and out[0]["index_pc"] is None
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")):
+        assert REAL["cboe_pc_csv_history"]() == []
+    assert [x for x in fetch.LOG if x["source"] == "cboe_pc_csv"][0]["status"] == "no_new_data"
