@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v93"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v94"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2885,9 +2885,9 @@ def us_extra_quotes():
     return out
 
 
-def _nasdaq_rows(sym, assetclass="etf", days=75):
+def _nasdaq_rows(sym, assetclass="etf", days=75, end=None):
     """Nasdaq 歷史行情 → ([{date, close, volume}] 由舊到新, "")；失敗回傳 (None, 原因)。收盤價超出合理範圍的列丟掉；成交量讀不出來就是 None（不編）。"""
-    today = date.today()
+    today = end or date.today()
     url = config.NASDAQ_HIST_URL.format(symbol=sym, assetclass=assetclass, fromdate=(today - timedelta(days=days)).isoformat(), todate=today.isoformat())
     status, ctype, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
     if status is None:
@@ -2944,6 +2944,48 @@ def us_daily_bars():
         log("us_daily_bars", "success", as_of=max(r["as_of"] for r in out), detail=f"{len(out)} 筆（{', '.join(sorted({r['symbol'] for r in out}))}），最新 {max(r['as_of'] for r in out)}" + (f"；{'；'.join(notes)}" if notes else ""))
     else:
         log("us_daily_bars", "no_new_data", detail=_clip("；".join(notes) or "沒有資料"))
+    return out
+
+
+def sox_history():
+    """模組 M39：費城半導體指數（SOX）的每日收盤歷史（Nasdaq 官方行情，index 分類）→ macro_series（series_id=SOX），給「SOX 從高點回落」用。
+    每次：近 SOX_WINDOW_DAYS 天（每天更新）＋從資料庫最早的一天再往前補最多 SOX_BACK_WINDOWS 段（每段 SOX_WINDOW_DAYS 天），最多補到 SOX_YEARS 年前。
+    只收美東已經收盤的日子；價格要在合理範圍；Nasdaq 一次最多回 400 列，所以分段。抓不到只記「沒有資料」，不讓工作變紅；不用 ETF 代替（SOXX 有分割，會讓回落算錯）。
+    主鍵是 series_id,as_of，重跑不會重複。"""
+    sid, label, low, high = config.SOX_SERIES
+    now = _now_et()
+    earliest = None
+    if sb_ready():
+        got, _err = sb_request("GET", f"macro_series?select=as_of&series_id=eq.{sid}&order=as_of.asc&limit=1")
+        if got:
+            earliest = date.fromisoformat(got[0]["as_of"])
+    wins = [date.today()]
+    if earliest is not None:
+        floor = date.today() - timedelta(days=int(config.SOX_YEARS * 365))
+        end = earliest - timedelta(days=1)
+        for _ in range(config.SOX_BACK_WINDOWS):
+            if end <= floor:
+                break
+            wins.append(end)
+            end = end - timedelta(days=config.SOX_WINDOW_DAYS + 1)
+    out, bad, why_last = [], 0, ""
+    for end in wins:
+        rows, why = _nasdaq_rows("SOX", "index", config.SOX_WINDOW_DAYS, end=end)
+        time.sleep(1)
+        if rows is None:
+            why_last = why
+            break
+        for r in rows:
+            dd = r["date"]
+            closed = dd < now.date() or (dd == now.date() and now.hour >= 17)
+            if not closed or not (low <= r["close"] <= high):
+                bad += 1
+                continue
+            out.append({"series_id": sid, "label": label, "as_of": dd.isoformat(), "value": r["close"], "source": "Nasdaq 官方行情（已收盤）"})
+    if out:
+        log("sox_history", "success", as_of=max(r["as_of"] for r in out), detail=_clip(f"{len(out)} 筆（{min(r['as_of'] for r in out)} 到 {max(r['as_of'] for r in out)}）" + (f"；略過 {bad} 筆（未收盤或超出範圍）" if bad else "")))
+    else:
+        log("sox_history", "no_new_data", detail=_clip(f"Nasdaq 沒有提供 SOX 歷史：{why_last or '沒有可用的列'}（不用 ETF 代替）"))
     return out
 
 
@@ -5869,6 +5911,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))
+        extra.append(("macro_series", _run_module("M39", "費城半導體指數 SOX 歷史（Nasdaq）", sox_history) or [], "series_id,as_of"))
     if job == "tw_backfill":
         extra.append(("tw_institutional", inst_hist, "as_of,source"))
         extra.append(("us_putcall", pc_rows, "as_of"))

@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -6609,3 +6609,17 @@ def test_probe_us_pe_logs_pe_like_fields_only_reads_and_never_raises():
     with mock.patch.object(fetch, "fetch_raw", side_effect=RuntimeError("boom")), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "load_us_watch", return_value=[]):
         fetch.probe_us_pe()
     assert fetch.LOG and all(x["status"] == "no_new_data" for x in fetch.LOG)
+
+
+def test_sox_history_keeps_closed_days_in_range_and_never_raises():
+    reset()
+    old = date.today() - timedelta(days=5)
+    rows = [{"date": old, "close": 5000.0, "volume": None}, {"date": old + timedelta(days=1), "close": 5.0, "volume": None}, {"date": date.today() + timedelta(days=0), "close": 5100.0, "volume": None}]
+    with mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "_nasdaq_rows", return_value=(rows, "")), mock.patch.object(fetch.time, "sleep"), \
+         mock.patch.object(fetch, "_now_et", return_value=fetch.datetime(date.today().year, date.today().month, date.today().day, 12, 0)):
+        out = REAL["sox_history"]()
+    assert [r["as_of"] for r in out] == [old.isoformat()] and out[0]["series_id"] == "SOX" and out[0]["value"] == 5000.0
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False), mock.patch.object(fetch, "_nasdaq_rows", return_value=(None, "連線失敗")), mock.patch.object(fetch.time, "sleep"):
+        assert REAL["sox_history"]() == []
+    assert [x for x in fetch.LOG if x["source"] == "sox_history"][0]["status"] == "no_new_data"

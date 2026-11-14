@@ -47,6 +47,10 @@ FRED_MACRO = {
     "VXNCLS": ("Nasdaq-100 波動率指數（VXN）", 5.0, 150.0),
 }
 # 可能不存在或授權限制的序列：抓不到時記「沒有資料」，不算失敗，不讓排程亮紅燈
+SOX_SERIES = ("SOX", "費城半導體指數（SOX）", 500.0, 100000.0)     # M39：存進 macro_series 的序列名、標籤、合理範圍
+SOX_WINDOW_DAYS = 380                     # Nasdaq 一次最多回 400 列，每段取約 1.5 年
+SOX_BACK_WINDOWS = 3                      # 每次往前多補幾段
+SOX_YEARS = 10                            # 最多補到幾年前
 FRED_OPTIONAL = {"RU2000PR", "VXNCLS"}
 # 模組 M06：這幾個序列另外回補一段歷史，用來算「從高點回落幅度」與月績效
 # 模組 M18：用 Nasdaq 官方行情補 FRED 落後的天數。每一項：(Nasdaq 的代號, macro_series 的序列, 分類[, 選用])。
@@ -178,7 +182,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v93"
+PIPELINE_VERSION = "v94"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
