@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "cboe_pc_csv_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength", "stock_risk_stats")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "cboe_pc_csv_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength", "stock_risk_stats", "tw_breadth_long_backfill", "tw_margin_ratio_backfill", "aaii_csv_import")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -6696,3 +6696,58 @@ def test_stock_risk_stats_us_computes_beta_short_pct_and_inst_and_leaves_missing
     assert 2.1 <= a["beta"] <= 2.3 and a["inst_pct"] == 60.5 and a["short_pct"] == 12.0 and a["days_to_cover"] == 3.1 and a["short_as_of"] == "2026-10-31", a
     assert e["beta"] is not None and e["short_pct"] is None and e["inst_pct"] is None, e
     assert [x for x in fetch.LOG if x["source"] == "stock_risk_stats"][0]["status"] == "success"
+
+
+def _ms_json(d, up, down, flat):
+    return {"stat": "OK", "date": d.replace("-", ""), "tables": [{"title": "漲跌證券數合計", "fields": ["類型", "整體市場", "股票"], "data": [["上漲(漲停)", "1,000(5)", f"{up}(3)"], ["下跌(跌停)", "900(2)", f"{down}(1)"], ["持平", "100", f"{flat}"]]}]}
+
+
+def test_parse_breadth_ms_checks_date_and_counts():
+    assert fetch.parse_breadth_ms(_ms_json("2020-03-12", 100, 800, 50), "2020-03-12") == ((100, 800, 50), "")
+    r, why = fetch.parse_breadth_ms(_ms_json("2020-03-13", 100, 800, 50), "2020-03-12"); assert r is None and "回傳" in why
+    r, why = fetch.parse_breadth_ms({"stat": "很抱歉，沒有符合條件的資料!"}, "2020-03-12"); assert r is None and "沒有這天" in why
+    r, why = fetch.parse_breadth_ms(_ms_json("2020-03-12", 1, 1, 1), "2020-03-12"); assert r is None and "合理" in why
+
+
+def test_tw_breadth_long_backfill_fills_missing_days_and_skips_bad_ones():
+    reset()
+    days = ["2020-03-13", "2020-03-12", "2020-03-11"]
+    def sbr(method, path, *a, **k):
+        if "market_stats" in path: return ([{"as_of": d} for d in days] if "offset=0" in path else []), ""
+        if "tw_breadth_hist" in path: return ([{"as_of": "2020-03-13"}] if "offset=0" in path else []), ""
+        return [], ""
+    def fj(url, **k):
+        if "date=20200312" in url: return _ms_json("2020-03-12", 100, 800, 50), ""
+        return {"stat": "很抱歉，沒有符合條件的資料!"}, ""
+    with mock.patch.object(fetch, "sb_request", sbr), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "fetch_json", fj), mock.patch.object(fetch.time, "sleep", lambda s: None):
+        out = REAL["tw_breadth_long_backfill"]()
+    assert out == [{"as_of": "2020-03-12", "market": "TWSE", "n_up": 100, "n_down": 800, "n_flat": 50}], out
+    assert "略過 1 天" in [x for x in fetch.LOG if x["source"] == "breadth_long"][0]["detail"]
+
+
+def test_tw_margin_ratio_backfill_stops_when_twse_ignores_date_and_computes_when_it_works():
+    reset()
+    def sbr(method, path, *a, **k):
+        if "tw_hist_days" in path: return [{"as_of": "2026-11-12"}], ""
+        if "tw_margin_ratio" in path: return [], ""
+        if "tw_hist?" in path: return ([{"code": "2330", "close": 1000}, {"code": "2317", "close": 200}] if "offset=0" in path else []), ""
+        return [], ""
+    base = {"stat": "OK", "date": "20261112"}
+    with mock.patch.object(fetch, "sb_request", sbr), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch.time, "sleep", lambda s: None), \
+         mock.patch.object(fetch, "fetch_json", lambda url, **k: (dict(base, date="20261113"), "")):
+        assert REAL["tw_margin_ratio_backfill"]() == []
+    assert "不提供歷史" in [x for x in fetch.LOG if x["source"] == "ratio_backfill"][0]["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_request", sbr), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch.time, "sleep", lambda s: None), \
+         mock.patch.object(fetch, "fetch_json", lambda url, **k: (base, "")), \
+         mock.patch.object(fetch, "parse_margin_stock_table", lambda d: ({"2330": 1000, "2317": 500}, None)), \
+         mock.patch.object(fetch, "_parse_margin", lambda d: ({"margin_balance": 1000 * 1000 * 1000 * 0.5 + 500 * 1000 * 200 * 0.5}, None)):
+        out = REAL["tw_margin_ratio_backfill"]()
+    assert len(out) == 1 and out[0]["as_of"] == "2026-11-12" and abs(out[0]["est_ratio"] - 200.0) < 0.01, out
+
+
+def test_parse_aaii_csv_accepts_fractions_percent_and_skips_bad_rows():
+    txt = "AAII Sentiment Survey,,,\nDate,Bullish,Neutral,Bearish,Total\n11/05/2026,0.38,0.30,0.32,1\n2026-10-29,45%,25%,30%,100%\n2026-10-22,10,10,10,30\n11/05/2026,0.4,0.3,0.3,1\nbad,1,2,3,4\n"
+    rows, sk = fetch.parse_aaii_csv(txt)
+    assert [r["as_of"] for r in rows] == ["2026-11-05", "2026-10-29"] and rows[0]["bullish"] == 38.0 and rows[1]["bearish"] == 30.0 and sk == 3, (rows, sk)
+    assert fetch.parse_aaii_csv("a,b\n1,2")[0] == []

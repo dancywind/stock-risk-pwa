@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v96"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v97"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -797,6 +797,220 @@ def tw_margin_long_backfill(max_days=None):
         detail=_clip(f"本次試 {tried} 天，補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") +
                      f"；略過 {skipped} 天（證交所沒有資料）、{bad} 天（驗證不過" + (f"：{first_err}" if first_err else "") + f"）；還有 {max(len(todo_all) - tried, 0)} 天下次繼續"))
     return out
+
+
+def parse_breadth_ms(data, want_iso):
+    """證交所 MI_INDEX（type=MS）指定日期的回傳 → ((上漲, 下跌, 持平), 錯誤原因)。取『漲跌證券數合計』的「股票」欄（和每日更新同一個口徑，不含權證、ETF）。
+    回傳的日期必須就是 want_iso；三項都要讀得出來、合計在合理範圍，否則回傳 (None, 原因)。"""
+    if not isinstance(data, dict) or data.get("stat") != "OK":
+        return None, "證交所沒有這天的資料"
+    got_iso = twse_ymd_to_iso(data.get("date"))
+    if got_iso != want_iso:
+        return None, f"要 {want_iso} 但證交所回傳 {got_iso}"
+    table = next((t for t in (data.get("tables") or []) if "漲跌證券數合計" in str(t.get("title"))), None)
+    fields = (table or {}).get("fields") or []
+    if table is None or "類型" not in fields or "股票" not in fields:
+        return None, "找不到『漲跌證券數合計』表格或欄位不符"
+    i_label, i_stock = fields.index("類型"), fields.index("股票")
+    got = {}
+    for r in table.get("data") or []:
+        label = str(r[i_label])
+        for prefix, name in (("上漲", "up"), ("下跌", "down"), ("持平", "flat")):
+            if label.startswith(prefix):
+                got[name] = parse_count(r[i_stock])[0]
+    if any(got.get(k) is None for k in ("up", "down", "flat")):
+        return None, "上漲／下跌／持平其中一項缺漏或無法解析"
+    lo, hi = config.BREADTH_TOTAL_RANGE
+    if not (lo <= got["up"] + got["down"] + got["flat"] <= hi):
+        return None, f"家數合計 {got['up'] + got['down'] + got['flat']} 超出合理範圍"
+    return (got["up"], got["down"], got["flat"]), ""
+
+
+def tw_breadth_long_backfill(max_days=None):
+    """模組 M46：上市漲跌家數往前回補到 INDEX_LONG_YEARS 年前（給「高檔但下跌家數 ≥ 60%」的歷史驗證用；自建行情 M13 只有近 400 天）。
+    交易日以加權指數歷史（market_stats）為準，扣掉 tw_breadth_hist 已有的；每次最多 BREADTH_LONG_BATCH 天、BREADTH_LONG_MINUTES 分鐘，由新到舊補。
+    每一天：回傳日期要等於要求的日期、三項都讀得到、合計合理；連線失敗整批停止，某天沒資料／驗證不過只略過那天。
+    口徑是證交所官方「股票」欄；M13 自建的是 4 位數代號股票，兩者同一天可能差幾檔，所以已有 M13 的日期不覆蓋。"""
+    max_days = max_days or config.BREADTH_LONG_BATCH
+    if not sb_ready():
+        log("breadth_long", "skipped", detail="未設定 Supabase，無法判斷哪些日期已經補過，不回補")
+        return []
+    start = date.today() - timedelta(days=int(config.INDEX_LONG_YEARS * 365))
+    days, have = [], set()
+    for off in range(0, 3000, 1000):
+        got, err = sb_request("GET", f"market_stats?select=as_of&source=eq.TWSE%20FMTQIK&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000&offset={off}")
+        if got is None:
+            log("breadth_long", "failure", detail=_clip(f"讀取交易日清單失敗：{err}"))
+            return []
+        days.extend(r["as_of"] for r in got)
+        if len(got) < 1000:
+            break
+    for off in range(0, 3000, 1000):
+        got, err = sb_request("GET", f"tw_breadth_hist?select=as_of&market=eq.TWSE&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000&offset={off}")
+        if got is None:
+            log("breadth_long", "failure", detail=_clip(f"讀取已有的漲跌家數失敗：{err}（請先執行 new_tables_v38.sql）"))
+            return []
+        have.update(r["as_of"] for r in got)
+        if len(got) < 1000:
+            break
+    todo_all = [d for d in days if d not in have]
+    if not todo_all:
+        log("breadth_long", "no_new_data", detail=f"{len(days)} 個交易日的漲跌家數都已經補齊")
+        return []
+    out, skipped, bad, first_err, tried, t0 = [], 0, 0, "", 0, time.time()
+    for d in todo_all[:max_days]:
+        if time.time() - t0 > config.BREADTH_LONG_MINUTES * 60:
+            break
+        tried += 1
+        data, err = fetch_json(config.TWSE_MI_INDEX_MS + "&date=" + d.replace("-", ""))
+        time.sleep(config.HIST_SLEEP)
+        if data is None:
+            log("breadth_long", "failure", as_of=d, detail=_clip(f"抓取失敗：{err}；已停止本次回補，不繼續打請求"))
+            break
+        res, why = parse_breadth_ms(data, d)
+        if res is None:
+            if "沒有這天" in why:
+                skipped += 1
+            else:
+                bad += 1
+                first_err = first_err or f"{d}：{why}"
+            continue
+        out.append({"as_of": d, "market": "TWSE", "n_up": res[0], "n_down": res[1], "n_flat": res[2]})
+    log("breadth_long", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
+        detail=_clip(f"本次試 {tried} 天，補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") + f"；略過 {skipped} 天（沒有資料）、{bad} 天（驗證不過" + (f"：{first_err}" if first_err else "") + f"）；還有 {max(len(todo_all) - tried, 0)} 天下次繼續"))
+    return out
+
+
+def tw_margin_ratio_backfill(max_days=None):
+    """模組 M47：回補上市融資維持率估算的歷史。做法和每天的 M21 完全一樣（逐檔融資餘額 × 當天收盤價 ÷ 融資金額），
+    只是改成指定日期：逐檔融資用 MI_MARGN（selectType=ALL＋date），收盤價用自建行情 tw_hist 同一天的全部上市股票。
+    先驗證證交所真的給歷史：回傳日期不是要求的那天、或沒有逐檔表，就整批停止並記下原因（不寫任何數字）。
+    只補自建行情有完整紀錄的上市交易日（約近 400 天）；每次最多 RATIO_BACKFILL_BATCH 天。每天的檢查同 M21：收盤價查不到的融資股票超過 5%、估算值不在 80–400% 就略過。"""
+    max_days = max_days or config.RATIO_BACKFILL_BATCH
+    if not sb_ready():
+        log("ratio_backfill", "skipped", detail="未設定 Supabase，無法判斷哪些日期已經補過，不回補")
+        return []
+    start = date.today() - timedelta(days=config.HIST_WINDOW_DAYS)
+    days, err = sb_request("GET", f"tw_hist_days?select=as_of&market=eq.TWSE&status=eq.ok&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000")
+    have_rows, err2 = sb_request("GET", f"tw_margin_ratio?select=as_of&as_of=gte.{start.isoformat()}&limit=2000")
+    if days is None or have_rows is None:
+        log("ratio_backfill", "failure", detail=_clip(f"讀取交易日或已有的估算失敗：{err or err2}"))
+        return []
+    have = {r["as_of"] for r in have_rows}
+    todo_all = [r["as_of"] for r in days if r["as_of"] not in have]
+    if not todo_all:
+        log("ratio_backfill", "no_new_data", detail=f"近 {config.HIST_WINDOW_DAYS} 天 {len(days)} 個交易日的維持率估算都已經補齊")
+        return []
+    out, skipped, bad, first_err, tried = [], 0, 0, "", 0
+    for d in todo_all[:max_days]:
+        tried += 1
+        data, err = fetch_json(config.TWSE_MI_MARGN_ALL + "&date=" + d.replace("-", ""))
+        time.sleep(config.HIST_SLEEP)
+        if data is None:
+            log("ratio_backfill", "failure", as_of=d, detail=_clip(f"抓取失敗：{err}；已停止本次回補"))
+            break
+        if not isinstance(data, dict) or data.get("stat") != "OK":
+            skipped += 1
+            continue
+        if twse_ymd_to_iso(data.get("date")) != d:
+            log("ratio_backfill", "no_new_data", as_of=d, detail=_clip(f"證交所逐檔融資不提供歷史：要 {d} 但回傳 {twse_ymd_to_iso(data.get('date'))}。維持率估算只能從啟用日起每天累積，沒有寫入任何數字"))
+            return out
+        units, perr = parse_margin_stock_table(data)
+        total, lerr = _parse_margin(data)
+        if perr or lerr:
+            bad += 1
+            first_err = first_err or f"{d}：{perr or lerr}"
+            continue
+        close, off = {}, 0
+        while off < 3000:
+            got, e3 = sb_request("GET", f"tw_hist?select=code,close&market=eq.TWSE&as_of=eq.{d}&order=code.asc&limit=1000&offset={off}")
+            if got is None:
+                log("ratio_backfill", "failure", as_of=d, detail=_clip(f"讀取 {d} 的收盤價失敗：{e3}"))
+                return out
+            for r in got:
+                try:
+                    if float(r["close"]) > 0:
+                        close[str(r["code"]).strip()] = float(r["close"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if len(got) < 1000:
+                break
+            off += 1000
+        value, missing = 0.0, 0
+        for code, u in units.items():
+            if code in close:
+                value += u * 1000 * close[code]
+            else:
+                missing += 1
+        if not units or missing / len(units) > 0.05 or not total.get("margin_balance"):
+            bad += 1
+            first_err = first_err or f"{d}：{len(units)} 檔裡 {missing} 檔查不到收盤價（或融資金額缺）"
+            continue
+        ratio = value / total["margin_balance"] * 100
+        if not (80 <= ratio <= 400):
+            bad += 1
+            first_err = first_err or f"{d}：估算值 {ratio:.1f}% 不在 80–400%"
+            continue
+        out.append({"as_of": d, "est_ratio": round(ratio, 2), "margin_value": round(value), "margin_loan": round(total["margin_balance"]), "n_stocks": len(units) - missing, "n_missing": missing,
+                    "source": "自行估算（回補：證交所逐檔融資餘額 × 自建行情收盤價 ÷ 融資金額；不是官方整戶擔保維持率）"})
+    log("ratio_backfill", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
+        detail=_clip(f"本次試 {tried} 天，補 {len(out)} 天" + f"；略過 {skipped} 天（沒有資料）、{bad} 天（驗證不過" + (f"：{first_err}" if first_err else "") + f"）；還有 {max(len(todo_all) - tried, 0)} 天下次繼續"))
+    return out
+
+
+def parse_aaii_csv(text):
+    """AAII 完整歷史（sentiment.xls 另存成 CSV）→ ([{as_of, bullish, neutral, bearish}] 新到舊, 略過幾列)。
+    要有標題列（含 Date、Bullish、Neutral、Bearish；其他欄位忽略）。日期接受 2026-11-11、2026/11/11、11/11/2026、Nov 11, 2026；
+    比例可以是 0.38（Excel 存成小數）或 38 / 38%；三項合計要在 98–102（%）才收，否則略過那一列。日期重複取第一列。"""
+    import csv as _csv, io as _io
+    rows = list(_csv.reader(_io.StringIO(text.lstrip("\ufeff"))))
+    hi = next((i for i, r in enumerate(rows) if {"date", "bullish", "neutral", "bearish"} <= {c.strip().lower() for c in r}), None)
+    if hi is None:
+        return [], 0
+    head = [c.strip().lower() for c in rows[hi]]
+    ix = {k: head.index(k) for k in ("date", "bullish", "neutral", "bearish")}
+    out, seen, skipped = [], set(), 0
+    for r in rows[hi + 1:]:
+        if len(r) <= max(ix.values()) or not any(c.strip() for c in r):
+            continue
+        t, d_ = r[ix["date"]].strip(), None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%b %d, %Y", "%B %d, %Y", "%m/%d/%y"):
+            try:
+                d_ = datetime.strptime(t.split(" ")[0] if " " in t and fmt in ("%Y-%m-%d", "%Y/%m/%d") else t, fmt).date()
+                break
+            except ValueError:
+                continue
+        vals = [parse_number(r[ix[k]].replace("%", "")) for k in ("bullish", "neutral", "bearish")]
+        if d_ is None or None in vals:
+            skipped += 1
+            continue
+        if max(vals) <= 1.0001:
+            vals = [v * 100 for v in vals]
+        if not (98 <= sum(vals) <= 102) or d_ > date.today() or d_.isoformat() in seen:
+            skipped += 1
+            continue
+        seen.add(d_.isoformat())
+        out.append({"as_of": d_.isoformat(), "bullish": round(vals[0], 2), "neutral": round(vals[1], 2), "bearish": round(vals[2], 2), "source": "AAII 完整歷史（你自己下載的 sentiment 檔，匯入）"})
+    out.sort(key=lambda x: x["as_of"], reverse=True)
+    return out, skipped
+
+
+def aaii_csv_import():
+    """模組 M48：匯入你自己下載的 AAII 完整歷史（會員下載的 sentiment.xls，另存成 CSV，放在倉庫 data/aaii_sentiment.csv）。
+    沒有這個檔案就什麼都不做（不算錯）；有的話每次都整份驗證後寫入（主鍵是日期，重複不會多出來）。"""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "aaii_sentiment.csv")
+    if not os.path.exists(path):
+        log("aaii_csv", "no_new_data", detail="倉庫裡沒有 data/aaii_sentiment.csv：沒有要匯入 AAII 完整歷史就可以忽略")
+        return []
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            rows, skipped = parse_aaii_csv(fh.read())
+    except OSError as e:
+        log("aaii_csv", "failure", detail=_clip(f"讀取失敗：{e}"))
+        return []
+    log("aaii_csv", "success" if rows else "failure", as_of=rows[0]["as_of"] if rows else None,
+        detail=_clip(f"讀到 {len(rows)} 週" + (f"（{rows[-1]['as_of']} 到 {rows[0]['as_of']}）" if rows else "：找不到 Date、Bullish、Neutral、Bearish 這幾欄，或全部驗證不過") + f"；略過 {skipped} 列"))
+    return rows
 
 
 def _norm_ymd(text):
@@ -6145,6 +6359,9 @@ def run_job(job, dry_run=False):
         extra.append(("macro_series", us_long, "series_id,as_of"))
         if not dry_run:
             extra.append(("tw_industry", _run_module("M17", "台股產業別", tw_industry_collect) or [], "code"))
+            extra.append(("tw_breadth_hist", _run_module("M46", "上市漲跌家數長期回補（10 年）", tw_breadth_long_backfill) or [], "as_of,market"))
+            extra.append(("us_aaii", _run_module("M48", "AAII 完整歷史匯入（你下載的檔案）", aaii_csv_import) or [], "as_of"))
+            extra.append(("tw_margin_ratio", _run_module("M47", "上市融資維持率估算回補", tw_margin_ratio_backfill) or [], "as_of"))
         extra.append(("market_stats", _run_module("M05", "加權指數歷史", tw_index_history) if not dry_run else [], "market,as_of,source"))
         extra.append(("macro_series", _run_module("M06", "FRED 歷史回補", fred_history_backfill) if not dry_run else [], "series_id,as_of"))
         if not dry_run:
