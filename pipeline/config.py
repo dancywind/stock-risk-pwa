@@ -176,7 +176,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v91"
+PIPELINE_VERSION = "v92"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -192,8 +192,9 @@ US_QUOTES = (
     ("GLD", "黃金 ETF（GLD，不是黃金期貨）", "etf", ("etf",), 100.0, 1500.0, True),
     ("QQQ", "納斯達克 100 ETF（QQQ，只顯示漲跌幅）", "etf_proxy", ("etf",), 50.0, 3000.0, False),
     ("SOX", "費城半導體指數（SOX）", "index", ("index",), 500.0, 100000.0, True),
+    ("RUT", "Russell 2000 指數（RUT）", "index", ("index",), 100.0, 20000.0, True),
 )
-US_QUOTE_FALLBACKS = {"GLD": ("IAU", "黃金 ETF（IAU，備用，不是黃金期貨）", 20.0, 800.0)}
+US_QUOTE_FALLBACKS = {"RUT": ("IWM", "Russell 2000 ETF（IWM，指數查不到時的代理，不是指數）", 50.0, 1000.0), "GLD": ("IAU", "黃金 ETF（IAU，備用，不是黃金期貨）", 20.0, 800.0)}
 # 模組 M03：美股產業相對強弱（11 檔產業 ETF 對 SPY；Nasdaq 歷史行情）
 SECTOR_ETFS = {"XLK": "科技", "XLF": "金融", "XLE": "能源", "XLV": "醫療保健", "XLY": "非必需消費", "XLP": "必需消費",
                "XLI": "工業", "XLU": "公用事業", "XLB": "原物料", "XLRE": "房地產", "XLC": "通訊服務"}

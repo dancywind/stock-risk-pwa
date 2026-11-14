@@ -2377,18 +2377,18 @@ def test_nasdaq_quote_only_accepts_closed_prices_with_their_own_date():
 def test_us_extra_quotes_stores_qqq_as_percent_only_and_falls_back_for_gold():
     reset()
     ts = (TODAY - timedelta(days=1)).strftime("%b %d, %Y").replace(" 0", " ")
-    prices = {"SPY": "$745.20", "TLT": "$88.10", "IAU": "$55.30", "QQQ": "$640.00", "SOX": "6,100.55"}
+    prices = {"SPY": "$745.20", "TLT": "$88.10", "IAU": "$55.30", "QQQ": "$640.00", "SOX": "6,100.55", "RUT": "2,450.10", "IWM": "$245.00"}
     def raw(url, timeout=None, headers=None):
         sym = url.split("/quote/")[1].split("/")[0]
-        if sym == "GLD":
-            return None, "", b"", "timed out"                                                      # GLD 失敗 → 改用 IAU
+        if sym in ("GLD", "RUT"):
+            return None, "", b"", "timed out"                                                      # GLD 失敗 → 改用 IAU；RUT 失敗 → 改用 IWM
         if sym == "SOX":
             return 200, "application/json", nas_quote_body(price=prices[sym], asset="index"), ""
         return 200, "application/json", nas_quote_body(price=prices[sym]), ""
     with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
         out = REAL["us_extra_quotes"]()
     by = {r["symbol"]: r for r in out}
-    assert set(by) == {"SPY", "TLT", "IAU", "QQQ", "SOX"} and "GLD" not in by
+    assert set(by) == {"SPY", "TLT", "IAU", "QQQ", "SOX", "IWM"} and "GLD" not in by and "不是指數" in by["IWM"]["label"]
     assert by["QQQ"]["value"] is None and by["QQQ"]["change_pct"] == 0.45 and by["QQQ"]["kind"] == "etf_proxy"      # QQQ 只存漲跌幅，不存價格
     assert by["SPY"]["value"] == 745.2 and by["SOX"]["value"] == 6100.55 and by["SOX"]["kind"] == "index"
     assert "備用" in by["IAU"]["label"] and "不是黃金期貨" in by["IAU"]["label"]
