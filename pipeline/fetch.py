@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v104"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v105"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3329,14 +3329,20 @@ def _nasdaq_history(sym, assetclass="etf", days=75):
     return [(r["date"], r["close"]) for r in rows], ""
 
 
+_LONG_TRACE = []
+
+
 def _nasdaq_history_long(sym, assetclass="stocks", days=3700, chunk=540):
     """Nasdaq 一次最多回 400 筆，所以每 chunk 個日曆天（約 370 個交易日）分段往前抓，湊成長歷史。
     第一段失敗就回傳 (None, 原因)；後面的段落失敗就用已經抓到的，不讓整檔作廢。"""
-    out, end, got, why = {}, date.today(), 0, ""
+    out, end, got, why, trace = {}, date.today(), 0, "", []
     while got < days:
         span = min(chunk, days - got)
         rows, why = _nasdaq_rows(sym, assetclass, span, end=end)
         time.sleep(config.BREADTH_NDX_SLEEP)
+        trace.append(f"{(end - timedelta(days=span)).isoformat()}~{end.isoformat()}：" + (f"{len(rows)} 筆" if rows is not None else f"失敗 {why}"))
+        if not _LONG_TRACE:
+            _LONG_TRACE.append(trace)                                        # 只留第一檔的分段結果，寫進紀錄方便看哪一段沒回資料
         if rows is None:
             if not out:
                 return None, why
@@ -4038,6 +4044,9 @@ def us_breadth_ndx():
            "pct200": round(a200 / ok200 * 100, 2) if ok200 >= config.BREADTH_NDX_MIN_OK else None,
            "source": "Nasdaq 官方成分股清單與歷史行情（自己計算；涵蓋 Nasdaq-100，不是 S&P 500）"}
     hist_rows = _ndx_breadth_history(series, last, len(syms))
+    if _LONG_TRACE:
+        note += "；第一檔分段抓取：" + " | ".join(_LONG_TRACE[0]) + f"；各檔最早日期 {min(p[0][0] for p in series).isoformat()}"
+        del _LONG_TRACE[:]
     log("us_breadth_ndx", "success", as_of=row["as_of"], detail=f"站上 50 日線 {a50} / {ok50} 檔（{row['pct50']}%）；站上 200 日線 {a200} / {ok200} 檔；同時用同一批歷史補了前 {len(hist_rows)} 天" + (f"（{row['pct200']}%）" if row["pct200"] is not None else "（有效檔數不到 80，不算比例）") + note)
     return hist_rows + [row]
 
