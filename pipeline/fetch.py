@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v95"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v96"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4282,6 +4282,161 @@ def tw_rel_strength(price_rows):
     return out
 
 
+def calc_beta(stock_close, index_close, min_pairs=120):
+    """Beta ＝ 個股日報酬對指數日報酬的迴歸斜率（共變異 ÷ 指數變異）。兩邊都有收盤價的日子才用；
+    相鄰兩個共同日期相隔超過 6 天（資料有缺漏）的那一段報酬不算；有效報酬不到 min_pairs 個就不給（回傳 (None, 筆數)）；結果超出 -3 到 8 視為壞資料。
+    stock_close、index_close：{日期字串: 收盤價}。回傳 (beta, 報酬筆數)。"""
+    days = sorted(set(stock_close) & set(index_close))
+    xs, ys = [], []
+    for a, b in zip(days, days[1:]):
+        if (date.fromisoformat(b) - date.fromisoformat(a)).days > 6:
+            continue
+        s0, s1, i0, i1 = stock_close[a], stock_close[b], index_close[a], index_close[b]
+        if min(s0, s1, i0, i1) <= 0:
+            continue
+        ys.append(s1 / s0 - 1)
+        xs.append(i1 / i0 - 1)
+    n = len(xs)
+    if n < min_pairs:
+        return None, n
+    mx, my = sum(xs) / n, sum(ys) / n
+    var = sum((x - mx) ** 2 for x in xs)
+    if var <= 0:
+        return None, n
+    beta = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
+    return (round(beta, 2), n) if -3 <= beta <= 8 else (None, n)
+
+
+def parse_nasdaq_short_interest(j):
+    """Nasdaq 放空餘額（/api/quote/{代號}/short-interest）→ 最新一期 {settle, shares, days_to_cover}；沒有或格式不對回傳 None。
+    表格列要有 settlementDate（MM/DD/YYYY）與 interest（股數）；daysToCover 缺就留空。每期是每月兩次公布的，日期取表裡最新的那一列。"""
+    rows = ((((j or {}).get("data") or {}).get("shortInterestTable") or {}).get("rows")) if isinstance(j, dict) else None
+    best = None
+    for r in (rows or []):
+        iso = None
+        if isinstance(r, dict):
+            m_ = re.fullmatch(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*", str(r.get("settlementDate", "")))
+            try:
+                iso = date(int(m_.group(3)), int(m_.group(1)), int(m_.group(2))).isoformat() if m_ else parse_us_date(r.get("settlementDate"))
+            except ValueError:
+                iso = None
+        sh = parse_number(str(r.get("interest", "")).replace(",", "")) if isinstance(r, dict) else None
+        if iso and sh is not None and sh >= 0 and (best is None or iso > best["settle"]):
+            dtc = parse_number(str(r.get("daysToCover", "")))
+            best = {"settle": iso, "shares": sh, "days_to_cover": dtc if dtc is not None and 0 <= dtc < 1000 else None}
+    return best
+
+
+def parse_nasdaq_institutional(j):
+    """Nasdaq 機構持股（/api/company/{代號}/institutional-holdings）→ {pct, shares_out}；pct 是「機構持股占流通在外股數 %」。
+    先找 ownershipSummary 裡鍵名是 SharesOutstandingPCT 的項目，找不到再用標籤文字（含 Shares Outstanding 與 %）找；
+    shares_out 是總股數：標籤有 millions 就乘 1,000,000。不合理（機構持股 ≤ 0 或 > 300%）的當作沒有。"""
+    d = ((j or {}).get("data") or {}) if isinstance(j, dict) else {}
+    s = d.get("ownershipSummary") if isinstance(d.get("ownershipSummary"), dict) else {}
+    pct, out = None, None
+    it = s.get("SharesOutstandingPCT")
+    if not isinstance(it, dict):
+        it = next((v for v in s.values() if isinstance(v, dict) and re.search(r"Outstanding", str(v.get("label", "")), re.I) and "%" in str(v.get("value", v.get("label", "")))), None)
+    if isinstance(it, dict):
+        pct = parse_number(re.sub(r"[%\s]", "", str(it.get("value", ""))))
+        if pct is not None and not (0 < pct <= 300):
+            pct = None
+    tot = s.get("ShareoutstandingTotal") if isinstance(s.get("ShareoutstandingTotal"), dict) else next((v for k, v in s.items() if isinstance(v, dict) and re.search(r"Total.*Shares.*Outstanding|Shares.*Outstanding.*Total", str(v.get("label", "")), re.I) and "PCT" not in k.upper()), None)
+    if isinstance(tot, dict):
+        v = parse_number(str(tot.get("value", "")).replace(",", ""))
+        if v is not None and v > 0:
+            out = v * 1_000_000 if re.search(r"million", str(tot.get("label", "")), re.I) else v
+    return {"pct": pct, "shares_out": out} if (pct is not None or out is not None) else None
+
+
+def stock_risk_stats(holdings, tw_codes=None):
+    """模組 M45：Beta（近一年日報酬對指數：美股對 SPY、上市對加權、上櫃對櫃買）、美股放空餘額占股數比例（軋空燃料）、美股機構持股比例。
+    美股：Nasdaq 歷史行情、放空餘額、機構持股（皆為資料商／交易所公布，放空餘額每月兩次，不是每日）。放空占比 ＝ 放空股數 ÷ 總股數
+    （總股數優先用機構持股頁的總股數，沒有就用「市值 ÷ 收盤價」；這是占「總股數」不是占「流通股數」，流通股數通常略少，所以實際占流通比例會略高一點，網站會寫明）。
+    ETF 沒有放空占比與機構持股，只算 Beta。台股：用自建 tw_hist 與加權／櫃買指數算 Beta，沒有放空與機構資料。查不到的欄位留空，不編。"""
+    out, notes = [], []
+    us = sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol")})
+    kinds = {str(h.get("symbol")).strip().upper(): h.get("kind") for h in (holdings or []) if h.get("market") == "US" and h.get("symbol")}
+    if us:
+        spy, why = _nasdaq_rows("SPY", "etf", 400)
+        spy_c = {r["date"].isoformat(): r["close"] for r in (spy or [])}
+        if not spy_c:
+            notes.append(f"SPY 歷史取不到（{why}），美股不算 Beta")
+        for sym in us:
+            is_etf = kinds.get(sym) in ("etf", "leveraged_etf")
+            row = {"market": "US", "code": sym, "beta": None, "beta_n": None, "short_shares": None, "short_pct": None, "days_to_cover": None, "short_as_of": None, "inst_pct": None, "source": "Nasdaq（歷史行情自算 Beta；放空餘額、機構持股為資料商公布）"}
+            rows_, w = _nasdaq_rows(sym, "etf" if is_etf else "stocks", 400)
+            time.sleep(1)
+            last_px = rows_[-1]["close"] if rows_ else None
+            if rows_ and spy_c:
+                row["beta"], row["beta_n"] = calc_beta({r["date"].isoformat(): r["close"] for r in rows_}, spy_c)
+            elif not rows_:
+                notes.append(f"{sym} 歷史（{w}）")
+            if not is_etf:
+                shares_out = None
+                st, ct, body, err = fetch_raw(f"https://api.nasdaq.com/api/company/{sym}/institutional-holdings?limit=1&type=TOTAL&sortColumn=marketValue&sortOrder=DESC", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+                time.sleep(1)
+                try:
+                    inst = parse_nasdaq_institutional(json.loads(body.decode("utf-8-sig"))) if st == 200 else None
+                except (ValueError, UnicodeDecodeError):
+                    inst = None
+                if inst:
+                    row["inst_pct"], shares_out = inst["pct"], inst["shares_out"]
+                else:
+                    notes.append(f"{sym} 機構持股（HTTP {st}）")
+                st, ct, body, err = fetch_raw(f"https://api.nasdaq.com/api/quote/{sym}/short-interest?assetClass=stocks", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+                time.sleep(1)
+                try:
+                    si = parse_nasdaq_short_interest(json.loads(body.decode("utf-8-sig"))) if st == 200 else None
+                except (ValueError, UnicodeDecodeError):
+                    si = None
+                if si:
+                    row["short_shares"], row["days_to_cover"], row["short_as_of"] = si["shares"], si["days_to_cover"], si["settle"]
+                    if shares_out is None and last_px:
+                        st, ct, body, err = fetch_raw(f"https://api.nasdaq.com/api/quote/{sym}/summary?assetclass=stocks", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+                        time.sleep(1)
+                        try:
+                            mc = (((json.loads(body.decode("utf-8-sig")).get("data") or {}).get("summaryData") or {}).get("MarketCap") or {}).get("value") if st == 200 else None
+                            mcv = parse_number(re.sub(r"[$,\s]", "", str(mc or "")))
+                            shares_out = mcv / last_px if mcv and mcv > 0 else None
+                        except (ValueError, UnicodeDecodeError, AttributeError):
+                            shares_out = None
+                    if shares_out and shares_out > 0:
+                        pct = si["shares"] / shares_out * 100
+                        row["short_pct"] = round(pct, 2) if 0 <= pct <= 150 else None
+                else:
+                    notes.append(f"{sym} 放空餘額（HTTP {st}）")
+            out.append(row)
+    codes = sorted({str(c).strip() for c in (tw_codes or []) if c} | (_tw_watch_codes() if sb_ready() else set()))
+    if codes and sb_ready():
+        twse, e1 = sb_request("GET", "market_stats?select=as_of,close&market=eq.TW&source=eq.TWSE%20FMTQIK&order=as_of.desc&limit=400")
+        otc, e2 = sb_request("GET", "tw_otc_index?select=as_of,close&order=as_of.desc&limit=400")
+        mk_idx = {"TWSE": {str(r["as_of"]): float(r["close"]) for r in (twse if isinstance(twse, list) else []) if r.get("close")},
+                  "TPEX": {str(r["as_of"]): float(r["close"]) for r in (otc if isinstance(otc, list) else []) if r.get("close")}}
+        since = (date.today() - timedelta(days=380)).isoformat()
+        for code in codes:
+            hist, err = sb_request("GET", f"tw_hist?select=market,as_of,close&code=eq.{code}&as_of=gte.{since}&order=as_of.asc&limit=1000")
+            rows_ = [r for r in (hist if isinstance(hist, list) else []) if r.get("close") is not None]
+            if not rows_:
+                notes.append(f"{code} 自建歷史沒有")
+                continue
+            mk = "TWSE" if str(rows_[-1].get("market")) == "TWSE" else "TPEX"
+            beta, n = calc_beta({str(r["as_of"]): float(r["close"]) for r in rows_ if str(r.get("market")) == str(rows_[-1].get("market"))}, mk_idx[mk])
+            if beta is None:
+                notes.append(f"{code} Beta 不夠資料（{n} 筆報酬）")
+            out.append({"market": "TW", "code": code, "beta": beta, "beta_n": n if beta is not None else None, "short_shares": None, "short_pct": None, "days_to_cover": None, "short_as_of": None, "inst_pct": None,
+                        "source": "自建歷史行情對" + ("加權指數" if mk == "TWSE" else "櫃買指數") + "的近一年日報酬自算"})
+    n_b, n_s, n_i = sum(1 for r in out if r["beta"] is not None), sum(1 for r in out if r["short_pct"] is not None), sum(1 for r in out if r["inst_pct"] is not None)
+    log("stock_risk_stats", "success" if out else "no_new_data", detail=_clip(f"{len(out)} 檔：Beta {n_b}、放空占比 {n_s}、機構持股 {n_i}" + (f"；沒有：{'、'.join(notes[:10])}" if notes else "")))
+    return out
+
+
+def _tw_watch_codes():
+    """台股候選股代號（private_watchlist），讀不到就回空集合。"""
+    wl, _e = sb_request("GET", "private_watchlist?select=code&limit=500")
+    return {str(r.get("code")).strip() for r in (wl if isinstance(wl, list) else []) if isinstance(r, dict) and re.fullmatch(r"\d{4,6}[A-Z]?", str(r.get("code") or "").strip())}
+
+
 def nasdaq_summary_items(j, limit=45):
     """診斷用：把 Nasdaq 個股摘要裡每個項目寫成「鍵｜標籤｜值」，看實際有哪些欄位（本益比抓不到時用）。"""
     sd = (((j or {}).get("data") or {}).get("summaryData")) if isinstance(j, dict) else None
@@ -5975,6 +6130,7 @@ def run_job(job, dry_run=False):
             extra.append(("twd_rates", _run_module("M36", "Yahoo 補美元兌台幣落後的天數（非官方）", yahoo_twd_fill, twd_hist) or [], "layer,source,as_of"))
             extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, with_us_watch(hold or [], us_watch)) or [], "symbol"))
             extra.append(("us_valuation", _run_module("M39", "美股本益比（Nasdaq 個股摘要）", us_valuation, with_us_watch(hold or [], us_watch)) or [], "symbol"))
+            extra.append(("stock_risk_stats", _run_module("M45", "個股 Beta、放空占比、機構持股", stock_risk_stats, with_us_watch(hold or [], us_watch), sorted({str(r.get("code")) for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")})) or [], "market,code"))
             extra.append(("tw_otc_index", _run_module("M40", "櫃買指數（櫃買中心開放資料）", tw_otc_index) or [], "as_of"))
             extra.append(("tw_rel_strength", _run_module("M41", "個股對大盤（近 5、20 日）", tw_rel_strength, price_rows or []) or [], "code"))
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))

@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "cboe_pc_csv_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "sox_history", "cboe_pc_csv_history", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength", "stock_risk_stats")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -6643,3 +6643,56 @@ def test_cboe_pc_csv_history_only_adds_missing_dates_and_never_raises():
     with mock.patch.object(fetch, "fetch_raw", return_value=(None, "", b"", "timeout")):
         assert REAL["cboe_pc_csv_history"]() == []
     assert [x for x in fetch.LOG if x["source"] == "cboe_pc_csv"][0]["status"] == "no_new_data"
+
+
+def test_calc_beta_regression_slope_and_guards():
+    import random
+    random.seed(1)
+    d0 = date(2026, 1, 1)
+    idx, stk, pi, ps = {}, {}, 100.0, 50.0
+    for i in range(200):
+        d = (d0 + timedelta(days=i)).isoformat()
+        r = random.uniform(-0.02, 0.02)
+        pi *= 1 + r; ps *= 1 + 1.6 * r
+        idx[d], stk[d] = pi, ps
+    b, n = fetch.calc_beta(stk, idx)
+    assert n == 199 and 1.55 <= b <= 1.65, (b, n)
+    assert fetch.calc_beta(stk, idx, min_pairs=500) == (None, 199)
+    sparse = {k: v for i, (k, v) in enumerate(sorted(stk.items())) if i % 10 == 0}
+    assert fetch.calc_beta(sparse, idx)[0] is None
+
+
+def test_parse_nasdaq_short_interest_and_institutional():
+    j = {"data": {"shortInterestTable": {"rows": [{"settlementDate": "10/15/2026", "interest": "12,000,000", "avgDailyShareVolume": "5,000,000", "daysToCover": "2.4"}, {"settlementDate": "09/30/2026", "interest": "9,000,000", "daysToCover": "1.0"}]}}}
+    r = fetch.parse_nasdaq_short_interest(j)
+    assert r == {"settle": "2026-10-15", "shares": 12000000.0, "days_to_cover": 2.4}, r
+    assert fetch.parse_nasdaq_short_interest({"data": None}) is None
+    i = fetch.parse_nasdaq_institutional({"data": {"ownershipSummary": {"SharesOutstandingPCT": {"label": "Institutional Ownership", "value": "72.67%"}, "ShareoutstandingTotal": {"label": "Total Shares Outstanding (millions)", "value": "15,334"}}}})
+    assert i == {"pct": 72.67, "shares_out": 15334000000.0}, i
+    assert fetch.parse_nasdaq_institutional({"data": {"ownershipSummary": {"SharesOutstandingPCT": {"value": "900%"}}}}) is None
+
+
+def test_stock_risk_stats_us_computes_beta_short_pct_and_inst_and_leaves_missing_empty():
+    reset()
+    d0 = date.today() - timedelta(days=260)
+    spy_rows, st_rows = [], []
+    import random
+    random.seed(2)
+    p, q = 400.0, 100.0
+    for i in range(260):
+        r = random.uniform(-0.015, 0.015); p *= 1 + r; q *= 1 + 2.2 * r
+        spy_rows.append({"date": d0 + timedelta(days=i), "close": p, "volume": 1}); st_rows.append({"date": d0 + timedelta(days=i), "close": q, "volume": 1})
+    def rows(sym, ac="etf", days=75, end=None):
+        return (spy_rows if sym == "SPY" else st_rows), ""
+    def raw(url, **kw):
+        if "institutional-holdings" in url:
+            return 200, "application/json", json.dumps({"data": {"ownershipSummary": {"SharesOutstandingPCT": {"value": "60.5%"}, "ShareoutstandingTotal": {"label": "Total Shares Outstanding (millions)", "value": "100"}}}}).encode(), ""
+        if "short-interest" in url:
+            return 200, "application/json", json.dumps({"data": {"shortInterestTable": {"rows": [{"settlementDate": "10/31/2026", "interest": "12,000,000", "daysToCover": "3.1"}]}}}).encode(), ""
+        return 404, "", b"", "nope"
+    with mock.patch.object(fetch, "_nasdaq_rows", rows), mock.patch.object(fetch, "fetch_raw", raw), mock.patch.object(fetch.time, "sleep", lambda s: None), mock.patch.object(fetch, "sb_ready", lambda: False):
+        out = REAL["stock_risk_stats"]([{"market": "US", "symbol": "AAA", "kind": "stock"}, {"market": "US", "symbol": "QQQ", "kind": "etf"}], [])
+    a = [r for r in out if r["code"] == "AAA"][0]; e = [r for r in out if r["code"] == "QQQ"][0]
+    assert 2.1 <= a["beta"] <= 2.3 and a["inst_pct"] == 60.5 and a["short_pct"] == 12.0 and a["days_to_cover"] == 3.1 and a["short_as_of"] == "2026-10-31", a
+    assert e["beta"] is not None and e["short_pct"] is None and e["inst_pct"] is None, e
+    assert [x for x in fetch.LOG if x["source"] == "stock_risk_stats"][0]["status"] == "success"
