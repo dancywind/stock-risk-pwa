@@ -67,7 +67,7 @@ TWSE_RWD_BASE = "https://www.twse.com.tw/rwd/zh"   # 臺股儀表板頁面程式
 OTC_INDEX_RANGE = (20.0, 5000.0)           # 櫃買指數收盤的合理範圍
 KEEP_RATE_DAYS = 30                         # 全市場擔保維持率：向儀表板要最近幾天（伺服器不支援時只會回 5 天，也沒關係，每天累積）
 KEEP_RATE_RANGE = (60.0, 400.0)             # 全市場擔保維持率的合理範圍（%）
-TWD_HISTORY_DAYS = 400                      # 台幣每日收盤歷史回補的天數
+TWD_HISTORY_DAYS = 3700                     # 台幣每日收盤歷史回補的天數
 TWD_RANGE = (20.0, 45.0)  # 美元兌台幣合理範圍
 
 # 排程工作：每個工作只做自己的事
@@ -146,6 +146,8 @@ TPEX_DAY_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={slash}&
 HIST_SLEEP = 3.0                  # 每次請求之間等幾秒，避免被交易所限流
 PC_BATCH_DAYS = 80                 # Put/Call 歷史每次最多補幾個美股交易日
 PC_SLEEP = 1.0                    # CBOE 每次請求之間等幾秒
+MARGIN_LONG_BATCH = 250                  # 融資長期回補（M38）每次最多補幾個交易日
+MARGIN_LONG_MINUTES = 12                 # 融資長期回補每次最多跑幾分鐘（工作上限 30 分鐘）
 MARGIN_BATCH_DAYS = 70             # 上市融資餘額歷史每次最多補幾個交易日（每天 1 次請求）
 INST_BATCH_DAYS = 70               # 外資買賣超歷史每次最多補幾個交易日（每天 1 次請求）
 HIST_BATCH_DAYS = 70              # 每次回補最多處理幾個交易日（約 15 到 20 分鐘，低於工作的 30 分鐘上限）
@@ -176,7 +178,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v92"
+PIPELINE_VERSION = "v93"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")

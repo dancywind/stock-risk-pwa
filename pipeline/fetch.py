@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v92"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v93"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -734,6 +734,68 @@ def tw_margin_backfill(max_days=None):
     log("margin_backfill", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
         detail=_clip(f"本次補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") +
                      f"；略過 {skipped} 天（證交所沒有資料）、{bad} 天（日期或數字驗證不過" + (f"：{first_err}" if first_err else "") + f"）；還有 {max(len(todo_all) - len(todo), 0)} 天下次繼續"))
+    return out
+
+
+def tw_margin_long_backfill(max_days=None):
+    """模組 M38：把上市融資餘額往前回補到 INDEX_LONG_YEARS 年前（給計分卡歷史驗證用，M19 只補近 400 天）。
+    交易日以資料庫裡加權指數的歷史（market_stats，M05／M24 寫入）為準，扣掉 tw_margin 已經有的；每次最多 MARGIN_LONG_BATCH 天、最多跑 MARGIN_LONG_MINUTES 分鐘，
+    由新到舊補。每一天的驗證和每日更新相同（日期要對、前日＋買進－賣出－償還＝今日、餘額在合理範圍）。
+    連線失敗就整批停止；某天沒有資料或驗證不過只略過那一天（太舊的日期證交所格式不同時會被略過，不會寫進錯的數字）。重跑不會重複（主鍵是日期）。"""
+    max_days = max_days or config.MARGIN_LONG_BATCH
+    if not sb_ready():
+        log("margin_long", "skipped", detail="未設定 Supabase，無法判斷哪些日期已經補過，不回補")
+        return []
+    start = date.today() - timedelta(days=int(config.INDEX_LONG_YEARS * 365))
+    days, have = [], set()
+    for off in range(0, 3000, 1000):
+        got, err = sb_request("GET", f"market_stats?select=as_of&source=eq.TWSE%20FMTQIK&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000&offset={off}")
+        if got is None:
+            log("margin_long", "failure", detail=_clip(f"讀取交易日清單失敗：{err}"))
+            return []
+        days.extend(r["as_of"] for r in got)
+        if len(got) < 1000:
+            break
+    for off in range(0, 3000, 1000):
+        got, err = sb_request("GET", f"tw_margin?select=as_of&source=eq.TWSE%20MI_MARGN&as_of=gte.{start.isoformat()}&order=as_of.desc&limit=1000&offset={off}")
+        if got is None:
+            log("margin_long", "failure", detail=_clip(f"讀取已有的融資日期失敗：{err}"))
+            return []
+        have.update(r["as_of"] for r in got)
+        if len(got) < 1000:
+            break
+    todo_all = [d for d in days if d not in have]
+    if not todo_all:
+        log("margin_long", "no_new_data", detail=f"{len(days)} 個交易日的融資餘額都已經補齊")
+        return []
+    out, skipped, bad, first_err, tried = [], 0, 0, "", 0
+    t0 = time.time()
+    for d in todo_all[:max_days]:
+        if time.time() - t0 > config.MARGIN_LONG_MINUTES * 60:
+            break
+        tried += 1
+        data, err = fetch_json(config.TWSE_MI_MARGN + "&date=" + d.replace("-", ""))
+        time.sleep(config.HIST_SLEEP)
+        if data is None:
+            log("margin_long", "failure", as_of=d, detail=_clip(f"抓取失敗：{err}；已停止本次回補，不繼續打請求"))
+            break
+        if not isinstance(data, dict) or data.get("stat") != "OK":
+            skipped += 1
+            continue
+        as_of = twse_ymd_to_iso(data.get("date"))
+        if as_of != d:
+            bad += 1
+            first_err = first_err or f"要 {d} 但證交所回傳 {as_of}"
+            continue
+        row, perr = _parse_margin(data)
+        if perr:
+            bad += 1
+            first_err = first_err or f"{d}：{perr}"
+            continue
+        out.append({"as_of": as_of, **row})
+    log("margin_long", "success" if out else "no_new_data", as_of=out[0]["as_of"] if out else None,
+        detail=_clip(f"本次試 {tried} 天，補 {len(out)} 天" + (f"（{out[-1]['as_of']} 到 {out[0]['as_of']}）" if out else "") +
+                     f"；略過 {skipped} 天（證交所沒有資料）、{bad} 天（驗證不過" + (f"：{first_err}" if first_err else "") + f"）；還有 {max(len(todo_all) - tried, 0)} 天下次繼續"))
     return out
 
 
@@ -5754,6 +5816,7 @@ def run_job(job, dry_run=False):
             inst_hist = _run_module("M12", "外資買賣歷史回補", tw_institutional_backfill) or []
             pc_rows = _run_module("M14", "Put/Call 歷史回補", cboe_putcall_backfill) or []
             margin_hist = _run_module("M19", "上市融資餘額歷史回補", tw_margin_backfill) or []
+            margin_hist = margin_hist + (_run_module("M38", "上市融資餘額長期回補（10 年）", tw_margin_long_backfill) or [])
             index_long = _run_module("M24", "加權指數長期歷史回補", tw_index_long_history) or []
             us_long = _run_module("M35", "美股指數長期歷史（標普 500、Nasdaq 綜合，FRED）", us_index_long_history) or []
     if job in ("full", "tw_close") and not dry_run:

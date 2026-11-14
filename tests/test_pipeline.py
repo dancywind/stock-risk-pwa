@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_long_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -6416,6 +6416,33 @@ def test_margin_backfill_fetches_missing_days_validates_dates_and_numbers():
     assert [r["as_of"] for r in rows] == [D(4)]
     d = [x for x in fetch.LOG if x["source"] == "margin_backfill"][0]["detail"]
     assert "略過 1 天（證交所沒有資料）、2 天" in d and "要 " + D(1) + " 但證交所回傳 " + D(9) in d, d
+
+
+def test_margin_long_backfill_uses_index_days_skips_existing_and_stops_on_failure():
+    reset()
+    days = [D(i) for i in range(1, 6)]
+    def req(method, path, body=None, **k):
+        if path.startswith("market_stats"): return ([{"as_of": d} for d in days] if "offset=0" in path else []), ""
+        if path.startswith("tw_margin"): return ([{"as_of": D(2)}] if "offset=0" in path else []), ""
+        raise AssertionError(path)
+    urls = []
+    def fj(url, **k):
+        urls.append(url); d = url.split("date=")[1][:8]
+        if d == D(4).replace("-", ""): return None, "HTTP 403"
+        return margin_payload(date_str=d), ""
+    patches = [mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=req), mock.patch.object(fetch, "fetch_json", side_effect=fj), mock.patch.object(fetch.time, "sleep")]
+    rows = _with(patches, lambda: REAL["tw_margin_long_backfill"]())
+    assert [r["as_of"] for r in rows] == [D(1), D(3)] and len(urls) == 3, "已有的不重抓；連線失敗整批停止"
+    lg = [x for x in fetch.LOG if x["source"] == "margin_long"]
+    assert lg[0]["status"] == "failure" and "不繼續打請求" in lg[0]["detail"] and lg[-1]["status"] == "success"
+    reset()
+    patches[2] = mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (margin_payload(date_str=u.split("date=")[1][:8]), ""))
+    days[:] = [D(1)]
+    def req2(method, path, body=None, **k):
+        return ([{"as_of": D(1)}] if "offset=0" in path else []), ""
+    patches[1] = mock.patch.object(fetch, "sb_request", side_effect=req2)
+    assert _with(patches, lambda: REAL["tw_margin_long_backfill"]()) == []
+    assert [x for x in fetch.LOG if x["source"] == "margin_long"][0]["status"] == "no_new_data"
 
 
 def test_margin_backfill_cap_stop_on_failure_and_nothing_to_do():
