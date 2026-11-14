@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v89"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v90"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1245,6 +1245,13 @@ def probe_vix_otc():
                 links.append(h)
         rows = len(re.findall(r"<tr", html))
         log(f"probe:{name}", "success", detail=_clip(f"{url}｜{len(body)} 位元組｜有「臺指選擇權波動率指數」字樣 {('臺指選擇權波動率指數' in html)}｜<tr> {rows} 列｜可能的資料連結 {len(links)} 個：" + " ## ".join(links[:14]), 1400))
+        trs = [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", x)).strip() for x in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I)]
+        trs = [x for x in trs if x][:14]
+        js_urls = []
+        for m in re.finditer(r"[\"'](/[^\"'\s<>]*(?:vix|Vix|VIX)[^\"'\s<>]*)[\"']", html):                      # 程式碼裡寫死的資料網址（表格的值可能是 JavaScript 另外載入）
+            if m.group(1) not in js_urls and m.group(1) not in links:
+                js_urls.append(m.group(1))
+        log(f"probe:{name}_table", "success", detail=_clip(f"表格各列的文字（前 {len(trs)} 列）：" + " ## ".join(trs) + f"｜程式碼裡的其他網址 {len(js_urls)} 個：" + " ## ".join(js_urls[:10]), 1500))
         data_links = [l_ for l_ in links if re.search(r"\.(csv|zip|txt|xls)|download", l_, re.I)][:2]
         for l_ in data_links:
             full = urllib.parse.urljoin(url, l_)
@@ -3943,13 +3950,14 @@ def parse_nasdaq_summary(j):
     if not isinstance(sd, dict) or not sd:
         return None, "沒有 summaryData（ETF、代號不存在或格式變了）"
 
-    def pick(keys, label_re):
+    def pick(keys, label_re, avoid=None):
         for k in keys:
             it = sd.get(k)
             if isinstance(it, dict) and "value" in it:
                 return it.get("value")
         for it in sd.values():
-            if isinstance(it, dict) and re.search(label_re, str(it.get("label", "")), re.I):
+            lab = str(it.get("label", "")) if isinstance(it, dict) else ""
+            if isinstance(it, dict) and re.search(label_re, lab, re.I) and not (avoid and re.search(avoid, lab, re.I)):
                 return it.get("value")
         return None
 
@@ -3962,8 +3970,97 @@ def parse_nasdaq_summary(j):
         except ValueError:
             return None
         return x if lo < x <= hi else None
-    return {"pe": num(pick(("PERatio",), r"^P/?E\s*Ratio"), 0, 3000), "forward_pe": num(pick(("ForwardPE1Yr",), r"Forward\s*P/?E"), 0, 3000),
+    return {"pe": num(pick(("PERatio", "PeRatio", "peRatio"), r"P/?E|Price\s*/\s*Earnings", r"Forward|Fwd|PEG|Est"), 0, 3000), "forward_pe": num(pick(("ForwardPE1Yr", "ForwardPE"), r"(Forward|Fwd).*P/?E|P/?E.*(Forward|Fwd)"), 0, 3000),
             "eps": num(pick(("EarningsPerShare",), r"Earnings Per Share|\bEPS\b"), -1000, 100000), "prev_close": num(pick(("PreviousClose",), r"Previous Close"), 0, 1e7)}, None
+
+
+def tw_otc_index():
+    """模組 M40：櫃買指數的每日收盤（櫃買中心開放資料 /tpex_index：只有最近約 10 個交易日，沒有日期參數，所以靠每天累積）。
+    每天驗證：日期是 YYYYMMDD 且不在未來、收盤在合理範圍內；不合格的略過。回傳要寫進 tw_otc_index 的列。"""
+    obj, err = fetch_json(config.TPEX_DEFAULT_BASE + "/tpex_index", headers=DASH_HEADERS)
+    if not isinstance(obj, list):
+        log("tw_otc_index", "no_new_data", detail=_clip(f"櫃買指數抓不到或格式不對：{err or type(obj).__name__}"))
+        return []
+    low, high = config.OTC_INDEX_RANGE
+    out, skipped, today = [], 0, date.today()
+    for r in obj:
+        if not isinstance(r, dict):
+            skipped += 1
+            continue
+        raw = str(r.get("Date", "")).strip()
+        try:
+            d_ = datetime.strptime(raw, "%Y%m%d").date()
+        except ValueError:
+            skipped += 1
+            continue
+        close = parse_number(r.get("Close"))
+        if d_ > today or close is None or not (low <= close <= high):
+            skipped += 1
+            continue
+        out.append({"as_of": d_.isoformat(), "open": parse_number(r.get("Open")), "high": parse_number(r.get("High")), "low": parse_number(r.get("Low")), "close": close, "change": parse_number(r.get("Change")), "source": "櫃買中心開放資料 tpex_index"})
+    out.sort(key=lambda x: x["as_of"])
+    if not out:
+        log("tw_otc_index", "no_new_data", detail=_clip(f"沒有可用的櫃買指數資料（略過 {skipped} 筆不符的）"))
+        return []
+    log("tw_otc_index", "success", as_of=out[-1]["as_of"], detail=_clip(f"櫃買指數 {out[-1]['close']}（{out[-1]['as_of']}）；{len(out)} 天（{out[0]['as_of']} 到 {out[-1]['as_of']}）" + (f"；略過 {skipped} 筆不符的" if skipped else "")))
+    return out
+
+
+def tw_rel_strength(price_rows):
+    """模組 M41：台股持股與候選股「近 5 日、近 20 日」的漲跌，給網站和大盤比較用（上市對加權指數、上櫃對櫃買指數）。
+    用自建歷史 tw_hist（不指定市場，從歷史列本身看這檔是上市還是上櫃）。每一項都要通過檢查才給：
+    5 日前那一筆要在 5 到 12 個日曆天之前、20 日前那一筆要在 25 到 45 個日曆天之前（歷史有缺漏就不算，不拿更早的充數）；最新一筆距今不能超過 10 天。
+    寫進獨立的 tw_rel_strength（不動 stock_prices）：這個資料表沒建好時，只有這一項失敗。"""
+    if not sb_ready():
+        log("tw_rel_strength", "skipped", detail="未設定 Supabase，不算個股對大盤")
+        return []
+    codes = {str(r.get("code")).strip() for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")}
+    wl, _e = sb_request("GET", "private_watchlist?select=code&limit=500")
+    for r in (wl or []):
+        c_ = str((r or {}).get("code", "")).strip()
+        if re.fullmatch(r"\d{4,6}[A-Z]?", c_):
+            codes.add(c_)
+    if not codes:
+        log("tw_rel_strength", "no_new_data", detail="沒有台股持股或候選股")
+        return []
+    since = (date.today() - timedelta(days=70)).isoformat()
+    out, miss = [], []
+    for code in sorted(codes):
+        hist, err = sb_request("GET", f"tw_hist?select=market,as_of,close&code=eq.{code}&as_of=gte.{since}&order=as_of.asc&limit=300")
+        rows = []
+        for r in (hist if isinstance(hist, list) else []):
+            try:
+                rows.append({"market": str(r["market"]), "as_of": str(r["as_of"]), "close": float(r["close"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not rows:
+            miss.append(f"{code}（自建歷史沒有這檔）")
+            continue
+        mk = rows[-1]["market"]
+        rows = [r for r in rows if r["market"] == mk and r["close"] > 0]
+        last = rows[-1]
+        d0 = date.fromisoformat(last["as_of"])
+        if (date.today() - d0).days > 10:
+            miss.append(f"{code}（最新一筆 {last['as_of']} 太舊）")
+            continue
+        prior = rows[:-1]
+        row = {"code": code, "mkt": mk, "as_of": last["as_of"], "close": last["close"], "ret_5d": None, "ret_5d_from": None, "ret_20d": None, "ret_20d_from": None}
+        if len(prior) >= 5 and 5 <= (d0 - date.fromisoformat(prior[-5]["as_of"])).days <= 12:
+            row["ret_5d"], row["ret_5d_from"] = round((last["close"] / prior[-5]["close"] - 1) * 100, 2), prior[-5]["as_of"]
+        if len(prior) >= 20 and 25 <= (d0 - date.fromisoformat(prior[-20]["as_of"])).days <= 45:
+            row["ret_20d"], row["ret_20d_from"] = round((last["close"] / prior[-20]["close"] - 1) * 100, 2), prior[-20]["as_of"]
+        out.append(row)
+    n5 = sum(1 for r in out if r["ret_5d"] is not None)
+    log("tw_rel_strength", "success" if out else "no_new_data", detail=_clip(f"{len(codes)} 檔：算出 {len(out)} 檔（其中近 5 日 {n5} 檔；上市 {sum(1 for r in out if r['mkt'] == 'TWSE')}、上櫃 {sum(1 for r in out if r['mkt'] == 'TPEX')}）" + (f"；沒有：{'、'.join(miss[:8])}" if miss else "")))
+    return out
+
+
+def nasdaq_summary_items(j, limit=45):
+    """診斷用：把 Nasdaq 個股摘要裡每個項目寫成「鍵｜標籤｜值」，看實際有哪些欄位（本益比抓不到時用）。"""
+    sd = (((j or {}).get("data") or {}).get("summaryData")) if isinstance(j, dict) else None
+    if not isinstance(sd, dict):
+        return "沒有 summaryData；頂層鍵 " + (str(list(j.keys())[:8]) if isinstance(j, dict) else type(j).__name__) + (f"；data 的鍵 {list((j.get('data') or {}).keys())[:10]}" if isinstance(j, dict) and isinstance(j.get("data"), dict) else "")
+    return " ## ".join(f"{k}｜{(it or {}).get('label') if isinstance(it, dict) else ''}｜{(it or {}).get('value') if isinstance(it, dict) else it}" for k, it in list(sd.items())[:limit])
 
 
 def us_valuation(holdings):
@@ -3974,7 +4071,7 @@ def us_valuation(holdings):
     if not syms:
         log("us_valuation", "skipped", detail="沒有美股個股代號，不查本益比")
         return []
-    out, miss = [], []
+    out, miss, shape = [], [], None
     for sym in syms:
         status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/quote/{sym}/summary?assetclass=stocks", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
         time.sleep(1)
@@ -3982,15 +4079,24 @@ def us_valuation(holdings):
             miss.append(f"{sym}（HTTP {status} {err}）".strip())
             continue
         try:
-            vals, why = parse_nasdaq_summary(json.loads(body.decode("utf-8-sig")))
+            j_ = json.loads(body.decode("utf-8-sig"))
+            vals, why = parse_nasdaq_summary(j_)
         except (ValueError, UnicodeDecodeError):
             miss.append(f"{sym}（不是 JSON）")
             continue
+        if shape is None or (vals is not None and vals.get("pe") is None and "（" not in shape.split("｜")[0]):
+            shape = f"{sym}｜" + nasdaq_summary_items(j_)                                 # 第一檔、或第一檔本益比抓不到的：把實際欄位記下來
         if vals is None:
             miss.append(f"{sym}（{why}）")
             continue
-        out.append({"symbol": sym, **vals, "source": "Nasdaq 個股摘要（本益比用過去四季盈餘；預估本益比是資料商的 1 年預估，不是共識中位數）"})
+        src = "Nasdaq 個股摘要（本益比用過去四季盈餘；預估本益比是資料商的 1 年預估，不是共識中位數）"
+        if vals.get("pe") is None and vals.get("eps") and vals["eps"] > 0 and vals.get("prev_close"):          # Nasdaq 沒直接給本益比，但有每股盈餘與前一日收盤：自己算並標明
+            vals = dict(vals, pe=round(vals["prev_close"] / vals["eps"], 2))
+            src = "Nasdaq 個股摘要（本益比是「前一日收盤 ÷ 每股盈餘」自己算的，因為 Nasdaq 沒直接提供；預估本益比是資料商的 1 年預估，不是共識中位數）"
+        out.append({"symbol": sym, **vals, "source": src})
     n_pe, n_fw = sum(1 for r in out if r["pe"] is not None), sum(1 for r in out if r["forward_pe"] is not None)
+    if shape:
+        log("us_valuation_shape", "success", detail=_clip("Nasdaq 摘要實際的欄位（鍵｜標籤｜值）：" + shape, 1800))
     log("us_valuation", "success" if out else "no_new_data", detail=_clip(f"{len(syms)} 檔個股：摘要有 {len(out)} 檔（有本益比 {n_pe}、有預估本益比 {n_fw}）" + (f"；沒有：{'、'.join(miss[:8])}" if miss else "")))
     return out
 
@@ -5639,6 +5745,8 @@ def run_job(job, dry_run=False):
             extra.append(("twd_rates", _run_module("M36", "Yahoo 補美元兌台幣落後的天數（非官方）", yahoo_twd_fill, twd_hist) or [], "layer,source,as_of"))
             extra.append(("us_sector_auto", _run_module("M26", "美股產業自動帶入（Nasdaq）", us_sector_lookup, with_us_watch(hold or [], us_watch)) or [], "symbol"))
             extra.append(("us_valuation", _run_module("M39", "美股本益比（Nasdaq 個股摘要）", us_valuation, with_us_watch(hold or [], us_watch)) or [], "symbol"))
+            extra.append(("tw_otc_index", _run_module("M40", "櫃買指數（櫃買中心開放資料）", tw_otc_index) or [], "as_of"))
+            extra.append(("tw_rel_strength", _run_module("M41", "個股對大盤（近 5、20 日）", tw_rel_strength, price_rows or []) or [], "code"))
             extra.append(("tw_fin_q_ext", _run_module("M25", "三率歷史季度（FinMind，第三方）", finmind_fin_history, price_rows or []) or [], "code,year,quarter"))
     if job in ("full", "tw_close") and not dry_run:
         extra.append(("macro_series", _run_module("M18", "美股指數官方行情（補 FRED 落後）", us_index_quotes) or [], "series_id,as_of"))

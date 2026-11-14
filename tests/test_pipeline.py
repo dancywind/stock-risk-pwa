@@ -16,7 +16,7 @@ D = lambda n: (TODAY - timedelta(days=n)).isoformat()  # noqa: E731
 
 MODULE_FUNCS = ("us_extra_quotes", "sector_rs", "tw_leaders_compute", "tw_index_history", "fred_history_backfill",
                 "tw_financials", "us_crash_screen", "aaii_sentiment", "us_leaders_compute", "tw_investor_events",
-                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc")
+                "tw_institutional_backfill", "tw_breadth_hist_compute", "cboe_putcall_backfill", "tw_exright_preview", "tw_exright_history", "tw_industry_collect", "us_index_quotes", "tw_margin_backfill", "tw_margin_ratio_est", "us_options_snapshot", "tw_options_snapshot", "tw_pcr_official", "tw_index_long_history", "us_sector_lookup", "finmind_fin_history", "yahoo_fill", "tw_retail_ratio", "tpex_margin_daily", "watch_valuation", "yahoo_dxy", "us_breadth_ndx", "cftc_cot_ndx", "us_daily_bars", "probe_dashboard", "probe_fin_coverage", "load_us_watch", "probe_nasdaq_access", "us_index_long_history", "yahoo_twd_fill", "twd_fred_history", "tw_keep_rate", "probe_chips", "us_valuation", "probe_vix_otc", "tw_otc_index", "tw_rel_strength")
 REAL = {n: getattr(fetch, n) for n in MODULE_FUNCS}          # 模組真正的函式；測試模組本身時用 REAL[...]
 OFFENDERS = []
 NETWORK_CALLS = []                                             # 任何沒有被測試替換掉的真實連線都會記在這裡，最後整個測試會失敗
@@ -5614,6 +5614,30 @@ def test_us_valuation_fetches_each_stock_summary_skips_etfs_and_logs_what_is_mis
     assert fetch.LOG[-1]["status"] == "no_new_data" and "AMD（HTTP 403" in fetch.LOG[-1]["detail"] and not [x for x in fetch.LOG if x["status"] == "failure"], "被擋：只記錄、不變紅"
 
 
+def test_parse_nasdaq_summary_accepts_other_label_wordings_and_never_mixes_up_forward_and_trailing():
+    p = fetch.parse_nasdaq_summary
+    def mk(items): return {"data": {"summaryData": {f"K{i}": {"label": lab, "value": v} for i, (lab, v) in enumerate(items)}}}
+    v, _w = p(mk([("PE Ratio (TTM)", "41.5"), ("Forward P/E (1yr)", "30.2"), ("PEG Ratio", "2.1"), ("EPS", "$3.4"), ("Previous Close", "$140.00")])); assert v["pe"] == 41.5 and v["forward_pe"] == 30.2 and v["eps"] == 3.4 and v["prev_close"] == 140.0, v
+    v, _w = p(mk([("Forward P/E 1 Yr.", "28.0"), ("P/E Ratio", "N/A")])); assert v["pe"] is None and v["forward_pe"] == 28.0, "只有預估、沒有本益比：兩者不互相冒充: " + str(v)
+    v, _w = p(mk([("PEG Ratio", "1.5")])); assert v["pe"] is None and v["forward_pe"] is None, "PEG 不是本益比"
+    items = fetch.nasdaq_summary_items(mk([("P/E Ratio", "N/A"), ("Market Cap", "1,000")])); assert "K0｜P/E Ratio｜N/A" in items and "K1｜Market Cap｜1,000" in items, items
+    assert "沒有 summaryData" in fetch.nasdaq_summary_items({"data": {"x": 1}}) and "沒有 summaryData" in fetch.nasdaq_summary_items(None)
+
+
+def test_us_valuation_derives_pe_from_eps_when_nasdaq_gives_none_marks_it_and_logs_the_real_field_list():
+    reset()
+    body = json.dumps({"data": {"summaryData": {"PERatio": {"label": "P/E Ratio", "value": "N/A"}, "EarningsPerShare": {"label": "Earnings Per Share(EPS)", "value": "$4.00"}, "PreviousClose": {"label": "Previous Close", "value": "$200.00"}, "ForwardPE1Yr": {"label": "Forward P/E 1 Yr.", "value": "25.0"}}}}).encode()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body, "")), mock.patch.object(fetch.time, "sleep"):
+        rows = REAL["us_valuation"]([{"market": "US", "symbol": "AMD", "kind": "stock"}])
+    assert len(rows) == 1 and rows[0]["pe"] == 50.0 and rows[0]["forward_pe"] == 25.0 and "自己算的" in rows[0]["source"] and "前一日收盤 ÷ 每股盈餘" in rows[0]["source"], rows
+    sh = [x for x in fetch.LOG if x["source"] == "us_valuation_shape"]; assert len(sh) == 1 and sh[0]["status"] == "success" and "AMD｜PERatio｜P/E Ratio｜N/A" in sh[0]["detail"] and "EarningsPerShare｜Earnings Per Share(EPS)｜$4.00" in sh[0]["detail"], "把實際欄位記下來: " + str(sh)
+    # 每股盈餘是負的（虧損）：不自己算
+    reset(); body2 = json.dumps({"data": {"summaryData": {"PERatio": {"label": "P/E Ratio", "value": "N/A"}, "EarningsPerShare": {"label": "EPS", "value": "-1.5"}, "PreviousClose": {"label": "Previous Close", "value": "$20"}}}}).encode()
+    with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", body2, "")), mock.patch.object(fetch.time, "sleep"):
+        rows = REAL["us_valuation"]([{"market": "US", "symbol": "LOSS", "kind": "stock"}])
+    assert rows[0]["pe"] is None and "自己算" not in rows[0]["source"], "虧損不算本益比"
+
+
 def test_run_job_tw_close_persists_us_valuation_rows_and_isolates_a_crash():
     reset()
     base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
@@ -5652,6 +5676,7 @@ def test_probe_vix_otc_logs_pages_links_files_swagger_candidates_and_yahoo_write
     by = {}
     for x in fetch.LOG: by.setdefault(x["source"], []).append(x)
     d = by["probe:vix_daily3m"][0]; assert d["status"] == "success" and "有「臺指選擇權波動率指數」字樣 True" in d["detail"] and "vix_202610.csv" in d["detail"] and "javascript" not in d["detail"] and "<tr> 2 列" in d["detail"], d["detail"]
+    tb = by["probe:vix_daily3m_table"][0]; assert tb["status"] == "success" and "臺指選擇權波動率指數 ## 1" in tb["detail"], "表格各列的文字也記下來（值可能在表格裡）: " + tb["detail"]
     files = by["probe:vix_daily3m_file"]; assert any(x["status"] == "success" and "20261112,22.5" in x["detail"] and "big5" not in x["detail"] for x in files) and any(x["status"] == "no_new_data" and "HTTP 404" in x["detail"] for x in files), "csv 用 Big5 解碼、404 的記錄原因: " + str([x["detail"][:90] for x in files])
     sw = by["probe:otc_swagger"][0]; assert "含「櫃買指數收盤／歷史」字樣的 2 個" in sw["detail"] and "/tpex_index" in sw["detail"] and "/other" not in sw["detail"], sw["detail"]
     ep = by["probe:otc_endpoint"]; assert ep and ep[0]["status"] == "success" and "/tpex_index" in ep[0]["detail"] and "2 筆" in ep[0]["detail"] and "Index" in ep[0]["detail"], ep[0]["detail"]
@@ -5663,6 +5688,79 @@ def test_probe_vix_otc_logs_pages_links_files_swagger_candidates_and_yahoo_write
         REAL["probe_vix_otc"]()
     srcs = [x for x in fetch.LOG if x["source"].startswith("probe:vix") or x["source"].startswith("probe:otc")]
     assert srcs and all(x["status"] == "no_new_data" for x in srcs) and not [x for x in fetch.LOG if x["status"] == "failure"], str([(x["source"], x["status"]) for x in srcs])
+
+
+def test_tw_otc_index_reads_the_open_data_validates_each_day_and_sorts_oldest_first():
+    reset()
+    dd = lambda n: (TODAY - timedelta(days=n)).strftime("%Y%m%d")
+    obj = [{"Date": dd(1), "Open": "368.22", "High": "373.28", "Low": "362.18", "Close": "369.24", "Change": "-1.02"}, {"Date": dd(2), "Open": "366", "High": "367", "Low": "345", "Close": "345.52", "Change": "-23.72"},
+           {"Date": dd(-3), "Close": "300"}, {"Date": dd(3), "Close": "9999"}, {"Date": dd(4), "Close": "壞"}, {"Date": "2026-13-40", "Close": "300"}, "不是物件", {"Date": dd(5), "Close": ""}]
+    with mock.patch.object(fetch, "fetch_json", return_value=(obj, "")) as fj:
+        rows = REAL["tw_otc_index"]()
+    assert fj.call_args[0][0].endswith("/tpex_index"), fj.call_args
+    assert [r["as_of"] for r in rows] == [(TODAY - timedelta(days=2)).isoformat(), (TODAY - timedelta(days=1)).isoformat()] and rows[1]["close"] == 369.24 and rows[1]["change"] == -1.02 and rows[1]["open"] == 368.22 and rows[0]["source"] == "櫃買中心開放資料 tpex_index", rows
+    lg = [x for x in fetch.LOG if x["source"] == "tw_otc_index"][0]; assert lg["status"] == "success" and "2 天" in lg["detail"] and "略過 6 筆不符的" in lg["detail"], lg["detail"]
+    for bad in ((None, "HTTP 503"), ({"x": 1}, ""), ([], ""), ([{"Date": "x"}], "")):
+        reset()
+        with mock.patch.object(fetch, "fetch_json", return_value=bad):
+            assert REAL["tw_otc_index"]() == []
+        assert fetch.LOG[-1]["status"] == "no_new_data" and not [x for x in fetch.LOG if x["status"] == "failure"], bad
+
+
+def _hist(rows_by_code):
+    def sbr(method, path, body=None, prefer=None):
+        if path.startswith("private_watchlist"): return ([{"code": "6488"}, {"code": "壞"}], "")
+        for code, rows in rows_by_code.items():
+            if f"code=eq.{code}&" in path: return (rows, "")
+        return ([], "")
+    return sbr
+
+
+def test_tw_rel_strength_computes_5_and_20_day_returns_and_the_market_from_history_with_gap_checks():
+    reset()
+    base = TODAY - timedelta(days=1)
+    while base.weekday() >= 5: base -= timedelta(days=1)                      # 最近一個平日
+    wd = []                                                                    # 連續 30 個「交易日」（只算平日），每天 +1
+    d_ = base
+    while len(wd) < 30:
+        if d_.weekday() < 5: wd.append(d_)
+        d_ -= timedelta(days=1)
+    wd.reverse()
+    daily = [{"market": "TWSE", "as_of": x.isoformat(), "close": 100.0 + i} for i, x in enumerate(wd)]       # 最新 129；5 筆前 124；20 筆前 109
+    gap = [{"market": "TPEX", "as_of": (base - timedelta(days=(29 - i) * 3)).isoformat(), "close": 100.0 + i} for i in range(30)]       # 每 3 天一筆：5 筆前是 15 天前（超過 12 天）、20 筆前是 60 天前 → 都不算
+    old = [{"market": "TWSE", "as_of": (TODAY - timedelta(days=30)).isoformat(), "close": 50.0}]
+    price_rows = [{"market": "TW", "code": "2330", "close": 1}, {"market": "TW", "code": "6488", "close": 1}, {"market": "TW", "code": "9999", "close": 1}, {"market": "TW", "code": "1111", "close": 1}, {"market": "US", "code": "ORCL"}]
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", side_effect=_hist({"2330": daily, "6488": gap, "9999": [], "1111": old})):
+        rows = REAL["tw_rel_strength"](price_rows)
+    by = {r["code"]: r for r in rows}; assert sorted(by) == ["2330", "6488"], sorted(by)
+    a = by["2330"]; assert a["mkt"] == "TWSE" and a["as_of"] == base.isoformat() and a["close"] == 129.0 and a["ret_5d"] == round((129 / 124 - 1) * 100, 2) and a["ret_5d_from"] == wd[-6].isoformat() and a["ret_20d"] == round((129 / 109 - 1) * 100, 2) and a["ret_20d_from"] == wd[-21].isoformat(), a
+    b = by["6488"]; assert b["mkt"] == "TPEX" and b["ret_5d"] is None and b["ret_20d"] is None, "歷史有缺漏（間隔太大）：不算、不拿更早的充數: " + str(b)
+    lg = [x for x in fetch.LOG if x["source"] == "tw_rel_strength"][0]; assert lg["status"] == "success" and "算出 2 檔（其中近 5 日 1 檔；上市 1、上櫃 1）" in lg["detail"] and "9999（自建歷史沒有這檔）" in lg["detail"] and "1111（最新一筆" in lg["detail"], lg["detail"]
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=False):
+        assert REAL["tw_rel_strength"](price_rows) == [] and fetch.LOG[-1]["status"] == "skipped"
+    reset()
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_request", return_value=([], "")):
+        assert REAL["tw_rel_strength"]([]) == [] and fetch.LOG[-1]["status"] == "no_new_data"
+
+
+def test_run_job_tw_close_persists_otc_index_and_rel_strength_in_their_own_tables_and_isolates_crashes():
+    reset()
+    base = dict(twse_market=None, twse_breadth=None, twse_institutional=None, twse_margin=None, taifex_futures=None, taifex_basis=None, cftc_cot=None, cboe_putcall=None, twd_fallback_chain=None)
+    otc = [{"as_of": "2026-11-12", "close": 369.2, "source": "x"}]; rel = [{"code": "2330", "mkt": "TWSE", "as_of": "2026-11-12", "close": 1.0, "ret_5d": 1.0, "ret_5d_from": "2026-11-05", "ret_20d": None, "ret_20d_from": None}]
+    def go(otc_kw, rel_kw):
+        got, seen = [], []
+        ps = [mock.patch.object(fetch, k, return_value=v) for k, v in base.items()] + [mock.patch.object(fetch, "load_holdings", return_value=(None, "x")), mock.patch.object(fetch, "persist"), mock.patch.object(fetch, "fred_latest", return_value=None),
+              mock.patch.object(fetch, "tw_otc_index", **otc_kw), mock.patch.object(fetch, "tw_rel_strength", **rel_kw), mock.patch.object(fetch, "persist_extra", side_effect=lambda d_, t_: got.append(list(t_)))]
+        for p_ in ps: p_.start()
+        try:
+            fetch.run_job("tw_close", dry_run=False)
+        finally:
+            for p_ in ps: p_.stop()
+        return got[0], {x["source"]: x["status"] for x in fetch.LOG}
+    tables, st = go({"return_value": otc}, {"return_value": rel}); assert ("tw_otc_index", otc, "as_of") in tables and ("tw_rel_strength", rel, "code") in tables and st["module:M40"] == "success" and st["module:M41"] == "success"
+    reset(); tables, st = go({"side_effect": RuntimeError("boom")}, {"return_value": rel}); assert st["module:M40"] == "failure" and ("tw_rel_strength", rel, "code") in tables and ("tw_otc_index", otc, "as_of") not in tables, "櫃買指數壞掉不影響個股對大盤"
+    reset(); tables, st = go({"return_value": otc}, {"side_effect": RuntimeError("boom")}); assert st["module:M41"] == "failure" and ("tw_otc_index", otc, "as_of") in tables and "module:M27" in st
 
 
 def test_probe_dashboard_stops_at_the_first_working_language_segment_and_logs_the_full_apipath_class():
