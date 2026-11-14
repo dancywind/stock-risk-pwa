@@ -35,6 +35,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: 安裝讀 .xls 的套件（AAII 完整歷史用；失敗不影響其他工作）
+        run: pip install xlrd || true
       - name: 決定工作
         id: pick
         run: |
