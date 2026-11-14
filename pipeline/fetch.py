@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v90"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v91"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1224,6 +1224,61 @@ def _obj_shape(obj, n=2):
     if isinstance(obj, dict):
         return f"頂層鍵 {list(obj.keys())[:12]}；{json.dumps(obj, ensure_ascii=False)[:420]}"
     return f"不是預期的格式（{type(obj).__name__}）"
+
+
+def _pe_keys(obj, path="", out=None, depth=0):
+    """遞迴找出 JSON 裡名稱像本益比／EPS 的欄位（欄位名稱含 pe、eps、earnings、forward），回傳 [(路徑, 值)]。"""
+    if out is None:
+        out = []
+    if depth > 7 or len(out) >= 40:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{path}.{k}" if path else str(k)
+            if isinstance(v, (dict, list)):
+                _pe_keys(v, p, out, depth + 1)
+            elif re.search(r"(^|[^a-z])(pe|p/e|eps)([^a-z]|$)|trailingpe|forwardpe|peratio|earningspershare|price.?earn", str(k), re.I) and v not in (None, "", "N/A"):
+                out.append((p, v))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:6]):
+            _pe_keys(v, f"{path}[{i}]", out, depth + 1)
+    return out
+
+
+def probe_us_pe():
+    """只讀探測（不寫任何資料表）：美股本益比（過去四季、預估）有沒有別的來源。Nasdaq 的個股摘要確定沒有（已驗證），
+    這裡試 Yahoo 報價／個股統計、Nasdaq 的 info／earnings-forecast／financials 端點，每個只記「HTTP 狀態＋名稱像本益比或 EPS 的欄位與值」，
+    取不到就記 no_new_data，不丟例外、不記失敗。"""
+    syms = [s for s in (load_us_watch() or [])][:2] or []
+    for s in ("ORCL", "ARM"):
+        if s not in syms and len(syms) < 3:
+            syms.append(s)
+    urls = []
+    for s in syms:
+        urls += [
+            (f"yahoo_quote:{s}", f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={s}", None),
+            (f"yahoo_summary:{s}", f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{s}?modules=summaryDetail,defaultKeyStatistics,financialData", None),
+            (f"nasdaq_info:{s}", f"https://api.nasdaq.com/api/quote/{s}/info?assetclass=stocks", NASDAQ_HEADERS),
+            (f"nasdaq_forecast:{s}", f"https://api.nasdaq.com/api/analyst/{s}/earnings-forecast", NASDAQ_HEADERS),
+            (f"nasdaq_fin:{s}", f"https://api.nasdaq.com/api/company/{s}/financials?frequency=2", NASDAQ_HEADERS),
+        ]
+    for name, url, hdr in urls:
+        try:
+            st, ct, body, err = fetch_raw(url, timeout=config.PROBE_TIMEOUT, headers=hdr or {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept": "application/json,*/*"})
+        except Exception as e:                                                                                  # noqa: BLE001
+            st, ct, body, err = None, "", b"", str(e)
+        time.sleep(1)
+        if st != 200 or not body:
+            log(f"probe:us_pe:{name}", "no_new_data", detail=_clip(f"HTTP {st} {err or ''}".strip()))
+            continue
+        try:
+            obj = json.loads(body.decode("utf-8", errors="replace"))
+        except ValueError:
+            log(f"probe:us_pe:{name}", "no_new_data", detail=_clip(f"HTTP 200 但不是 JSON：{body[:120]!r}"))
+            continue
+        hits = _pe_keys(obj)
+        log(f"probe:us_pe:{name}", "success", detail=_clip(f"HTTP 200｜名稱像本益比／EPS 的欄位 {len(hits)} 個：" + "；".join(f"{p}={str(v)[:40]}" for p, v in hits[:14]) if hits else "HTTP 200｜沒有名稱像本益比／EPS 的欄位", 700))
+
 
 
 def probe_vix_otc():
@@ -5673,6 +5728,7 @@ def run_job(job, dry_run=False):
         probe_chips()
         probe_vix_otc()
     if job == "us_probe":
+        probe_us_pe()
         probe_earnings()
         probe_round3()
         probe_round4()

@@ -6562,3 +6562,23 @@ if __name__ == "__main__":
                 OFFENDERS.append((name, NETWORK_CALLS[before:][:2]))
     assert not OFFENDERS, "這些測試偷偷連了真實網路（要用 mock 替換）：\n" + "\n".join(f"  {a}: {b}" for a, b in OFFENDERS)
     print(f"全部 {n} 項測試通過（且沒有任何真實連網）")
+
+
+def test_probe_us_pe_logs_pe_like_fields_only_reads_and_never_raises():
+    reset()
+    quote = json.dumps({"quoteResponse": {"result": [{"symbol": "ORCL", "trailingPE": 31.2, "forwardPE": 25.1, "epsTrailingTwelveMonths": 5.3, "marketCap": 1}]}}).encode()
+    def raw(url, timeout=None, headers=None):
+        if "v7/finance/quote" in url: return 200, "application/json", quote, ""
+        if "quoteSummary" in url: return 200, "text/html", b"<html>", ""
+        return 403, "", b"", "HTTP 403"
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "load_us_watch", return_value=["AMD"]), \
+            mock.patch.object(fetch, "persist") as per, mock.patch.object(fetch, "persist_extra") as pe:
+        fetch.probe_us_pe()
+    by = {x["source"]: x for x in fetch.LOG}
+    q = by["probe:us_pe:yahoo_quote:AMD"]; assert q["status"] == "success" and "trailingPE=31.2" in q["detail"] and "forwardPE=25.1" in q["detail"] and "marketCap" not in q["detail"], q["detail"]
+    assert by["probe:us_pe:yahoo_summary:AMD"]["status"] == "no_new_data" and by["probe:us_pe:nasdaq_info:AMD"]["status"] == "no_new_data"
+    assert per.call_count == 0 and pe.call_count == 0 and not [x for x in fetch.LOG if x["status"] == "failure"]
+    reset()
+    with mock.patch.object(fetch, "fetch_raw", side_effect=RuntimeError("boom")), mock.patch.object(fetch.time, "sleep"), mock.patch.object(fetch, "load_us_watch", return_value=[]):
+        fetch.probe_us_pe()
+    assert fetch.LOG and all(x["status"] == "no_new_data" for x in fetch.LOG)
