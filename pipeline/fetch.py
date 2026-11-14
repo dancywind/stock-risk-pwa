@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v107"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v108"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4073,11 +4073,51 @@ def us_breadth_ndx():
            "pct200": round(a200 / ok200 * 100, 2) if ok200 >= config.BREADTH_NDX_MIN_OK else None,
            "source": "Nasdaq 官方成分股清單與歷史行情（自己計算；涵蓋 Nasdaq-100，不是 S&P 500）"}
     hist_rows = _ndx_breadth_history(series, last, len(syms))
+    ymsg = ""
+    if config.BREADTH_NDX_YAHOO and hist_rows and date.fromisoformat(hist_rows[0]["as_of"]) > date.today() - timedelta(days=1200):
+        ys = []
+        for sym in syms:
+            pts_y, _w = _yahoo_history(sym)
+            time.sleep(config.BREADTH_NDX_SLEEP)
+            if pts_y and len(pts_y) >= 250:
+                ys.append(pts_y)
+        if len(ys) >= config.BREADTH_NDX_MIN_OK:
+            h2 = _ndx_breadth_history(ys, last, len(syms))
+            if len(h2) > len(hist_rows):
+                for r in h2:
+                    r["source"] = "Yahoo 還原日線（自己計算，往前補；涵蓋現在的 Nasdaq-100 成分股，不是 S&P 500）"
+                hist_rows, ymsg = h2, f"；歷史改用 Yahoo（{len(ys)} 檔，最早 {h2[0]['as_of']}）"
+            else:
+                ymsg = f"；Yahoo 只有 {len(h2)} 天，沒有比 Nasdaq 多，不採用"
+        else:
+            ymsg = f"；Yahoo 只抓到 {len(ys)} 檔（至少 {config.BREADTH_NDX_MIN_OK}），歷史維持 Nasdaq 的版本"
+    note += ymsg
     if _LONG_TRACE:
         note += "；第一檔分段抓取：" + " | ".join(_LONG_TRACE[0]) + f"；各檔最早日期 {min(p[0][0] for p in series).isoformat()}"
         del _LONG_TRACE[:]
     log("us_breadth_ndx", "success", as_of=row["as_of"], detail=f"站上 50 日線 {a50} / {ok50} 檔（{row['pct50']}%）；站上 200 日線 {a200} / {ok200} 檔；同時用同一批歷史補了前 {len(hist_rows)} 天" + (f"（{row['pct200']}%）" if row["pct200"] is not None else "（有效檔數不到 80，不算比例）") + note)
     return hist_rows + [row]
+
+
+def _yahoo_history(sym, rng="10y"):
+    """Yahoo 日線（已還原分割與配息）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。Nasdaq 的個股歷史只給約 18 個月，更早的由這裡補。"""
+    url = f"https://query1.finance.yahoo.com/v8/chart/{sym.replace('.', '-')}?range={rng}&interval=1d&includeAdjustedClose=true"
+    data, err = fetch_json(url, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
+    if data is None:
+        return None, err
+    try:
+        res = data["chart"]["result"][0]
+        ts, off = res["timestamp"], int((res.get("meta") or {}).get("gmtoffset") or 0)
+        ind = res["indicators"]
+        px = ((ind.get("adjclose") or [{}])[0] or {}).get("adjclose") or ind["quote"][0]["close"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None, "格式不符"
+    out = {}
+    for t, c in zip(ts, px):
+        if c is None or not (0 < c < config.PRICE_LIMIT):
+            continue
+        out[datetime.utcfromtimestamp(t + off).date()] = float(c)
+    return sorted(out.items()), ""
 
 
 def _ndx_breadth_history(series, last, n_total):

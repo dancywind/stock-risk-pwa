@@ -188,7 +188,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v107"
+PIPELINE_VERSION = "v108"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -219,6 +219,7 @@ US_VOL_RANGE = (1_000_000, 2_000_000_000)
 CFTC_NDX_MARKETS = (("NASDAQ-100 Consolidated - CHICAGO MERCANTILE EXCHANGE", "Nasdaq-100 Consolidated"), ("NASDAQ MINI - CHICAGO MERCANTILE EXCHANGE", "Nasdaq-100 E-mini"))
 # 模組 M32：Nasdaq-100 廣度
 NASDAQ_NDX_URL = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
+BREADTH_NDX_YAHOO = True            # Nasdaq 個股歷史只有約 18 個月，更早的用 Yahoo 還原日線補
 BREADTH_NDX_HIST_DAYS = 3700   # 歷史回補要抓幾個日曆天（約 10 年，同樣 100 多個請求）
 BREADTH_NDX_DAYS = 330        # 要抓幾個日曆天的歷史（200 日均線約需要 290 天）
 BREADTH_NDX_SLEEP = 0.7       # 每檔之間等幾秒（100 多個請求，避免被限流）
