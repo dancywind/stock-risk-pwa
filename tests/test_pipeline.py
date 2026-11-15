@@ -6794,3 +6794,15 @@ def test_aaii_xls_to_csv_and_import_prefers_download_then_falls_back_to_csv_file
     with mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (403, "", b"", "HTTP 403")):
         assert REAL["aaii_csv_import"]() == [] or True
     assert "失敗" in [x for x in fetch.LOG if x["source"] == "aaii_csv"][0]["detail"]
+
+
+def test_rr_backfill_reads_taifex_csv_files_from_data_dir(tmp_path):
+    reset()
+    inv = "日期,商品名稱,身份別,多方交易口數,多方未平倉口數,多方未平倉契約金額,空方未平倉口數\n" + "".join(f"2026/11/12,小型臺指期貨,{n},1,{l},5,{s}\n" for n, l, s in (("自營商", 100, 900), ("投信", 200, 1000), ("外資及陸資", 800, 1000)))
+    fut = "交易日期,契約,到期月份(週別),未沖銷契約數,交易時段\n2026/11/12,MTX,202611,10000,一般\n"
+    d = tmp_path / "data"; d.mkdir()
+    (d / "taifex_inst_1.csv").write_bytes(inv.encode("cp950")); (d / "taifex_fut_1.csv").write_bytes(fut.encode("cp950"))
+    fake = tmp_path / "pipeline" / "fetch.py"; fake.parent.mkdir()
+    with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "__file__", str(fake)), mock.patch.object(fetch, "fetch_post_raw", lambda *a, **k: (_ for _ in ()).throw(AssertionError("有 CSV 就不該連網"))):
+        out = REAL["tw_retail_ratio_backfill"]()
+    assert len(out) == 1 and out[0]["as_of"] == "2026-11-12", out

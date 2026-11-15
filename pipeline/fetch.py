@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v108"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v110"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -961,6 +961,11 @@ def tw_margin_ratio_backfill(max_days=None):
             if len(got) < 1000:
                 break
             off += 1000
+        if any(c_ not in close for c_ in units):                               # 自建行情沒有的（多半是 ETF）：向證交所補一次當天全部證券的收盤價
+            extra = _twse_all_close(d)
+            time.sleep(config.HIST_SLEEP)
+            for c_, v_ in extra.items():
+                close.setdefault(c_, v_)
         value, missing = 0.0, 0
         for code, u in units.items():
             if code in close:
@@ -1134,6 +1139,47 @@ def tw_retail_ratio_backfill():
         log("rr_backfill", "failure", detail=_clip(f"讀取已有的散戶多空比失敗：{err}（請先執行 new_tables_v55.sql）"))
         return []
     have = {r["as_of"] for r in have_rows}
+    # 先看倉庫裡有沒有你從期交所網站下載、放進 data/ 的 CSV（taifex_inst*.csv 法人、taifex_fut*.csv 行情，可以放好幾個月份的檔案）：網站下載抓不到時，這是最穩的做法
+    import glob as _glob
+    ddir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    def _cat(patterns, keep=None):
+        """把 data/ 裡符合的檔案（.csv，行情檔也可以是期交所的年度 .zip）接成一份文字；keep 用來只留需要的列（行情檔只留 MTX，檔案再大也不佔記憶體）。"""
+        import zipfile as _zip
+        texts = []
+        for pattern in patterns:
+            for fp in sorted(_glob.glob(os.path.join(ddir, pattern))):
+                if fp.lower().endswith(".zip"):
+                    with _zip.ZipFile(fp) as z:
+                        texts += [_decode_tw_csv(z.read(n)) for n in sorted(z.namelist()) if n.lower().endswith(".csv")]
+                else:
+                    with open(fp, "rb") as fh:
+                        texts.append(_decode_tw_csv(fh.read()))
+        head, body = "", []
+        for t in texts:
+            lines = t.lstrip("\ufeff").splitlines()
+            if not lines:
+                continue
+            head = head or lines[0]
+            for ln in lines[1:]:
+                if ln.strip() and (keep is None or keep(ln)):
+                    body.append(ln)
+        return (head + "\n" + "\n".join(body) + "\n") if head and body else ""
+    t_inv = _cat(["taifex_inst*.csv"], lambda ln: "小型臺指" in ln or "小型台指" in ln)
+    t_fut = _cat(["taifex_fut*.csv", "taifex_fut*.zip"], lambda ln: ln.split(",")[1].strip() == "MTX" if "," in ln else False)
+    if t_inv and t_fut:
+        inv, fut, why = parse_taifex_hist_rows(t_inv, t_fut)
+        if inv is None:
+            log("rr_backfill", "failure", detail=_clip(f"data/ 裡的期交所 CSV 欄位對不上：{why}"))
+            return []
+        got = []
+        for d in sorted({r["Date"] for r in inv if len(r["Date"]) == 8}, reverse=True):
+            if twse_ymd_to_iso(d) in have:
+                continue
+            row, _w = compute_retail_ratio([r for r in inv if r["Date"] == d], [r for r in fut if r["Date"] == d])
+            if row is not None:
+                got.append(row)
+        log("rr_backfill", "success" if got else "no_new_data", as_of=got[0]["as_of"] if got else None, detail=_clip(f"讀 data/ 裡的期交所 CSV，補了 {len(got)} 天（法人 {len({r['Date'] for r in inv})} 天、行情 {len({r['Date'] for r in fut})} 天；已有的日期不重補）"))
+        return got
     oldest = date.today() - timedelta(days=config.HIST_WINDOW_DAYS)
     out, first_err, months_done, end = [], "", 0, date.today()
     while months_done < config.RR_BACKFILL_MONTHS and end >= oldest:
@@ -2575,6 +2621,31 @@ def hist_twse_day(d):
     for r in rows:
         r["market"] = "TWSE"
     return rows, "ok"
+
+
+def _twse_all_close(d):
+    """證交所指定日期「每日收盤行情」全部證券（含 ETF、槓桿／反向 ETF）的收盤價 → {代號: 收盤價}；抓不到回傳 {}。
+    自建行情 tw_hist 只收 4 碼個股，融資餘額很大的 ETF（00631L 等）查不到價，維持率回補用這個補上。"""
+    ymd = d.replace("-", "")
+    data, _err = fetch_json(config.TWSE_HIST_URL.format(ymd=ymd))
+    if not isinstance(data, dict) or data.get("stat") != "OK" or str(data.get("date")) != ymd:
+        return {}
+    table = next((t for t in (data.get("tables") or []) if "每日收盤行情" in str(t.get("title"))), None)
+    if table is None:
+        return {}
+    f = table.get("fields") or []
+    if "證券代號" not in f or "收盤價" not in f:
+        return {}
+    ic, ip = f.index("證券代號"), f.index("收盤價")
+    out = {}
+    for r in table.get("data") or []:
+        try:
+            v = parse_number(r[ip])
+            if v is not None and 0 < v < config.PRICE_LIMIT:
+                out[str(r[ic]).strip()] = v
+        except IndexError:
+            continue
+    return out
 
 
 def hist_tpex_day(d):
