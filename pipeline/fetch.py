@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v111"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v112"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3448,6 +3448,8 @@ def _nasdaq_history_long(sym, assetclass="stocks", days=3700, chunk=540):
             if not out:
                 return None, why
             break
+        if not rows and out:                                                 # 這一段沒有資料、前面有：更早的 Nasdaq 也不會有，不用再打
+            break
         for r in rows:
             out[r["date"]] = r["close"]
         got += span + 1
@@ -4147,12 +4149,20 @@ def us_breadth_ndx():
     hist_rows = _ndx_breadth_history(series, last, len(syms))
     ymsg = ""
     if config.BREADTH_NDX_YAHOO and hist_rows and date.fromisoformat(hist_rows[0]["as_of"]) > date.today() - timedelta(days=1200):
-        ys = []
+        ys, fails, why_y, t_y = [], 0, "", time.time()
         for sym in syms:
-            pts_y, _w = _yahoo_history(sym)
+            pts_y, why_y2 = _yahoo_history(sym)
             time.sleep(config.BREADTH_NDX_SLEEP)
             if pts_y and len(pts_y) >= 250:
                 ys.append(pts_y)
+                fails = 0
+            else:
+                fails += 1
+                why_y = why_y or f"{sym}：{why_y2 or '歷史太短'}"
+                if fails >= 5 and not ys:                                  # 一開始連續 5 檔都失敗：多半是被擋，不要再浪費時間
+                    break
+            if time.time() - t_y > 12 * 60:                                # Yahoo 這段最多 12 分鐘
+                break
         if len(ys) >= config.BREADTH_NDX_MIN_OK:
             h2 = _ndx_breadth_history(ys, last, len(syms))
             if len(h2) > len(hist_rows):
@@ -4162,7 +4172,7 @@ def us_breadth_ndx():
             else:
                 ymsg = f"；Yahoo 只有 {len(h2)} 天，沒有比 Nasdaq 多，不採用"
         else:
-            ymsg = f"；Yahoo 只抓到 {len(ys)} 檔（至少 {config.BREADTH_NDX_MIN_OK}），歷史維持 Nasdaq 的版本"
+            ymsg = f"；Yahoo 只抓到 {len(ys)} 檔（至少 {config.BREADTH_NDX_MIN_OK}），歷史維持 Nasdaq 的版本" + (f"；第一個失敗：{why_y}" if why_y else "")
     note += ymsg
     if _LONG_TRACE:
         note += "；第一檔分段抓取：" + " | ".join(_LONG_TRACE[0]) + f"；各檔最早日期 {min(p[0][0] for p in series).isoformat()}"
@@ -4174,10 +4184,11 @@ def us_breadth_ndx():
 def _yahoo_history(sym, rng="10y"):
     """Yahoo 日線（已還原分割與配息）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。Nasdaq 的個股歷史只給約 18 個月，更早的由這裡補。"""
     url = f"https://query1.finance.yahoo.com/v8/chart/{sym.replace('.', '-')}?range={rng}&interval=1d&includeAdjustedClose=true"
-    data, err = fetch_json(url, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})
-    if data is None:
-        return None, err
+    st, _ct, body, err = fetch_raw(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})    # 只試一次、20 秒：被擋時不要像 fetch_json 那樣等很久再重試
+    if st != 200 or not body:
+        return None, f"HTTP {st} {err}".strip()
     try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
         res = data["chart"]["result"][0]
         ts, off = res["timestamp"], int((res.get("meta") or {}).get("gmtoffset") or 0)
         ind = res["indicators"]
