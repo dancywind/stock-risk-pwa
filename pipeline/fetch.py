@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v110"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v111"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1154,14 +1154,15 @@ def tw_retail_ratio_backfill():
                 else:
                     with open(fp, "rb") as fh:
                         texts.append(_decode_tw_csv(fh.read()))
-        head, body = "", []
+        head, body, seen = "", [], set()
         for t in texts:
             lines = t.lstrip("\ufeff").splitlines()
             if not lines:
                 continue
             head = head or lines[0]
             for ln in lines[1:]:
-                if ln.strip() and (keep is None or keep(ln)):
+                if ln.strip() and ln not in seen and (keep is None or keep(ln)):       # 相鄰月份的檔案可能都含交界那一天，完全相同的列只留一份，免得口數加倍
+                    seen.add(ln)
                     body.append(ln)
         return (head + "\n" + "\n".join(body) + "\n") if head and body else ""
     t_inv = _cat(["taifex_inst*.csv"], lambda ln: "小型臺指" in ln or "小型台指" in ln)
