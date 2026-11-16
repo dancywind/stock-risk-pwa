@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v114"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v115"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4435,7 +4435,7 @@ def parse_taifex_snapshot(opt_rows, fut_rows, today=None, band=0.20):
     return summary, sorted(strikes.values(), key=lambda r: r["strike"]), None
 
 
-TAIFEX_CSV_COLS = {"日期": "Date", "契約": "Contract", "到期月份(週別)": "ContractMonth(Week)", "履約價": "StrikePrice", "買賣權": "CallPut", "開盤價": "Open", "最高價": "High", "最低價": "Low",
+TAIFEX_CSV_COLS = {"日期": "Date", "契約": "Contract", "契約代號": "Contract", "未沖銷契約數": "OpenInterest", "合計成交量": "Volume", "漲跌%": "Change%", "到期月份(週別)": "ContractMonth(Week)", "履約價": "StrikePrice", "買賣權": "CallPut", "開盤價": "Open", "最高價": "High", "最低價": "Low",
                    "最後成交價": "Close", "成交量": "Volume", "結算價": "SettlementPrice", "未沖銷契約量": "OpenInterest", "最後最佳買價": "BestBid", "最後最佳賣價": "BestAsk",
                    "歷史最高價": "HistoricalHigh", "歷史最低價": "HistoricalLow", "是否因訊息面暫停交易": "TradingHalt", "交易時段": "TradingSession", "漲跌價": "Change",
                    "賣權成交量": "PutVolume", "買權成交量": "CallVolume", "買賣權成交量比率%": "PutCallVolumeRatio%", "賣權未平倉量": "PutOI", "買權未平倉量": "CallOI", "買賣權未平倉量比率%": "PutCallOIRatio%"}

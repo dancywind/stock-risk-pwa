@@ -6806,3 +6806,9 @@ def test_rr_backfill_reads_taifex_csv_files_from_data_dir(tmp_path):
     with mock.patch.object(fetch, "sb_request", lambda *a, **k: ([], "")), mock.patch.object(fetch, "sb_ready", lambda: True), mock.patch.object(fetch, "__file__", str(fake)), mock.patch.object(fetch, "fetch_post_raw", lambda *a, **k: (_ for _ in ()).throw(AssertionError("有 CSV 就不該連網"))):
         out = REAL["tw_retail_ratio_backfill"]()
     assert len(out) == 1 and out[0]["as_of"] == "2026-11-12", out
+
+
+def test_parse_taifex_csv_accepts_renamed_columns_contract_code_and_oi_count():
+    text = "日期,契約代號,到期月份(週別),開盤價,最高價,最低價,最後成交價,漲跌價,漲跌%,合計成交量,結算價,未沖銷契約數,最後最佳買價\n2026/11/13,TX,202611,23000,23100,22900,23050,50,0.2%,1000,23050,12345,23049\n"
+    rows = fetch.parse_taifex_csv(text)
+    assert rows[0]["Contract"] == "TX" and rows[0]["OpenInterest"] == "12345" and rows[0]["Date"] == "20261113" and rows[0]["SettlementPrice"] == "23050", rows
