@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v115"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v116"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1258,7 +1258,7 @@ def _taifex_investor_csv(url):
 def taifex_basis(tw_rows):
     """台指期基差 = 近月臺股期貨（一般時段）最後成交價 － 同一天加權指數收盤。單位：點。
     日期必須是同一天，否則不算；不使用盤後時段；排除價差合約。"""
-    rows, err = fetch_json(config.TAIFEX_DAILY_URL)
+    rows, err = fetch_taifex(config.TAIFEX_DAILY_URL)       # 期交所有時回傳 JSON、有時回傳 CSV，兩種都吃
     if rows is None:
         log("taifex:basis", "failure", detail=_clip(f"抓取失敗: {err}"))
         return None
@@ -4459,6 +4459,8 @@ def parse_taifex_csv(text):
             continue
         d = {k: (row[i].strip() if i < len(row) else "") for i, k in enumerate(keys)}
         d["Date"] = re.sub(r"[/\-]", "", d.get("Date", ""))
+        if "Last" not in d and "Close" in d:                       # JSON 版叫 Last，CSV 版的「最後成交價」我們對成 Close，兩邊都給
+            d["Last"] = d["Close"]
         out.append(d)
     return out or None
 
@@ -5704,7 +5706,7 @@ def probe_round9():
         chunk.append(it)
     if chunk or not items:
         log(f"probe:taifex_paths:{n + 1}", "success" if items else "no_new_data", detail=_clip(" ; ".join(chunk) if chunk else f"期交所說明文件裡找不到相關端點（{err or ''}）"))
-    rows, err = fetch_json(config.TAIFEX_DAILY_URL)
+    rows, err = fetch_taifex(config.TAIFEX_DAILY_URL)       # 期交所有時回傳 JSON、有時回傳 CSV，兩種都吃
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         keys = list(rows[0].keys())
         oi = [k for k in keys if "Open" in k and "Interest" in k or "未沖銷" in k]
