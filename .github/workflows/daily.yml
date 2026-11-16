@@ -4,6 +4,8 @@ on:
     # GitHub 用 UTC。新加坡時間(SGT) = UTC+8
     - cron: "15 23 * * *"   # 07:15 SGT 完整更新（job=full）
     - cron: "35 6 * * *"    # 14:35 SGT 台股收盤後（job=tw_close）
+    - cron: "20 9 * * *"    # 17:20 SGT 備援：台股收盤後再跑一次 tw_close（GitHub 的排程偶爾延遲或跳過）
+    - cron: "20 0 * * *"    # 08:20 SGT 備援：美股廣度再跑一次 us_breadth
     - cron: "30 22 * * *"   # 06:30 SGT 美股廣度（job=us_breadth）：美股收盤後 90 分鐘以上（冬令 05:00 SGT 收盤、夏令 04:00 SGT），Nasdaq 的日資料才確定；太早跑會只拿到前一天
     - cron: "0 20 * * *"    # 04:00 SGT 夜間自動回補台股歷史（job=tw_backfill），回補完成後幾乎不花時間
     - cron: "0 21 * * *"    # 05:00 SGT 夜間長回補（job=tw_backfill2）：10 年歷史、維持率、散戶多空比等；和上面的回補分開，避免一個工作超過時間上限
@@ -43,6 +45,8 @@ jobs:
           case "${{ github.event.schedule }}" in
             "15 23 * * *") echo "job=full" >> $GITHUB_OUTPUT ;;
             "35 6 * * *")  echo "job=tw_close" >> $GITHUB_OUTPUT ;;
+            "20 9 * * *")  echo "job=tw_close" >> $GITHUB_OUTPUT ;;
+            "20 0 * * *")  echo "job=us_breadth" >> $GITHUB_OUTPUT ;;
             "30 22 * * *") echo "job=us_breadth" >> $GITHUB_OUTPUT ;;
             "0 20 * * *")  echo "job=tw_backfill" >> $GITHUB_OUTPUT ;;
             "0 21 * * *")  echo "job=tw_backfill2" >> $GITHUB_OUTPUT ;;
