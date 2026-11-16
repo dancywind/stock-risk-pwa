@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v113"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v114"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4183,7 +4183,7 @@ def us_breadth_ndx():
 
 def _yahoo_history(sym, rng="10y"):
     """Yahoo 日線（已還原分割與配息）→ [(日期, 收盤)] 由舊到新；失敗回傳 (None, 原因)。Nasdaq 的個股歷史只給約 18 個月，更早的由這裡補。"""
-    url = f"https://query1.finance.yahoo.com/v8/chart/{sym.replace('.', '-')}?range={rng}&interval=1d&includeAdjustedClose=true"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym.replace('.', '-')}?range={rng}&interval=1d&includeAdjustedClose=true"
     st, _ct, body, err = fetch_raw(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; risk-pwa/1.0)", "Accept": "application/json"})    # 只試一次、20 秒：被擋時不要像 fetch_json 那樣等很久再重試
     if st != 200 or not body:
         return None, f"HTTP {st} {err}".strip()
