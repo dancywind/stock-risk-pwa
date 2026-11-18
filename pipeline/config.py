@@ -51,7 +51,7 @@ SOX_SERIES = ("SOX", "費城半導體指數（SOX）", 500.0, 100000.0)     # M3
 SOX_WINDOW_DAYS = 380                     # Nasdaq 一次最多回 400 列，每段取約 1.5 年
 SOX_BACK_WINDOWS = 3                      # 每次往前多補幾段
 SOX_YEARS = 10                            # 最多補到幾年前
-FRED_OPTIONAL = {"RU2000PR", "VXNCLS"}
+FRED_OPTIONAL = {"RU2000PR", "VXNCLS", "BAMLH0A0HYM2"}
 # 模組 M06：這幾個序列另外回補一段歷史，用來算「從高點回落幅度」與月績效
 # 模組 M18：用 Nasdaq 官方行情補 FRED 落後的天數。每一項：(Nasdaq 的代號, macro_series 的序列, 分類[, 選用])。
 # 選用＝抓不到只記「沒有資料」，不讓整個工作變紅；沒寫就是核心來源，抓不到會記失敗。
@@ -188,7 +188,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v117"
+PIPELINE_VERSION = "v118"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -277,3 +277,9 @@ DASHBOARD_MAX_ENDPOINTS = 10
 # 探測：哪些持股／候選股沒有三率，官方各財報資料集與 FinMind 有沒有。
 FIN_PROBE_MAX_DATASETS = 16
 FIN_PROBE_FINMIND = 6
+
+# 模組 M51：美股谷底計分卡新增的風險序列。FRED 的 ICE BofA 系列自 2026 年起只提供近 3 年；VIX3M 取自 Yahoo（非官方）
+US_RISK_FRED = ("BAMLH0A0HYM2", "DGS10")
+US_RISK_VIX3M = ("^VIX3M", "VIX3M", "VIX 3 個月波動率（Yahoo，非官方）", 5.0, 100.0)
+US_RISK_DAYS_FULL = 60                     # 每天更新時往回抓幾天
+US_RISK_DAYS_HIST = 3700                   # 歷史回補（約 10 年；高收益債利差 FRED 只給 3 年，抓不到更早的會自然停在 3 年）

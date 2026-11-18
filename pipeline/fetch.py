@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v117"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v118"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3740,6 +3740,35 @@ def us_index_long_history():
     return out
 
 
+def us_risk_series(hist=False):
+    """模組 M51：美股谷底計分卡新增條件用的序列。FRED：高收益債利差（BAMLH0A0HYM2）、10 年期殖利率（DGS10）；
+    Yahoo（非官方）：^VIX3M（3 個月波動率）。hist=True 回補約 10 年，否則只抓最近 US_RISK_DAYS_FULL 天。
+    數字都過合理範圍與日期檢查；抓不到只記錄，不讓工作變紅。寫入用 series_id,as_of 當主鍵，重跑不會重複。"""
+    out = []
+    days = config.US_RISK_DAYS_HIST if hist else config.US_RISK_DAYS_FULL
+    for sid in config.US_RISK_FRED:
+        low, high = config.FRED_MACRO[sid][1], config.FRED_MACRO[sid][2]
+        rows = fred_history_rows(sid, low, high, days=days)
+        if rows:
+            out.extend(rows)
+            log(f"us_risk:{sid}", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 筆（{rows[0]['as_of']} 到 {rows[-1]['as_of']}）")
+        else:
+            log(f"us_risk:{sid}", "no_new_data", detail="FRED 沒有回傳資料（沒設金鑰、連線失敗，或這個序列已不提供）")
+    ysym, sid, label, low, high = config.US_RISK_VIX3M
+    pts, why = _yahoo_history(urllib.parse.quote(ysym), "10y" if hist else "3mo")
+    if not pts:
+        log(f"us_risk:{sid}", "no_new_data", detail=_clip(f"Yahoo {ysym} 抓不到：{why}"))
+        return out
+    n = 0
+    for d_, v in pts:
+        ok, _w = validate_close_date(d_.isoformat())
+        if ok and low <= v <= high:
+            out.append({"series_id": sid, "label": label, "as_of": d_.isoformat(), "value": round(v, 4), "source": "Yahoo Finance（非官方）"})
+            n += 1
+    log(f"us_risk:{sid}", "success" if n else "no_new_data", as_of=pts[-1][0].isoformat(), detail=f"{n} 筆（{pts[0][0]} 到 {pts[-1][0]}）")
+    return out
+
+
 def tw_index_history():
     """模組 M05：加權指數近 13 個月的收盤與成交金額（證交所 FMTQIK 每月一次，間隔 3 秒），用來算從高點回落、下跌放量。"""
     today = date.today()
@@ -6687,6 +6716,7 @@ def run_job(job, dry_run=False):
         _save2("tw_margin", _run_module("M43", "上市融資餘額長期回補（10 年）", tw_margin_long_backfill), "as_of,source")
         _save2("market_stats", _run_module("M24", "加權指數長期歷史回補", tw_index_long_history), "market,as_of,source")
         _save2("macro_series", _run_module("M35", "美股指數長期歷史（標普 500、Nasdaq 綜合，FRED）", us_index_long_history), "series_id,as_of")
+        _save2("macro_series", _run_module("M51", "美股風險序列歷史（高收益債利差、10 年債、VIX3M）", lambda: us_risk_series(True)), "series_id,as_of")
         pc_rows = margin_hist = index_long = us_long = []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
@@ -6727,6 +6757,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
+            extra.append(("macro_series", _run_module("M51", "美股風險序列（高收益債利差、10 年債、VIX3M）", us_risk_series) or [], "series_id,as_of"))
             extra.append(("tw_keep_rate", _run_module("M38", "臺股儀表板：全市場擔保維持率（官方）", tw_keep_rate) or [], "as_of,source"))
             twd_hist = _run_module("M37", "美元兌台幣每日歷史（FRED）", twd_fred_history) or []
             extra.append(("twd_rates", twd_hist, "layer,source,as_of"))

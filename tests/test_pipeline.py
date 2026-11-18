@@ -6819,3 +6819,23 @@ def test_taifex_basis_reads_csv_response_with_new_column_names():
     with mock.patch.object(fetch, "fetch_json", lambda *a, **k: (None, "不是 JSON（1 位元組）")), mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (200, "text/csv", csv_text.encode("utf-8"), "")):
         rows, err = fetch.fetch_taifex(config.TAIFEX_DAILY_URL)
     assert rows and rows[0]["Last"] == "23050" and rows[0]["SettlementPrice"] == "23050" and rows[0]["TradingSession"] == "一般", (rows, err)
+
+
+def test_us_risk_series_collects_fred_and_vix3m(monkeypatch):
+    from pipeline import fetch as f
+    from datetime import date as _d, timedelta as _t
+    day = _d.today() - _t(days=3)
+    monkeypatch.setattr(f, "fred_history_rows", lambda sid, lo, hi, days=None: [{"series_id": sid, "label": sid, "as_of": day.isoformat(), "value": 4.0, "source": "FRED"}])
+    monkeypatch.setattr(f, "_yahoo_history", lambda sym, rng="10y": ([(day, 20.5), (day + _t(days=1), 999.0)], ""))
+    monkeypatch.setattr(f, "log", lambda *a, **k: None)
+    rows = f.us_risk_series()
+    ids = sorted(r["series_id"] for r in rows)
+    assert ids == ["BAMLH0A0HYM2", "DGS10", "VIX3M"]          # 超出合理範圍的 999 被拒收
+
+
+def test_us_risk_series_yahoo_failure_keeps_fred(monkeypatch):
+    from pipeline import fetch as f
+    monkeypatch.setattr(f, "fred_history_rows", lambda *a, **k: None)
+    monkeypatch.setattr(f, "_yahoo_history", lambda *a, **k: (None, "HTTP 404"))
+    monkeypatch.setattr(f, "log", lambda *a, **k: None)
+    assert f.us_risk_series() == []
