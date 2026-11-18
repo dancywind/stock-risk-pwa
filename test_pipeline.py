@@ -5595,6 +5595,7 @@ def test_us_valuation_fetches_each_stock_summary_skips_etfs_and_logs_what_is_mis
             {"market": "US", "symbol": "LOSS", "kind": "stock"}, {"market": "US", "symbol": "BAD", "kind": "stock"}, {"market": "US", "symbol": "NOJ", "kind": "stock"}, {"market": "TW", "symbol": None, "kind": "stock"}]
     seen = []
     def raw(url, timeout=None, headers=None):
+        if "/analyst/" in url: return 404, "", b"", "HTTP 404"                  # 分析師預估補不到：不影響原本的欄位
         sym = url.split("/quote/")[1].split("/")[0]; seen.append(sym)
         if sym == "AMD": return 200, "application/json", json.dumps(_summary()).encode(), ""
         if sym == "ORCL": return 200, "application/json", json.dumps(_summary(pe="41.2", fw="31.0", eps="$5.1")).encode(), ""
@@ -6819,3 +6820,36 @@ def test_taifex_basis_reads_csv_response_with_new_column_names():
     with mock.patch.object(fetch, "fetch_json", lambda *a, **k: (None, "不是 JSON（1 位元組）")), mock.patch.object(fetch, "fetch_raw", lambda *a, **k: (200, "text/csv", csv_text.encode("utf-8"), "")):
         rows, err = fetch.fetch_taifex(config.TAIFEX_DAILY_URL)
     assert rows and rows[0]["Last"] == "23050" and rows[0]["SettlementPrice"] == "23050" and rows[0]["TradingSession"] == "一般", (rows, err)
+
+
+def test_us_risk_series_collects_fred_and_vix3m(monkeypatch):
+    from pipeline import fetch as f
+    from datetime import date as _d, timedelta as _t
+    day = _d.today() - _t(days=3)
+    monkeypatch.setattr(f, "fred_history_rows", lambda sid, lo, hi, days=None: [{"series_id": sid, "label": sid, "as_of": day.isoformat(), "value": 4.0, "source": "FRED"}])
+    monkeypatch.setattr(f, "_yahoo_history", lambda sym, rng="10y": ([(day, 20.5), (day + _t(days=1), 999.0)], ""))
+    monkeypatch.setattr(f, "log", lambda *a, **k: None)
+    rows = f.us_risk_series()
+    ids = sorted(r["series_id"] for r in rows)
+    assert ids == ["BAMLH0A0HYM2", "DGS10", "VIX3M"]          # 超出合理範圍的 999 被拒收
+
+
+def test_us_risk_series_yahoo_failure_keeps_fred(monkeypatch):
+    from pipeline import fetch as f
+    monkeypatch.setattr(f, "fred_history_rows", lambda *a, **k: None)
+    monkeypatch.setattr(f, "_yahoo_history", lambda *a, **k: (None, "HTTP 404"))
+    monkeypatch.setattr(f, "log", lambda *a, **k: None)
+    assert f.us_risk_series() == []
+
+
+def test_parse_nasdaq_forecast_picks_next_open_fiscal_year():
+    from pipeline import fetch as f
+    from datetime import date as _d
+    j = {"data": {"yearlyForecast": {"rows": [
+        {"fiscalEnd": "Mar 2026", "consensusEPSForecast": "$1.90"},
+        {"fiscalEnd": "Mar 2027", "consensusEPSForecast": "$2.50"},
+        {"fiscalEnd": "Mar 2028", "consensusEPSForecast": "$3.10"}]}}}
+    assert f.parse_nasdaq_forecast(j, _d(2026, 11, 18)) == (2.5, "Mar 2027")
+    assert f.parse_nasdaq_forecast({"data": {}}, _d(2026, 11, 18))[0] is None
+    neg = {"data": {"yearlyForecast": {"rows": [{"fiscalEnd": "Dec 2027", "consensusEPSForecast": "-0.4"}]}}}
+    assert f.parse_nasdaq_forecast(neg, _d(2026, 11, 18))[0] is None

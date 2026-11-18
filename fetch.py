@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v116"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v121"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1125,6 +1125,51 @@ def parse_taifex_hist_rows(inv_text, fut_text):
         return None, None, f"行情檔欄位不符：{h2[:12]}"
     fut = [{"Date": re.sub(r"\D", "", r[j_d]), "Contract": r[j_c], "ContractMonth(Week)": r[j_m], "TradingSession": (r[j_s] if j_s is not None and len(r) > j_s else ""), "OpenInterest": r[j_o].replace(",", "")} for r in r2 if len(r) > max(j_d, j_c, j_m, j_o)]
     return inv, fut, ""
+
+
+def tw_futures_hist_backfill():
+    """模組 M50：外資台指期淨未平倉歷史（讀 data/taifex_inst*.csv 裡「臺股期貨」的三個身份別），補進 tw_futures_position。
+    用來算「外資極度偏空」的近一年分位數。多方 − 空方 必須等於淨額，對不上的列不寫。已有的日期不重複補。"""
+    if not sb_ready():
+        log("fut_backfill", "skipped", detail="未設定 Supabase，不回補")
+        return []
+    import glob as _glob
+    ddir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    files = sorted(_glob.glob(os.path.join(ddir, "taifex_inst*.csv")))
+    if not files:
+        log("fut_backfill", "no_new_data", detail="data/ 裡沒有 taifex_inst*.csv")
+        return []
+    have_rows, err = sb_request("GET", "tw_futures_position?select=as_of,investor&order=as_of.desc&limit=5000")
+    if have_rows is None:
+        log("fut_backfill", "failure", detail=_clip(f"讀取已有的期貨部位失敗：{err}"))
+        return []
+    have = {(r["as_of"], r["investor"]) for r in have_rows}
+    out, bad, seen = [], 0, set()
+    import csv as _csv, io as _io
+    for fp in files:
+        with open(fp, "rb") as fh:
+            text = _decode_tw_csv(fh.read())
+        for cells in _csv.reader(_io.StringIO(text.lstrip("\ufeff"))):
+            if len(cells) < 15 or cells[1].strip() != config.TAIFEX_CONTRACT:
+                continue
+            d = twse_ymd_to_iso(cells[0].strip().replace("/", ""))
+            inv = cells[2].strip()
+            if not d or not inv:
+                continue
+            lng, sht, net = parse_number(cells[9]), parse_number(cells[11]), parse_number(cells[13])
+            if None in (lng, sht, net) or lng < 0 or sht < 0 or net != lng - sht or abs(net) > config.TAIFEX_NET_LIMIT:
+                bad += 1
+                continue
+            key = (d, inv)
+            if key in have or key in seen:
+                continue
+            seen.add(key)
+            out.append({"as_of": d, "contract": config.TAIFEX_CONTRACT, "investor": inv, "oi_long": lng, "oi_short": sht, "oi_net": net,
+                        "oi_net_value_thousand": parse_number(cells[14]), "source": "TAIFEX 三大法人-區分各期貨契約"})
+    nf = len([r for r in out if r["investor"].startswith("外資")])
+    log("fut_backfill", "success" if out else "no_new_data", as_of=max((r["as_of"] for r in out), default=None),
+        detail=_clip(f"讀 data/ 裡的期交所法人 CSV，補了 {len(out)} 列（外資 {nf} 天），{bad} 列驗證不過"))
+    return out
 
 
 def tw_retail_ratio_backfill():
@@ -3695,6 +3740,35 @@ def us_index_long_history():
     return out
 
 
+def us_risk_series(hist=False):
+    """模組 M51：美股谷底計分卡新增條件用的序列。FRED：高收益債利差（BAMLH0A0HYM2）、10 年期殖利率（DGS10）；
+    Yahoo（非官方）：^VIX3M（3 個月波動率）。hist=True 回補約 10 年，否則只抓最近 US_RISK_DAYS_FULL 天。
+    數字都過合理範圍與日期檢查；抓不到只記錄，不讓工作變紅。寫入用 series_id,as_of 當主鍵，重跑不會重複。"""
+    out = []
+    days = config.US_RISK_DAYS_HIST if hist else config.US_RISK_DAYS_FULL
+    for sid in config.US_RISK_FRED:
+        low, high = config.FRED_MACRO[sid][1], config.FRED_MACRO[sid][2]
+        rows = fred_history_rows(sid, low, high, days=days)
+        if rows:
+            out.extend(rows)
+            log(f"us_risk:{sid}", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 筆（{rows[0]['as_of']} 到 {rows[-1]['as_of']}）")
+        else:
+            log(f"us_risk:{sid}", "no_new_data", detail="FRED 沒有回傳資料（沒設金鑰、連線失敗，或這個序列已不提供）")
+    ysym, sid, label, low, high = config.US_RISK_VIX3M
+    pts, why = _yahoo_history(urllib.parse.quote(ysym), "10y" if hist else "3mo")
+    if not pts:
+        log(f"us_risk:{sid}", "no_new_data", detail=_clip(f"Yahoo {ysym} 抓不到：{why}"))
+        return out
+    n = 0
+    for d_, v in pts:
+        ok, _w = validate_close_date(d_.isoformat())
+        if ok and low <= v <= high:
+            out.append({"series_id": sid, "label": label, "as_of": d_.isoformat(), "value": round(v, 4), "source": "Yahoo Finance（非官方）"})
+            n += 1
+    log(f"us_risk:{sid}", "success" if n else "no_new_data", as_of=pts[-1][0].isoformat(), detail=f"{n} 筆（{pts[0][0]} 到 {pts[-1][0]}）")
+    return out
+
+
 def tw_index_history():
     """模組 M05：加權指數近 13 個月的收盤與成交金額（證交所 FMTQIK 每月一次，間隔 3 秒），用來算從高點回落、下跌放量。"""
     today = date.today()
@@ -4999,15 +5073,59 @@ def nasdaq_summary_items(j, limit=45):
     return " ## ".join(f"{k}｜{(it or {}).get('label') if isinstance(it, dict) else ''}｜{(it or {}).get('value') if isinstance(it, dict) else it}" for k, it in list(sd.items())[:limit])
 
 
+_MONTHS = {m: i + 1 for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
+
+
+def parse_nasdaq_forecast(j, today=None):
+    """Nasdaq 分析師預估（/api/analyst/{代號}/earnings-forecast）→ (下一個還沒結束的會計年度的共識 EPS, 年度標籤) 或 (None, 原因)。
+    只取年度預估（yearlyForecast）；欄位名用「名稱裡有 fiscal／consensus」去找，格式改了就回傳原因，不猜。
+    年度結束月份比今天早的不用（那是已經公布的年度）。EPS 要是正數才收。"""
+    today = today or date.today()
+    d = (j or {}).get("data") if isinstance(j, dict) else None
+    yf = d.get("yearlyForecast") if isinstance(d, dict) else None
+    rows = yf.get("rows") if isinstance(yf, dict) else yf
+    if not isinstance(rows, list) or not rows:
+        return None, "沒有 yearlyForecast 年度預估"
+    cands = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        fk = next((k for k in r if "fiscal" in k.lower()), None)
+        ck = next((k for k in r if "consensus" in k.lower()), None)
+        if not fk or not ck:
+            continue
+        m = re.search(r"([A-Za-z]{3})[A-Za-z]*\.?\s+(?:\d{1,2},?\s+)?(\d{4})", str(r.get(fk)))
+        t = re.sub(r"[$,\s]", "", str(r.get(ck) if r.get(ck) is not None else ""))
+        if not m or m.group(1).lower() not in _MONTHS:
+            continue
+        try:
+            eps = float(t)
+        except ValueError:
+            continue
+        end = date(int(m.group(2)), _MONTHS[m.group(1).lower()], 28)
+        if end >= today and 0 < eps < 100000:
+            cands.append((end, eps, str(r.get(fk)).strip()))
+    if not cands:
+        return None, "年度預估裡沒有還沒結束、且 EPS 為正數的年度"
+    end, eps, lab = sorted(cands)[0]
+    return eps, lab
+
+
 def us_valuation(holdings):
     """模組 M39：美股持股與候選股的本益比（過去四季）與 1 年預估本益比、每股盈餘（Nasdaq 個股摘要，資料商提供）。
     只查個股（ETF、槓桿 ETF 沒有）；預估本益比是資料商的預估，不是共識中位數，也不是你自己輸入的。查不到就不寫；
     摘要有拿到但本益比是 N/A（例如虧損）也寫一列，欄位留空，讓網站能分辨「Nasdaq 沒提供」和「還沒抓過」。"""
-    syms = sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol") and h.get("kind") not in ("etf", "leveraged_etf")})
+    syms = list(sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol") and h.get("kind") not in ("etf", "leveraged_etf")}))
+    for h in (holdings or []):                                                                   # 槓桿 ETF：改查它的標的股票（名稱裡的代號，例如 MUU＝2倍做多MU → MU）；看不出來就不加
+        if h.get("market") == "US" and h.get("kind") == "leveraged_etf":
+            u = leveraged_underlying(h.get("name"))
+            if u and u not in syms:
+                syms.append(u)
+    syms = sorted(syms)
     if not syms:
         log("us_valuation", "skipped", detail="沒有美股個股代號，不查本益比")
         return []
-    out, miss, shape = [], [], None
+    out, miss, shape, forecast_shape, fc_miss = [], [], None, None, []
     for sym in syms:
         status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/quote/{sym}/summary?assetclass=stocks", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
         time.sleep(1)
@@ -5029,8 +5147,30 @@ def us_valuation(holdings):
         if vals.get("pe") is None and vals.get("eps") and vals["eps"] > 0 and vals.get("prev_close"):          # Nasdaq 沒直接給本益比，但有每股盈餘與前一日收盤：自己算並標明
             vals = dict(vals, pe=round(vals["prev_close"] / vals["eps"], 2))
             src = "Nasdaq 個股摘要（本益比是「前一日收盤 ÷ 每股盈餘」自己算的，因為 Nasdaq 沒直接提供；預估本益比是資料商的 1 年預估，不是共識中位數）"
+        if vals.get("forward_pe") is None and vals.get("prev_close"):                                      # 摘要沒有預估本益比：用分析師年度共識 EPS 補
+            st2, _c2, b2, e2 = fetch_raw(f"https://api.nasdaq.com/api/analyst/{sym}/earnings-forecast", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+            time.sleep(1)
+            fc_why = f"HTTP {st2} {e2 or ''}".strip()
+            if st2 == 200 and b2:
+                try:
+                    jf = json.loads(b2.decode("utf-8-sig"))
+                    eps_f, lab_f = parse_nasdaq_forecast(jf)
+                    if eps_f:
+                        vals = dict(vals, forward_pe=round(vals["prev_close"] / eps_f, 2))
+                        src += f"；預估本益比是「前一日收盤 ÷ 分析師共識 EPS（{lab_f} 會計年度，{eps_f}）」自己算的（Nasdaq earnings-forecast）"
+                        fc_why = None
+                    else:
+                        fc_why = lab_f
+                        if not forecast_shape:
+                            forecast_shape = f"{sym}｜" + _clip(json.dumps((jf.get('data') or {}) if isinstance(jf, dict) else jf, ensure_ascii=False), 700)
+                except (ValueError, UnicodeDecodeError):
+                    fc_why = "不是 JSON"
+            if fc_why:
+                fc_miss.append(f"{sym}（{fc_why}）")
         out.append({"symbol": sym, **vals, "source": src})
     n_pe, n_fw = sum(1 for r in out if r["pe"] is not None), sum(1 for r in out if r["forward_pe"] is not None)
+    if fc_miss:
+        log("us_valuation_forecast", "no_new_data", detail=_clip("分析師預估補不到：" + "；".join(fc_miss[:8]) + (("｜實際回傳樣貌：" + forecast_shape) if forecast_shape else ""), 1800))
     if shape:
         log("us_valuation_shape", "success", detail=_clip("Nasdaq 摘要實際的欄位（鍵｜標籤｜值）：" + shape, 1800))
     log("us_valuation", "success" if out else "no_new_data", detail=_clip(f"{len(syms)} 檔個股：摘要有 {len(out)} 檔（有本益比 {n_pe}、有預估本益比 {n_fw}）" + (f"；沒有：{'、'.join(miss[:8])}" if miss else "")))
@@ -5198,7 +5338,7 @@ def _watch_hist_stats(code, market, as_of, close):
     return out
 
 
-def watch_valuation():
+def watch_valuation(extra_rows=None):
     """模組 M30：候選股（你在網站輸入的 private_watchlist）的收盤價、本益比、殖利率、股價淨值比，用證交所與櫃買中心的全市場表查。
     本益比是用過去四季盈餘算的（不是預估）；虧損的公司沒有本益比，留空。代號兩個市場都查不到就列出來（可能是興櫃、已下市或代號打錯），不寫入。
     四個來源裡有失敗的只影響該來源的欄位；全部都失敗才算失敗。"""
@@ -5206,15 +5346,19 @@ def watch_valuation():
         log("watch", "skipped", detail="未設定 Supabase，不查候選股")
         return []
     got, err = sb_request("GET", "private_watchlist?select=code&limit=500")
+    hold_codes = {str(r.get("code")).strip() for r in (extra_rows or []) if r.get("market") == "TW" and r.get("code")}      # 持股也一併抓本益比（持股清單的 PEG 要用）
+    if got is None and hold_codes:
+        got = []
     if got is None:
         if "PGRST205" in str(err) or "HTTP 404" in str(err):                                 # 資料表還不存在＝還沒啟用候選股功能，不是壞掉
             log("watch", "no_new_data", detail=_clip("候選股清單的資料表還不存在（還沒執行 new_tables_v58.sql）：沒有要用候選股功能的話可以忽略；要用，請執行 new_tables_v58.sql，再重新跑一次。"))
         else:
             log("watch", "failure", detail=_clip(f"讀取候選股清單失敗：{err}（如果是資料表不存在，請先執行 new_tables_v58.sql）"))
         return []
-    codes = sorted({str(r.get("code", "")).strip() for r in got if isinstance(r, dict) and re.fullmatch(r"\d{4,6}[A-Z]?", str(r.get("code", "")).strip())})
+    codes = sorted({str(r.get("code", "")).strip() for r in got if isinstance(r, dict) and re.fullmatch(r"\d{4,6}[A-Z]?", str(r.get("code", "")).strip())} |
+                   {c for c in hold_codes if re.fullmatch(r"\d{4,6}[A-Z]?", c)})
     if not codes:
-        log("watch", "no_new_data", detail="候選股清單是空的")
+        log("watch", "no_new_data", detail="候選股清單是空的（持股也沒有台股）")
         return []
     srcs = (("twse_px", config.TWSE_AVG_URL), ("twse_pe", config.TWSE_OPENAPI_BASE + "/exchangeReport/BWIBBU_ALL"), ("tpex_px", config.TPEX_QUOTES_URL), ("tpex_pe", config.TPEX_DEFAULT_BASE + "/tpex_mainboard_peratio_analysis"))
     keyf = {"twse_px": "Code", "twse_pe": "Code", "tpex_px": "SecuritiesCompanyCode", "tpex_pe": "SecuritiesCompanyCode"}
@@ -6642,6 +6786,7 @@ def run_job(job, dry_run=False):
         _save2("tw_margin", _run_module("M43", "上市融資餘額長期回補（10 年）", tw_margin_long_backfill), "as_of,source")
         _save2("market_stats", _run_module("M24", "加權指數長期歷史回補", tw_index_long_history), "market,as_of,source")
         _save2("macro_series", _run_module("M35", "美股指數長期歷史（標普 500、Nasdaq 綜合，FRED）", us_index_long_history), "series_id,as_of")
+        _save2("macro_series", _run_module("M51", "美股風險序列歷史（高收益債利差、10 年債、VIX3M）", lambda: us_risk_series(True)), "series_id,as_of")
         pc_rows = margin_hist = index_long = us_long = []
     if job in ("full", "tw_close") and not dry_run:
         res = tw_backfill(dry_run=False, max_days=config.HIST_DAILY_DAYS, window_days=7) or {}
@@ -6677,11 +6822,12 @@ def run_job(job, dry_run=False):
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
             extra.append(("macro_series", _run_module("M31", "美元指數 DXY（Yahoo，非官方）", yahoo_dxy) or [], "series_id,as_of"))
-            extra.append(("watch_snapshot", _run_module("M30", "候選股估值（本益比、殖利率、股價淨值比）", watch_valuation) or [], "code"))
+            extra.append(("watch_snapshot", _run_module("M30", "候選股與持股估值（本益比、殖利率、股價淨值比）", lambda: watch_valuation(price_rows)) or [], "code"))
             extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
+            extra.append(("macro_series", _run_module("M51", "美股風險序列（高收益債利差、10 年債、VIX3M）", us_risk_series) or [], "series_id,as_of"))
             extra.append(("tw_keep_rate", _run_module("M38", "臺股儀表板：全市場擔保維持率（官方）", tw_keep_rate) or [], "as_of,source"))
             twd_hist = _run_module("M37", "美元兌台幣每日歷史（FRED）", twd_fred_history) or []
             extra.append(("twd_rates", twd_hist, "layer,source,as_of"))
@@ -6698,6 +6844,7 @@ def run_job(job, dry_run=False):
     if job == "tw_backfill2":
         if not dry_run:
             persist_extra(False, [("tw_retail_ratio", _run_module("M49", "小台指散戶多空比回補（期交所歷史下載）", tw_retail_ratio_backfill) or [], "as_of")])
+            persist_extra(False, [("tw_futures_position", _run_module("M50", "外資台指期淨部位歷史匯入（data/ 的期交所法人 CSV）", tw_futures_hist_backfill) or [], "as_of,contract,investor,source")])
             persist_extra(False, [("us_aaii", _run_module("M48", "AAII 完整歷史匯入（你下載的檔案）", aaii_csv_import) or [], "as_of")])
             persist_extra(False, [("tw_breadth_hist", _run_module("M46", "上市漲跌家數長期回補（10 年）", tw_breadth_long_backfill) or [], "as_of,market")])
             persist_extra(False, [("tw_margin_ratio", _run_module("M47", "上市融資維持率估算回補", tw_margin_ratio_backfill) or [], "as_of")])
