@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v119"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v120"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -5077,7 +5077,13 @@ def us_valuation(holdings):
     """模組 M39：美股持股與候選股的本益比（過去四季）與 1 年預估本益比、每股盈餘（Nasdaq 個股摘要，資料商提供）。
     只查個股（ETF、槓桿 ETF 沒有）；預估本益比是資料商的預估，不是共識中位數，也不是你自己輸入的。查不到就不寫；
     摘要有拿到但本益比是 N/A（例如虧損）也寫一列，欄位留空，讓網站能分辨「Nasdaq 沒提供」和「還沒抓過」。"""
-    syms = sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol") and h.get("kind") not in ("etf", "leveraged_etf")})
+    syms = list(sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol") and h.get("kind") not in ("etf", "leveraged_etf")}))
+    for h in (holdings or []):                                                                   # 槓桿 ETF：改查它的標的股票（名稱裡的代號，例如 MUU＝2倍做多MU → MU）；看不出來就不加
+        if h.get("market") == "US" and h.get("kind") == "leveraged_etf":
+            u = leveraged_underlying(h.get("name"))
+            if u and u not in syms:
+                syms.append(u)
+    syms = sorted(syms)
     if not syms:
         log("us_valuation", "skipped", detail="沒有美股個股代號，不查本益比")
         return []
