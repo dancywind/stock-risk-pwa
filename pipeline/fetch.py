@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v125"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v126"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3392,6 +3392,19 @@ def parse_pct(text):
 
 
 def _nasdaq_quote(sym, classes):
+    """Nasdaq 報價（含重試）：Nasdaq 偶爾暫時擋掉連續請求、回傳沒有報價的 JSON；這種情況等 4 秒再試一次。其他失敗原因（連線失敗、非收盤價…）不重試。"""
+    res, why = _nasdaq_quote_once(sym, classes)
+    time.sleep(0.8)
+    if res is None and "沒有報價資料" in str(why):
+        time.sleep(4)
+        res, why2 = _nasdaq_quote_once(sym, classes)
+        time.sleep(0.8)
+        if res is None:
+            why = f"{why}（已重試一次）"
+    return res, why
+
+
+def _nasdaq_quote_once(sym, classes):
     """Nasdaq 報價。回傳 (資料, 原因)。只採用 marketStatus=Closed 且非即時的價格；日期用報價自己的時間戳。"""
     last = "查不到報價"
     for ac in classes:
