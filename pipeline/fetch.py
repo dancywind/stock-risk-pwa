@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v124"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v125"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2441,23 +2441,33 @@ def nasdaq_prices(hold):
         if not sym:
             continue
         first = "etf" if h.get("kind") in ("etf", "leveraged_etf") else "stocks"
-        got = None
-        for ac in (first, "stocks" if first == "etf" else "etf"):
-            status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
-            if status is None:
-                log(f"nasdaq:price:{sym}", "failure", detail=_clip(f"連線失敗: {err}"))
+        got, hard, why_ = None, False, ""
+        for attempt in (1, 2):                                                       # Nasdaq 偶爾會暫時擋掉連續請求（回傳沒有報價的 JSON）：等幾秒再試一次
+            for ac in (first, "stocks" if first == "etf" else "etf"):
+                status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+                time.sleep(0.8)
+                if status is None:
+                    log(f"nasdaq:price:{sym}", "failure", detail=_clip(f"連線失敗: {err}"))
+                    hard = True
+                    break
+                try:
+                    j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+                except (ValueError, UnicodeDecodeError):
+                    log(f"nasdaq:price:{sym}", "failure", detail=f"HTTP {status}，回傳不是 JSON")
+                    hard = True
+                    break
+                d = j.get("data") if isinstance(j, dict) else None
+                if isinstance(d, dict) and isinstance(d.get("primaryData"), dict):
+                    got = d
+                    break
+                st_ = j.get("status") if isinstance(j, dict) else None
+                why_ = _clip(str(((st_ or {}).get("bCodeMessage") or (st_ or {}).get("developerMessage") or ""))[:120]) if isinstance(st_, dict) else ""
+            if got is not None or hard:
                 break
-            try:
-                j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
-            except (ValueError, UnicodeDecodeError):
-                log(f"nasdaq:price:{sym}", "failure", detail=f"HTTP {status}，回傳不是 JSON")
-                break
-            d = j.get("data") if isinstance(j, dict) else None
-            if isinstance(d, dict) and isinstance(d.get("primaryData"), dict):
-                got = d
-                break
-        else:
-            log(f"nasdaq:price:{sym}", "failure", detail="stocks 與 etf 兩種分類都查不到報價")
+            if attempt == 1:
+                time.sleep(4)
+        if got is None and not hard:
+            log(f"nasdaq:price:{sym}", "failure", detail="stocks 與 etf 兩種分類都查不到報價（已重試一次）" + (f"｜Nasdaq 回應：{why_}" if why_ else ""))
             continue
         if got is None:
             continue
