@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v120"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v122"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -5073,6 +5073,44 @@ def nasdaq_summary_items(j, limit=45):
     return " ## ".join(f"{k}｜{(it or {}).get('label') if isinstance(it, dict) else ''}｜{(it or {}).get('value') if isinstance(it, dict) else it}" for k, it in list(sd.items())[:limit])
 
 
+_MONTHS = {m: i + 1 for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
+
+
+def parse_nasdaq_forecast(j, today=None):
+    """Nasdaq 分析師預估（/api/analyst/{代號}/earnings-forecast）→ (下一個還沒結束的會計年度的共識 EPS, 年度標籤) 或 (None, 原因)。
+    只取年度預估（yearlyForecast）；欄位名用「名稱裡有 fiscal／consensus」去找，格式改了就回傳原因，不猜。
+    年度結束月份比今天早的不用（那是已經公布的年度）。EPS 要是正數才收。"""
+    today = today or date.today()
+    d = (j or {}).get("data") if isinstance(j, dict) else None
+    yf = d.get("yearlyForecast") if isinstance(d, dict) else None
+    rows = yf.get("rows") if isinstance(yf, dict) else yf
+    if not isinstance(rows, list) or not rows:
+        return None, "沒有 yearlyForecast 年度預估"
+    cands = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        fk = next((k for k in r if "fiscal" in k.lower()), None)
+        ck = next((k for k in r if "consensus" in k.lower()), None)
+        if not fk or not ck:
+            continue
+        m = re.search(r"([A-Za-z]{3})[A-Za-z]*\.?\s+(?:\d{1,2},?\s+)?(\d{4})", str(r.get(fk)))
+        t = re.sub(r"[$,\s]", "", str(r.get(ck) if r.get(ck) is not None else ""))
+        if not m or m.group(1).lower() not in _MONTHS:
+            continue
+        try:
+            eps = float(t)
+        except ValueError:
+            continue
+        end = date(int(m.group(2)), _MONTHS[m.group(1).lower()], 28)
+        if end >= today and 0 < eps < 100000:
+            cands.append((end, eps, str(r.get(fk)).strip()))
+    if not cands:
+        return None, "年度預估裡沒有還沒結束、且 EPS 為正數的年度"
+    end, eps, lab = sorted(cands)[0]
+    return eps, lab
+
+
 def us_valuation(holdings):
     """模組 M39：美股持股與候選股的本益比（過去四季）與 1 年預估本益比、每股盈餘（Nasdaq 個股摘要，資料商提供）。
     只查個股（ETF、槓桿 ETF 沒有）；預估本益比是資料商的預估，不是共識中位數，也不是你自己輸入的。查不到就不寫；
@@ -5087,7 +5125,7 @@ def us_valuation(holdings):
     if not syms:
         log("us_valuation", "skipped", detail="沒有美股個股代號，不查本益比")
         return []
-    out, miss, shape = [], [], None
+    out, miss, shape, forecast_shape, fc_miss = [], [], None, None, []
     for sym in syms:
         status, ctype, body, err = fetch_raw(f"https://api.nasdaq.com/api/quote/{sym}/summary?assetclass=stocks", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
         time.sleep(1)
@@ -5109,8 +5147,33 @@ def us_valuation(holdings):
         if vals.get("pe") is None and vals.get("eps") and vals["eps"] > 0 and vals.get("prev_close"):          # Nasdaq 沒直接給本益比，但有每股盈餘與前一日收盤：自己算並標明
             vals = dict(vals, pe=round(vals["prev_close"] / vals["eps"], 2))
             src = "Nasdaq 個股摘要（本益比是「前一日收盤 ÷ 每股盈餘」自己算的，因為 Nasdaq 沒直接提供；預估本益比是資料商的 1 年預估，不是共識中位數）"
+        if vals.get("forward_pe") is None and vals.get("prev_close"):                                      # 摘要沒有預估本益比：用分析師年度共識 EPS 補
+            st2, _c2, b2, e2 = fetch_raw(f"https://api.nasdaq.com/api/analyst/{sym}/earnings-forecast", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+            time.sleep(1)
+            fc_why = f"HTTP {st2} {e2 or ''}".strip()
+            if st2 == 200 and b2:
+                try:
+                    jf = json.loads(b2.decode("utf-8-sig"))
+                    eps_f, lab_f = parse_nasdaq_forecast(jf)
+                    if eps_f:
+                        vals = dict(vals, forward_pe=round(vals["prev_close"] / eps_f, 2))
+                        src += f"；預估本益比是「前一日收盤 ÷ 分析師共識 EPS（{lab_f} 會計年度，{eps_f}）」自己算的（Nasdaq earnings-forecast）"
+                        fc_why = None
+                    else:
+                        fc_why = lab_f
+                        if not forecast_shape:
+                            forecast_shape = f"{sym}｜" + _clip(json.dumps((jf.get('data') or {}) if isinstance(jf, dict) else jf, ensure_ascii=False), 700)
+                except (ValueError, UnicodeDecodeError):
+                    fc_why = "不是 JSON"
+            if fc_why:
+                fc_miss.append(f"{sym}（{fc_why}）")
         out.append({"symbol": sym, **vals, "source": src})
     n_pe, n_fw = sum(1 for r in out if r["pe"] is not None), sum(1 for r in out if r["forward_pe"] is not None)
+    n_fc = sum(1 for r in out if "分析師共識 EPS" in str(r.get("source")))
+    if fc_miss:
+        log("us_valuation_forecast", "no_new_data", detail=_clip(f"版本 {FETCH_VERSION}｜用分析師預估補上 {n_fc} 檔；補不到：" + "；".join(fc_miss[:8]) + (("｜實際回傳樣貌：" + forecast_shape) if forecast_shape else ""), 1800))
+    else:
+        log("us_valuation_forecast", "success", detail=f"版本 {FETCH_VERSION}｜摘要沒有預估本益比、改用分析師預估補上的有 {n_fc} 檔（其餘摘要本來就有）")
     if shape:
         log("us_valuation_shape", "success", detail=_clip("Nasdaq 摘要實際的欄位（鍵｜標籤｜值）：" + shape, 1800))
     log("us_valuation", "success" if out else "no_new_data", detail=_clip(f"{len(syms)} 檔個股：摘要有 {len(out)} 檔（有本益比 {n_pe}、有預估本益比 {n_fw}）" + (f"；沒有：{'、'.join(miss[:8])}" if miss else "")))

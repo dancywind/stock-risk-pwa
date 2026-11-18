@@ -5595,6 +5595,7 @@ def test_us_valuation_fetches_each_stock_summary_skips_etfs_and_logs_what_is_mis
             {"market": "US", "symbol": "LOSS", "kind": "stock"}, {"market": "US", "symbol": "BAD", "kind": "stock"}, {"market": "US", "symbol": "NOJ", "kind": "stock"}, {"market": "TW", "symbol": None, "kind": "stock"}]
     seen = []
     def raw(url, timeout=None, headers=None):
+        if "/analyst/" in url: return 404, "", b"", "HTTP 404"                  # 分析師預估補不到：不影響原本的欄位
         sym = url.split("/quote/")[1].split("/")[0]; seen.append(sym)
         if sym == "AMD": return 200, "application/json", json.dumps(_summary()).encode(), ""
         if sym == "ORCL": return 200, "application/json", json.dumps(_summary(pe="41.2", fw="31.0", eps="$5.1")).encode(), ""
@@ -6839,3 +6840,16 @@ def test_us_risk_series_yahoo_failure_keeps_fred(monkeypatch):
     monkeypatch.setattr(f, "_yahoo_history", lambda *a, **k: (None, "HTTP 404"))
     monkeypatch.setattr(f, "log", lambda *a, **k: None)
     assert f.us_risk_series() == []
+
+
+def test_parse_nasdaq_forecast_picks_next_open_fiscal_year():
+    from pipeline import fetch as f
+    from datetime import date as _d
+    j = {"data": {"yearlyForecast": {"rows": [
+        {"fiscalEnd": "Mar 2026", "consensusEPSForecast": "$1.90"},
+        {"fiscalEnd": "Mar 2027", "consensusEPSForecast": "$2.50"},
+        {"fiscalEnd": "Mar 2028", "consensusEPSForecast": "$3.10"}]}}}
+    assert f.parse_nasdaq_forecast(j, _d(2026, 11, 18)) == (2.5, "Mar 2027")
+    assert f.parse_nasdaq_forecast({"data": {}}, _d(2026, 11, 18))[0] is None
+    neg = {"data": {"yearlyForecast": {"rows": [{"fiscalEnd": "Dec 2027", "consensusEPSForecast": "-0.4"}]}}}
+    assert f.parse_nasdaq_forecast(neg, _d(2026, 11, 18))[0] is None
