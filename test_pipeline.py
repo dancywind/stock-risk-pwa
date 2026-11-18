@@ -6853,3 +6853,21 @@ def test_parse_nasdaq_forecast_picks_next_open_fiscal_year():
     assert f.parse_nasdaq_forecast({"data": {}}, _d(2026, 11, 18))[0] is None
     neg = {"data": {"yearlyForecast": {"rows": [{"fiscalEnd": "Dec 2027", "consensusEPSForecast": "-0.4"}]}}}
     assert f.parse_nasdaq_forecast(neg, _d(2026, 11, 18))[0] is None
+
+
+def test_parse_forecast_growth_and_revenue_growth(monkeypatch):
+    from pipeline import fetch as f
+    from datetime import date as _d
+    j = {"data": {"yearlyForecast": {"rows": [
+        {"fiscalEnd": "Mar 2027", "consensusEPSForecast": "$2.00"},
+        {"fiscalEnd": "Mar 2028", "consensusEPSForecast": "$3.00"}]}}}
+    assert f.parse_nasdaq_forecast_growth(j, _d(2026, 11, 18)) == (50.0, "Mar 2027→Mar 2028")
+    assert f.parse_nasdaq_forecast_growth({"data": {}}, _d(2026, 11, 18))[0] is None
+    monkeypatch.setattr(f, "sb_ready", lambda: True)
+    monkeypatch.setattr(f, "_tw_watch_codes", lambda: set())
+    monkeypatch.setattr(f, "log", lambda *a, **k: None)
+    tw = [{"公司代號": "2330", "公司名稱": "台積電", "資料年月": "11510", "營業收入-去年同月增減(%)": "30.5", "累計營業收入-前期比較增減(%)": "35.1"},
+          {"公司代號": "9999", "公司名稱": "別檔", "資料年月": "11510", "營業收入-去年同月增減(%)": "1", "累計營業收入-前期比較增減(%)": "2"}]
+    monkeypatch.setattr(f, "fetch_json", lambda url: (tw, None) if "twse" in url else (None, "HTTP 404"))
+    rows = f.tw_revenue_growth([{"market": "TW", "code": "2330"}])
+    assert len(rows) == 1 and rows[0]["code"] == "2330" and rows[0]["cum_yoy"] == 35.1 and rows[0]["month_yoy"] == 30.5

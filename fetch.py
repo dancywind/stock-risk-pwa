@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v121"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v127"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1286,15 +1286,24 @@ def _taifex_investor_csv(url):
         return None, "CSV 不是 UTF-8"
     import csv
     import io
-    reader = csv.DictReader(io.StringIO(text))
-    heads = [h.strip() for h in (reader.fieldnames or [])]
-    missing = [k for k in _CSV_MAP if k not in heads]
+    def _nh(h):   # 欄名正規化：去 BOM、引號、所有空白（含全形），全形括號轉半形
+        h = str(h or "").replace("\ufeff", "").replace("\u3000", "").replace("（", "(").replace("）", ")")
+        return re.sub(r"[\s\"']", "", h)
+    lines = text.splitlines()
+    # 有些檔案前面有說明行：找第一個含「日期」與「商品名稱」的行當表頭
+    start = next((i for i, ln in enumerate(lines) if "日期" in ln and "商品名稱" in ln), 0)
+    reader = csv.reader(io.StringIO("\n".join(lines[start:])))
+    head_raw = next(reader, [])
+    heads = [_nh(h) for h in head_raw]
+    missing = [k for k in _CSV_MAP if _nh(k) not in heads]
     if missing:
-        return None, f"CSV 欄位不符，缺 {missing[:3]}"
+        return None, f"CSV 欄位不符，缺 {missing[:3]}；實際欄位 {heads[:12]}（共 {len(heads)} 欄，{len(body)} 位元組，表頭在第 {start + 1} 行）"
+    idx = {zh: heads.index(_nh(zh)) for zh in _CSV_MAP}
     rows = []
-    for r in reader:
-        r = {(k or "").strip(): (v or "").strip() for k, v in r.items()}
-        row = {en: r.get(zh, "") for zh, en in _CSV_MAP.items()}
+    for rec in reader:
+        if not rec or len(rec) <= max(idx.values()):
+            continue
+        row = {en: rec[idx[zh]].strip() for zh, en in _CSV_MAP.items()}
         row["Date"] = _norm_ymd(row["Date"]) or row["Date"]
         rows.append(row)
     return (rows, "") if rows else (None, "CSV 沒有資料列")
@@ -2441,23 +2450,33 @@ def nasdaq_prices(hold):
         if not sym:
             continue
         first = "etf" if h.get("kind") in ("etf", "leveraged_etf") else "stocks"
-        got = None
-        for ac in (first, "stocks" if first == "etf" else "etf"):
-            status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
-            if status is None:
-                log(f"nasdaq:price:{sym}", "failure", detail=_clip(f"連線失敗: {err}"))
+        got, hard, why_ = None, False, ""
+        for attempt in (1, 2):                                                       # Nasdaq 偶爾會暫時擋掉連續請求（回傳沒有報價的 JSON）：等幾秒再試一次
+            for ac in (first, "stocks" if first == "etf" else "etf"):
+                status, ctype, body, err = fetch_raw(config.NASDAQ_QUOTE_URL.format(symbol=sym, assetclass=ac), timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
+                time.sleep(0.8)
+                if status is None:
+                    log(f"nasdaq:price:{sym}", "failure", detail=_clip(f"連線失敗: {err}"))
+                    hard = True
+                    break
+                try:
+                    j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
+                except (ValueError, UnicodeDecodeError):
+                    log(f"nasdaq:price:{sym}", "failure", detail=f"HTTP {status}，回傳不是 JSON")
+                    hard = True
+                    break
+                d = j.get("data") if isinstance(j, dict) else None
+                if isinstance(d, dict) and isinstance(d.get("primaryData"), dict):
+                    got = d
+                    break
+                st_ = j.get("status") if isinstance(j, dict) else None
+                why_ = _clip(str(((st_ or {}).get("bCodeMessage") or (st_ or {}).get("developerMessage") or ""))[:120]) if isinstance(st_, dict) else ""
+            if got is not None or hard:
                 break
-            try:
-                j = json.loads(body.decode("utf-8-sig").lstrip("\ufeff"))
-            except (ValueError, UnicodeDecodeError):
-                log(f"nasdaq:price:{sym}", "failure", detail=f"HTTP {status}，回傳不是 JSON")
-                break
-            d = j.get("data") if isinstance(j, dict) else None
-            if isinstance(d, dict) and isinstance(d.get("primaryData"), dict):
-                got = d
-                break
-        else:
-            log(f"nasdaq:price:{sym}", "failure", detail="stocks 與 etf 兩種分類都查不到報價")
+            if attempt == 1:
+                time.sleep(4)
+        if got is None and not hard:
+            log(f"nasdaq:price:{sym}", "failure", detail="stocks 與 etf 兩種分類都查不到報價（已重試一次）" + (f"｜Nasdaq 回應：{why_}" if why_ else ""))
             continue
         if got is None:
             continue
@@ -3382,6 +3401,19 @@ def parse_pct(text):
 
 
 def _nasdaq_quote(sym, classes):
+    """Nasdaq 報價（含重試）：Nasdaq 偶爾暫時擋掉連續請求、回傳沒有報價的 JSON；這種情況等 4 秒再試一次。其他失敗原因（連線失敗、非收盤價…）不重試。"""
+    res, why = _nasdaq_quote_once(sym, classes)
+    time.sleep(0.8)
+    if res is None and "沒有報價資料" in str(why):
+        time.sleep(4)
+        res, why2 = _nasdaq_quote_once(sym, classes)
+        time.sleep(0.8)
+        if res is None:
+            why = f"{why}（已重試一次）"
+    return res, why
+
+
+def _nasdaq_quote_once(sym, classes):
     """Nasdaq 報價。回傳 (資料, 原因)。只採用 marketStatus=Closed 且非即時的價格；日期用報價自己的時間戳。"""
     last = "查不到報價"
     for ac in classes:
@@ -3844,6 +3876,11 @@ def persist_extra(dry_run, tables):
             continue
         for chunk in _chunks(rows, 500):
             ok, msg = sb_upsert(table, chunk, conflict)
+            opt = config.OPTIONAL_COLS.get(table)
+            if not ok and opt and any(k in r for r in chunk for k in opt):                 # 新欄位還沒建（沒執行新的 .sql）：去掉新欄位再寫一次，原本的欄位不受影響
+                ok, msg = sb_upsert(table, [{k: v for k, v in r.items() if k not in opt} for r in chunk], conflict)
+                if ok:
+                    log(f"persist:{table}_optional", "no_new_data", detail=f"資料表缺少新欄位 {list(opt)}（請執行最新的 new_tables sql）；已略過這些欄位，其餘照常寫入")
             if not ok:
                 log(f"persist:{table}", "failure", detail=_clip(msg))
                 break
@@ -4985,6 +5022,13 @@ def stock_risk_stats(holdings, tw_codes=None):
     out, notes = [], []
     us = sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol")})
     kinds = {str(h.get("symbol")).strip().upper(): h.get("kind") for h in (holdings or []) if h.get("market") == "US" and h.get("symbol")}
+    for h in (holdings or []):                                                  # 槓桿 ETF：放空占比與機構持股要看標的股票（例如 MUU 看 MU），所以把標的也一併查
+        if h.get("market") == "US" and h.get("kind") == "leveraged_etf":
+            u_ = leveraged_underlying(h.get("name"))
+            if u_ and u_ not in us:
+                us.append(u_)
+                kinds[u_] = "stock"
+    us = sorted(us)
     if us:
         spy, why = _nasdaq_rows("SPY", "etf", 400)
         spy_c = {r["date"].isoformat(): r["close"] for r in (spy or [])}
@@ -5111,6 +5155,42 @@ def parse_nasdaq_forecast(j, today=None):
     return eps, lab
 
 
+def parse_nasdaq_forecast_growth(j, today=None):
+    """同一份分析師年度預估：下一個年度 EPS 比再下一個年度 EPS 的成長率（%，兩個年度要連續、都是正數、成長率在 -90% 到 +500%）→ (成長率, 標籤) 或 (None, 原因)。
+    這是 PEG 的「預估成長」：預估本益比 ÷ 這個成長率。"""
+    today = today or date.today()
+    d = (j or {}).get("data") if isinstance(j, dict) else None
+    yf = d.get("yearlyForecast") if isinstance(d, dict) else None
+    rows = yf.get("rows") if isinstance(yf, dict) else yf
+    cands = []
+    for r in (rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        fk = next((k for k in r if "fiscal" in k.lower()), None)
+        ck = next((k for k in r if "consensus" in k.lower()), None)
+        if not fk or not ck:
+            continue
+        m = re.search(r"([A-Za-z]{3})[A-Za-z]*\.?\s+(?:\d{1,2},?\s+)?(\d{4})", str(r.get(fk)))
+        t = re.sub(r"[$,\s]", "", str(r.get(ck) if r.get(ck) is not None else ""))
+        if not m or m.group(1).lower() not in _MONTHS:
+            continue
+        try:
+            eps = float(t)
+        except ValueError:
+            continue
+        cands.append((date(int(m.group(2)), _MONTHS[m.group(1).lower()], 28), eps, str(r.get(fk)).strip()))
+    cands = sorted(c for c in cands if c[0] >= today)
+    if len(cands) < 2:
+        return None, "年度預估不到兩個還沒結束的年度"
+    (e1, v1, l1), (e2, v2, l2) = cands[0], cands[1]
+    if not (300 <= (e2 - e1).days <= 430) or v1 <= 0 or v2 <= 0:
+        return None, "兩個年度不連續或 EPS 不是正數"
+    g = (v2 / v1 - 1) * 100
+    if not (-90 <= g <= 500):
+        return None, f"預估成長率 {g:.0f}% 超出合理範圍"
+    return round(g, 1), f"{l1}→{l2}"
+
+
 def us_valuation(holdings):
     """模組 M39：美股持股與候選股的本益比（過去四季）與 1 年預估本益比、每股盈餘（Nasdaq 個股摘要，資料商提供）。
     只查個股（ETF、槓桿 ETF 沒有）；預估本益比是資料商的預估，不是共識中位數，也不是你自己輸入的。查不到就不寫；
@@ -5147,19 +5227,24 @@ def us_valuation(holdings):
         if vals.get("pe") is None and vals.get("eps") and vals["eps"] > 0 and vals.get("prev_close"):          # Nasdaq 沒直接給本益比，但有每股盈餘與前一日收盤：自己算並標明
             vals = dict(vals, pe=round(vals["prev_close"] / vals["eps"], 2))
             src = "Nasdaq 個股摘要（本益比是「前一日收盤 ÷ 每股盈餘」自己算的，因為 Nasdaq 沒直接提供；預估本益比是資料商的 1 年預估，不是共識中位數）"
-        if vals.get("forward_pe") is None and vals.get("prev_close"):                                      # 摘要沒有預估本益比：用分析師年度共識 EPS 補
+        if vals.get("prev_close"):                                      # 一律去抓分析師年度預估：摘要沒有預估本益比就用共識 EPS 補；另外取預估 EPS 成長率（PEG 用）
             st2, _c2, b2, e2 = fetch_raw(f"https://api.nasdaq.com/api/analyst/{sym}/earnings-forecast", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
             time.sleep(1)
             fc_why = f"HTTP {st2} {e2 or ''}".strip()
             if st2 == 200 and b2:
                 try:
                     jf = json.loads(b2.decode("utf-8-sig"))
+                    gf, lab_g = parse_nasdaq_forecast_growth(jf)
+                    if gf is not None:
+                        vals = dict(vals, fwd_growth=gf, fwd_label=lab_g)
                     eps_f, lab_f = parse_nasdaq_forecast(jf)
-                    if eps_f:
+                    if eps_f and vals.get("forward_pe") is None:
                         vals = dict(vals, forward_pe=round(vals["prev_close"] / eps_f, 2))
                         src += f"；預估本益比是「前一日收盤 ÷ 分析師共識 EPS（{lab_f} 會計年度，{eps_f}）」自己算的（Nasdaq earnings-forecast）"
                         fc_why = None
-                    else:
+                    elif eps_f and vals.get("forward_pe") is not None:
+                        fc_why = None
+                    elif eps_f is None:
                         fc_why = lab_f
                         if not forecast_shape:
                             forecast_shape = f"{sym}｜" + _clip(json.dumps((jf.get('data') or {}) if isinstance(jf, dict) else jf, ensure_ascii=False), 700)
@@ -5169,8 +5254,11 @@ def us_valuation(holdings):
                 fc_miss.append(f"{sym}（{fc_why}）")
         out.append({"symbol": sym, **vals, "source": src})
     n_pe, n_fw = sum(1 for r in out if r["pe"] is not None), sum(1 for r in out if r["forward_pe"] is not None)
+    n_fc = sum(1 for r in out if "分析師共識 EPS" in str(r.get("source")))
     if fc_miss:
-        log("us_valuation_forecast", "no_new_data", detail=_clip("分析師預估補不到：" + "；".join(fc_miss[:8]) + (("｜實際回傳樣貌：" + forecast_shape) if forecast_shape else ""), 1800))
+        log("us_valuation_forecast", "no_new_data", detail=_clip(f"版本 {FETCH_VERSION}｜用分析師預估補上 {n_fc} 檔；補不到：" + "；".join(fc_miss[:8]) + (("｜實際回傳樣貌：" + forecast_shape) if forecast_shape else ""), 1800))
+    else:
+        log("us_valuation_forecast", "success", detail=f"版本 {FETCH_VERSION}｜摘要沒有預估本益比、改用分析師預估補上的有 {n_fc} 檔（其餘摘要本來就有）")
     if shape:
         log("us_valuation_shape", "success", detail=_clip("Nasdaq 摘要實際的欄位（鍵｜標籤｜值）：" + shape, 1800))
     log("us_valuation", "success" if out else "no_new_data", detail=_clip(f"{len(syms)} 檔個股：摘要有 {len(out)} 檔（有本益比 {n_pe}、有預估本益比 {n_fw}）" + (f"；沒有：{'、'.join(miss[:8])}" if miss else "")))
@@ -5402,6 +5490,54 @@ def watch_valuation(extra_rows=None):
         out.append(row)
     notes = ([f"查不到：{'、'.join(missing)}（可能是興櫃、已下市或代號打錯）"] if missing else []) + ([f"日期異常略過：{'、'.join(bad_date)}"] if bad_date else []) + ([f"來源失敗：{'、'.join(errs)}"] if errs else [])
     log("watch", "success" if out else "no_new_data", detail=_clip(f"{len(out)} / {len(codes)} 檔有資料" + ("｜" + "；".join(notes) if notes else "")))
+    return out
+
+
+def _num_cell(v):
+    t = re.sub(r"[,\s%]", "", str(v if v is not None else ""))
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def tw_revenue_growth(price_rows=None):
+    """模組 M52：台股每月營業收入（證交所、櫃買中心開放資料，官方，每月 10 號前更新）：當月營收年增率與累計營收年增率。
+    只存你的台股持股與候選股。PEG 的成長率備援：獲利算不出來時，用營收年增當成長（營收成長，不是獲利成長，網站上會標明）。
+    欄位用名稱裡有「去年同月增減」「前期比較增減」去找；找不到就記錄實際欄位，不寫任何數字。"""
+    if not sb_ready():
+        log("tw_revenue", "skipped", detail="未設定 Supabase，不抓營收")
+        return []
+    wanted = {str(r.get("code")).strip() for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")} | _tw_watch_codes()
+    if not wanted:
+        log("tw_revenue", "no_new_data", detail="沒有台股持股或候選股")
+        return []
+    out, notes = [], []
+    for tag, url in (("TWSE", config.TWSE_OPENAPI_BASE + "/opendata/t187ap05_L"), ("TPEX", config.TPEX_DEFAULT_BASE + "/mopsfin_t187ap05_O")):
+        rows, err = fetch_json(url)
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            notes.append(f"{tag}（{err or '格式非預期'}）")
+            continue
+        keys = list(rows[0].keys())
+        kc = next((k for k in keys if "公司代號" in k or k.lower() in ("code", "companycode", "securitiescompanycode")), None)
+        km = next((k for k in keys if "去年同月增減" in k), None)
+        kcum = next((k for k in keys if "前期比較增減" in k and "累計" in k), None)
+        kym = next((k for k in keys if "資料年月" in k), None)
+        kn = next((k for k in keys if "公司名稱" in k), None)
+        if not kc or not (km or kcum):
+            notes.append(f"{tag}（找不到欄位；實際欄位：{keys[:14]}）")
+            continue
+        for r in rows:
+            code = str(r.get(kc, "")).strip()
+            if code not in wanted:
+                continue
+            m_, c_ = _num_cell(r.get(km)) if km else None, _num_cell(r.get(kcum)) if kcum else None
+            if m_ is None and c_ is None:
+                continue
+            out.append({"code": code, "name": str(r.get(kn, "")).strip() if kn else None, "ym": str(r.get(kym, "")).strip() if kym else None,
+                        "month_yoy": m_ if m_ is not None and -100 <= m_ <= 100000 else None, "cum_yoy": c_ if c_ is not None and -100 <= c_ <= 100000 else None,
+                        "source": f"{tag} 每月營業收入彙總表（官方開放資料）"})
+    log("tw_revenue", "success" if out else "no_new_data", detail=_clip(f"{len(out)} / {len(wanted)} 檔有營收年增" + ("｜" + "；".join(notes) if notes else "")))
     return out
 
 
@@ -6823,6 +6959,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
             extra.append(("macro_series", _run_module("M31", "美元指數 DXY（Yahoo，非官方）", yahoo_dxy) or [], "series_id,as_of"))
             extra.append(("watch_snapshot", _run_module("M30", "候選股與持股估值（本益比、殖利率、股價淨值比）", lambda: watch_valuation(price_rows)) or [], "code"))
+            extra.append(("tw_revenue_growth", _run_module("M52", "台股每月營收年增率（證交所、櫃買中心）", lambda: tw_revenue_growth(price_rows)) or [], "code"))
             extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
