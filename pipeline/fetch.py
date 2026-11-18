@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v116"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v117"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1125,6 +1125,51 @@ def parse_taifex_hist_rows(inv_text, fut_text):
         return None, None, f"行情檔欄位不符：{h2[:12]}"
     fut = [{"Date": re.sub(r"\D", "", r[j_d]), "Contract": r[j_c], "ContractMonth(Week)": r[j_m], "TradingSession": (r[j_s] if j_s is not None and len(r) > j_s else ""), "OpenInterest": r[j_o].replace(",", "")} for r in r2 if len(r) > max(j_d, j_c, j_m, j_o)]
     return inv, fut, ""
+
+
+def tw_futures_hist_backfill():
+    """模組 M50：外資台指期淨未平倉歷史（讀 data/taifex_inst*.csv 裡「臺股期貨」的三個身份別），補進 tw_futures_position。
+    用來算「外資極度偏空」的近一年分位數。多方 − 空方 必須等於淨額，對不上的列不寫。已有的日期不重複補。"""
+    if not sb_ready():
+        log("fut_backfill", "skipped", detail="未設定 Supabase，不回補")
+        return []
+    import glob as _glob
+    ddir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    files = sorted(_glob.glob(os.path.join(ddir, "taifex_inst*.csv")))
+    if not files:
+        log("fut_backfill", "no_new_data", detail="data/ 裡沒有 taifex_inst*.csv")
+        return []
+    have_rows, err = sb_request("GET", "tw_futures_position?select=as_of,investor&order=as_of.desc&limit=5000")
+    if have_rows is None:
+        log("fut_backfill", "failure", detail=_clip(f"讀取已有的期貨部位失敗：{err}"))
+        return []
+    have = {(r["as_of"], r["investor"]) for r in have_rows}
+    out, bad, seen = [], 0, set()
+    import csv as _csv, io as _io
+    for fp in files:
+        with open(fp, "rb") as fh:
+            text = _decode_tw_csv(fh.read())
+        for cells in _csv.reader(_io.StringIO(text.lstrip("\ufeff"))):
+            if len(cells) < 15 or cells[1].strip() != config.TAIFEX_CONTRACT:
+                continue
+            d = twse_ymd_to_iso(cells[0].strip().replace("/", ""))
+            inv = cells[2].strip()
+            if not d or not inv:
+                continue
+            lng, sht, net = parse_number(cells[9]), parse_number(cells[11]), parse_number(cells[13])
+            if None in (lng, sht, net) or lng < 0 or sht < 0 or net != lng - sht or abs(net) > config.TAIFEX_NET_LIMIT:
+                bad += 1
+                continue
+            key = (d, inv)
+            if key in have or key in seen:
+                continue
+            seen.add(key)
+            out.append({"as_of": d, "contract": config.TAIFEX_CONTRACT, "investor": inv, "oi_long": lng, "oi_short": sht, "oi_net": net,
+                        "oi_net_value_thousand": parse_number(cells[14]), "source": "TAIFEX 三大法人-區分各期貨契約"})
+    nf = len([r for r in out if r["investor"].startswith("外資")])
+    log("fut_backfill", "success" if out else "no_new_data", as_of=max((r["as_of"] for r in out), default=None),
+        detail=_clip(f"讀 data/ 裡的期交所法人 CSV，補了 {len(out)} 列（外資 {nf} 天），{bad} 列驗證不過"))
+    return out
 
 
 def tw_retail_ratio_backfill():
@@ -6698,6 +6743,7 @@ def run_job(job, dry_run=False):
     if job == "tw_backfill2":
         if not dry_run:
             persist_extra(False, [("tw_retail_ratio", _run_module("M49", "小台指散戶多空比回補（期交所歷史下載）", tw_retail_ratio_backfill) or [], "as_of")])
+            persist_extra(False, [("tw_futures_position", _run_module("M50", "外資台指期淨部位歷史匯入（data/ 的期交所法人 CSV）", tw_futures_hist_backfill) or [], "as_of,contract,investor,source")])
             persist_extra(False, [("us_aaii", _run_module("M48", "AAII 完整歷史匯入（你下載的檔案）", aaii_csv_import) or [], "as_of")])
             persist_extra(False, [("tw_breadth_hist", _run_module("M46", "上市漲跌家數長期回補（10 年）", tw_breadth_long_backfill) or [], "as_of,market")])
             persist_extra(False, [("tw_margin_ratio", _run_module("M47", "上市融資維持率估算回補", tw_margin_ratio_backfill) or [], "as_of")])
