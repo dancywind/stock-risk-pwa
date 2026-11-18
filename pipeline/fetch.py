@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v123"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v124"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -4990,6 +4990,13 @@ def stock_risk_stats(holdings, tw_codes=None):
     out, notes = [], []
     us = sorted({str(h.get("symbol")).strip().upper() for h in (holdings or []) if h.get("market") == "US" and h.get("symbol")})
     kinds = {str(h.get("symbol")).strip().upper(): h.get("kind") for h in (holdings or []) if h.get("market") == "US" and h.get("symbol")}
+    for h in (holdings or []):                                                  # 槓桿 ETF：放空占比與機構持股要看標的股票（例如 MUU 看 MU），所以把標的也一併查
+        if h.get("market") == "US" and h.get("kind") == "leveraged_etf":
+            u_ = leveraged_underlying(h.get("name"))
+            if u_ and u_ not in us:
+                us.append(u_)
+                kinds[u_] = "stock"
+    us = sorted(us)
     if us:
         spy, why = _nasdaq_rows("SPY", "etf", 400)
         spy_c = {r["date"].isoformat(): r["close"] for r in (spy or [])}
