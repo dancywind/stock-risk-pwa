@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v122"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v123"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3844,6 +3844,11 @@ def persist_extra(dry_run, tables):
             continue
         for chunk in _chunks(rows, 500):
             ok, msg = sb_upsert(table, chunk, conflict)
+            opt = config.OPTIONAL_COLS.get(table)
+            if not ok and opt and any(k in r for r in chunk for k in opt):                 # 新欄位還沒建（沒執行新的 .sql）：去掉新欄位再寫一次，原本的欄位不受影響
+                ok, msg = sb_upsert(table, [{k: v for k, v in r.items() if k not in opt} for r in chunk], conflict)
+                if ok:
+                    log(f"persist:{table}_optional", "no_new_data", detail=f"資料表缺少新欄位 {list(opt)}（請執行最新的 new_tables sql）；已略過這些欄位，其餘照常寫入")
             if not ok:
                 log(f"persist:{table}", "failure", detail=_clip(msg))
                 break
@@ -5111,6 +5116,42 @@ def parse_nasdaq_forecast(j, today=None):
     return eps, lab
 
 
+def parse_nasdaq_forecast_growth(j, today=None):
+    """同一份分析師年度預估：下一個年度 EPS 比再下一個年度 EPS 的成長率（%，兩個年度要連續、都是正數、成長率在 -90% 到 +500%）→ (成長率, 標籤) 或 (None, 原因)。
+    這是 PEG 的「預估成長」：預估本益比 ÷ 這個成長率。"""
+    today = today or date.today()
+    d = (j or {}).get("data") if isinstance(j, dict) else None
+    yf = d.get("yearlyForecast") if isinstance(d, dict) else None
+    rows = yf.get("rows") if isinstance(yf, dict) else yf
+    cands = []
+    for r in (rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        fk = next((k for k in r if "fiscal" in k.lower()), None)
+        ck = next((k for k in r if "consensus" in k.lower()), None)
+        if not fk or not ck:
+            continue
+        m = re.search(r"([A-Za-z]{3})[A-Za-z]*\.?\s+(?:\d{1,2},?\s+)?(\d{4})", str(r.get(fk)))
+        t = re.sub(r"[$,\s]", "", str(r.get(ck) if r.get(ck) is not None else ""))
+        if not m or m.group(1).lower() not in _MONTHS:
+            continue
+        try:
+            eps = float(t)
+        except ValueError:
+            continue
+        cands.append((date(int(m.group(2)), _MONTHS[m.group(1).lower()], 28), eps, str(r.get(fk)).strip()))
+    cands = sorted(c for c in cands if c[0] >= today)
+    if len(cands) < 2:
+        return None, "年度預估不到兩個還沒結束的年度"
+    (e1, v1, l1), (e2, v2, l2) = cands[0], cands[1]
+    if not (300 <= (e2 - e1).days <= 430) or v1 <= 0 or v2 <= 0:
+        return None, "兩個年度不連續或 EPS 不是正數"
+    g = (v2 / v1 - 1) * 100
+    if not (-90 <= g <= 500):
+        return None, f"預估成長率 {g:.0f}% 超出合理範圍"
+    return round(g, 1), f"{l1}→{l2}"
+
+
 def us_valuation(holdings):
     """模組 M39：美股持股與候選股的本益比（過去四季）與 1 年預估本益比、每股盈餘（Nasdaq 個股摘要，資料商提供）。
     只查個股（ETF、槓桿 ETF 沒有）；預估本益比是資料商的預估，不是共識中位數，也不是你自己輸入的。查不到就不寫；
@@ -5147,19 +5188,24 @@ def us_valuation(holdings):
         if vals.get("pe") is None and vals.get("eps") and vals["eps"] > 0 and vals.get("prev_close"):          # Nasdaq 沒直接給本益比，但有每股盈餘與前一日收盤：自己算並標明
             vals = dict(vals, pe=round(vals["prev_close"] / vals["eps"], 2))
             src = "Nasdaq 個股摘要（本益比是「前一日收盤 ÷ 每股盈餘」自己算的，因為 Nasdaq 沒直接提供；預估本益比是資料商的 1 年預估，不是共識中位數）"
-        if vals.get("forward_pe") is None and vals.get("prev_close"):                                      # 摘要沒有預估本益比：用分析師年度共識 EPS 補
+        if vals.get("prev_close"):                                      # 一律去抓分析師年度預估：摘要沒有預估本益比就用共識 EPS 補；另外取預估 EPS 成長率（PEG 用）
             st2, _c2, b2, e2 = fetch_raw(f"https://api.nasdaq.com/api/analyst/{sym}/earnings-forecast", timeout=config.PROBE_TIMEOUT, headers=NASDAQ_HEADERS)
             time.sleep(1)
             fc_why = f"HTTP {st2} {e2 or ''}".strip()
             if st2 == 200 and b2:
                 try:
                     jf = json.loads(b2.decode("utf-8-sig"))
+                    gf, lab_g = parse_nasdaq_forecast_growth(jf)
+                    if gf is not None:
+                        vals = dict(vals, fwd_growth=gf, fwd_label=lab_g)
                     eps_f, lab_f = parse_nasdaq_forecast(jf)
-                    if eps_f:
+                    if eps_f and vals.get("forward_pe") is None:
                         vals = dict(vals, forward_pe=round(vals["prev_close"] / eps_f, 2))
                         src += f"；預估本益比是「前一日收盤 ÷ 分析師共識 EPS（{lab_f} 會計年度，{eps_f}）」自己算的（Nasdaq earnings-forecast）"
                         fc_why = None
-                    else:
+                    elif eps_f and vals.get("forward_pe") is not None:
+                        fc_why = None
+                    elif eps_f is None:
                         fc_why = lab_f
                         if not forecast_shape:
                             forecast_shape = f"{sym}｜" + _clip(json.dumps((jf.get('data') or {}) if isinstance(jf, dict) else jf, ensure_ascii=False), 700)
@@ -5405,6 +5451,54 @@ def watch_valuation(extra_rows=None):
         out.append(row)
     notes = ([f"查不到：{'、'.join(missing)}（可能是興櫃、已下市或代號打錯）"] if missing else []) + ([f"日期異常略過：{'、'.join(bad_date)}"] if bad_date else []) + ([f"來源失敗：{'、'.join(errs)}"] if errs else [])
     log("watch", "success" if out else "no_new_data", detail=_clip(f"{len(out)} / {len(codes)} 檔有資料" + ("｜" + "；".join(notes) if notes else "")))
+    return out
+
+
+def _num_cell(v):
+    t = re.sub(r"[,\s%]", "", str(v if v is not None else ""))
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def tw_revenue_growth(price_rows=None):
+    """模組 M52：台股每月營業收入（證交所、櫃買中心開放資料，官方，每月 10 號前更新）：當月營收年增率與累計營收年增率。
+    只存你的台股持股與候選股。PEG 的成長率備援：獲利算不出來時，用營收年增當成長（營收成長，不是獲利成長，網站上會標明）。
+    欄位用名稱裡有「去年同月增減」「前期比較增減」去找；找不到就記錄實際欄位，不寫任何數字。"""
+    if not sb_ready():
+        log("tw_revenue", "skipped", detail="未設定 Supabase，不抓營收")
+        return []
+    wanted = {str(r.get("code")).strip() for r in (price_rows or []) if r.get("market") == "TW" and r.get("code")} | _tw_watch_codes()
+    if not wanted:
+        log("tw_revenue", "no_new_data", detail="沒有台股持股或候選股")
+        return []
+    out, notes = [], []
+    for tag, url in (("TWSE", config.TWSE_OPENAPI_BASE + "/opendata/t187ap05_L"), ("TPEX", config.TPEX_DEFAULT_BASE + "/mopsfin_t187ap05_O")):
+        rows, err = fetch_json(url)
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            notes.append(f"{tag}（{err or '格式非預期'}）")
+            continue
+        keys = list(rows[0].keys())
+        kc = next((k for k in keys if "公司代號" in k or k.lower() in ("code", "companycode", "securitiescompanycode")), None)
+        km = next((k for k in keys if "去年同月增減" in k), None)
+        kcum = next((k for k in keys if "前期比較增減" in k and "累計" in k), None)
+        kym = next((k for k in keys if "資料年月" in k), None)
+        kn = next((k for k in keys if "公司名稱" in k), None)
+        if not kc or not (km or kcum):
+            notes.append(f"{tag}（找不到欄位；實際欄位：{keys[:14]}）")
+            continue
+        for r in rows:
+            code = str(r.get(kc, "")).strip()
+            if code not in wanted:
+                continue
+            m_, c_ = _num_cell(r.get(km)) if km else None, _num_cell(r.get(kcum)) if kcum else None
+            if m_ is None and c_ is None:
+                continue
+            out.append({"code": code, "name": str(r.get(kn, "")).strip() if kn else None, "ym": str(r.get(kym, "")).strip() if kym else None,
+                        "month_yoy": m_ if m_ is not None and -100 <= m_ <= 100000 else None, "cum_yoy": c_ if c_ is not None and -100 <= c_ <= 100000 else None,
+                        "source": f"{tag} 每月營業收入彙總表（官方開放資料）"})
+    log("tw_revenue", "success" if out else "no_new_data", detail=_clip(f"{len(out)} / {len(wanted)} 檔有營收年增" + ("｜" + "；".join(notes) if notes else "")))
     return out
 
 
@@ -6826,6 +6920,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
             extra.append(("macro_series", _run_module("M31", "美元指數 DXY（Yahoo，非官方）", yahoo_dxy) or [], "series_id,as_of"))
             extra.append(("watch_snapshot", _run_module("M30", "候選股與持股估值（本益比、殖利率、股價淨值比）", lambda: watch_valuation(price_rows)) or [], "code"))
+            extra.append(("tw_revenue_growth", _run_module("M52", "台股每月營收年增率（證交所、櫃買中心）", lambda: tw_revenue_growth(price_rows)) or [], "code"))
             extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
