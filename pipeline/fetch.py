@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v118"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v119"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -5272,7 +5272,7 @@ def _watch_hist_stats(code, market, as_of, close):
     return out
 
 
-def watch_valuation():
+def watch_valuation(extra_rows=None):
     """模組 M30：候選股（你在網站輸入的 private_watchlist）的收盤價、本益比、殖利率、股價淨值比，用證交所與櫃買中心的全市場表查。
     本益比是用過去四季盈餘算的（不是預估）；虧損的公司沒有本益比，留空。代號兩個市場都查不到就列出來（可能是興櫃、已下市或代號打錯），不寫入。
     四個來源裡有失敗的只影響該來源的欄位；全部都失敗才算失敗。"""
@@ -5280,15 +5280,19 @@ def watch_valuation():
         log("watch", "skipped", detail="未設定 Supabase，不查候選股")
         return []
     got, err = sb_request("GET", "private_watchlist?select=code&limit=500")
+    hold_codes = {str(r.get("code")).strip() for r in (extra_rows or []) if r.get("market") == "TW" and r.get("code")}      # 持股也一併抓本益比（持股清單的 PEG 要用）
+    if got is None and hold_codes:
+        got = []
     if got is None:
         if "PGRST205" in str(err) or "HTTP 404" in str(err):                                 # 資料表還不存在＝還沒啟用候選股功能，不是壞掉
             log("watch", "no_new_data", detail=_clip("候選股清單的資料表還不存在（還沒執行 new_tables_v58.sql）：沒有要用候選股功能的話可以忽略；要用，請執行 new_tables_v58.sql，再重新跑一次。"))
         else:
             log("watch", "failure", detail=_clip(f"讀取候選股清單失敗：{err}（如果是資料表不存在，請先執行 new_tables_v58.sql）"))
         return []
-    codes = sorted({str(r.get("code", "")).strip() for r in got if isinstance(r, dict) and re.fullmatch(r"\d{4,6}[A-Z]?", str(r.get("code", "")).strip())})
+    codes = sorted({str(r.get("code", "")).strip() for r in got if isinstance(r, dict) and re.fullmatch(r"\d{4,6}[A-Z]?", str(r.get("code", "")).strip())} |
+                   {c for c in hold_codes if re.fullmatch(r"\d{4,6}[A-Z]?", c)})
     if not codes:
-        log("watch", "no_new_data", detail="候選股清單是空的")
+        log("watch", "no_new_data", detail="候選股清單是空的（持股也沒有台股）")
         return []
     srcs = (("twse_px", config.TWSE_AVG_URL), ("twse_pe", config.TWSE_OPENAPI_BASE + "/exchangeReport/BWIBBU_ALL"), ("tpex_px", config.TPEX_QUOTES_URL), ("tpex_pe", config.TPEX_DEFAULT_BASE + "/tpex_mainboard_peratio_analysis"))
     keyf = {"twse_px": "Code", "twse_pe": "Code", "tpex_px": "SecuritiesCompanyCode", "tpex_pe": "SecuritiesCompanyCode"}
@@ -6752,7 +6756,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_options_summary", [r["summary"] for r in twopt], "as_of"))
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
             extra.append(("macro_series", _run_module("M31", "美元指數 DXY（Yahoo，非官方）", yahoo_dxy) or [], "series_id,as_of"))
-            extra.append(("watch_snapshot", _run_module("M30", "候選股估值（本益比、殖利率、股價淨值比）", watch_valuation) or [], "code"))
+            extra.append(("watch_snapshot", _run_module("M30", "候選股與持股估值（本益比、殖利率、股價淨值比）", lambda: watch_valuation(price_rows)) or [], "code"))
             extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
