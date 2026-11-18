@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v126"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v127"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -1286,15 +1286,24 @@ def _taifex_investor_csv(url):
         return None, "CSV 不是 UTF-8"
     import csv
     import io
-    reader = csv.DictReader(io.StringIO(text))
-    heads = [h.strip() for h in (reader.fieldnames or [])]
-    missing = [k for k in _CSV_MAP if k not in heads]
+    def _nh(h):   # 欄名正規化：去 BOM、引號、所有空白（含全形），全形括號轉半形
+        h = str(h or "").replace("\ufeff", "").replace("\u3000", "").replace("（", "(").replace("）", ")")
+        return re.sub(r"[\s\"']", "", h)
+    lines = text.splitlines()
+    # 有些檔案前面有說明行：找第一個含「日期」與「商品名稱」的行當表頭
+    start = next((i for i, ln in enumerate(lines) if "日期" in ln and "商品名稱" in ln), 0)
+    reader = csv.reader(io.StringIO("\n".join(lines[start:])))
+    head_raw = next(reader, [])
+    heads = [_nh(h) for h in head_raw]
+    missing = [k for k in _CSV_MAP if _nh(k) not in heads]
     if missing:
-        return None, f"CSV 欄位不符，缺 {missing[:3]}"
+        return None, f"CSV 欄位不符，缺 {missing[:3]}；實際欄位 {heads[:12]}（共 {len(heads)} 欄，{len(body)} 位元組，表頭在第 {start + 1} 行）"
+    idx = {zh: heads.index(_nh(zh)) for zh in _CSV_MAP}
     rows = []
-    for r in reader:
-        r = {(k or "").strip(): (v or "").strip() for k, v in r.items()}
-        row = {en: r.get(zh, "") for zh, en in _CSV_MAP.items()}
+    for rec in reader:
+        if not rec or len(rec) <= max(idx.values()):
+            continue
+        row = {en: rec[idx[zh]].strip() for zh, en in _CSV_MAP.items()}
         row["Date"] = _norm_ymd(row["Date"]) or row["Date"]
         rows.append(row)
     return (rows, "") if rows else (None, "CSV 沒有資料列")
