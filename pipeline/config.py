@@ -188,7 +188,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v128"
+PIPELINE_VERSION = "v129"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -281,6 +281,7 @@ FIN_PROBE_FINMIND = 6
 # 模組 M51：美股谷底計分卡新增的風險序列。FRED 的 ICE BofA 系列自 2026 年起只提供近 3 年；VIX3M 取自 Yahoo（非官方）
 US_RISK_FRED = ("BAMLH0A0HYM2", "DGS10")
 US_RISK_VIX3M = ("^VIX3M", "VIX3M", "VIX 3 個月波動率（Yahoo，非官方）", 5.0, 100.0)
+US_RISK_SOX = ("^SOX", "SOX", "費城半導體指數（Yahoo，非官方）", 100.0, 100000.0)
 US_RISK_DAYS_FULL = 60                     # 每天更新時往回抓幾天
 US_RISK_DAYS_HIST = 3700                   # 歷史回補（約 10 年；高收益債利差 FRED 只給 3 年，抓不到更早的會自然停在 3 年）
 

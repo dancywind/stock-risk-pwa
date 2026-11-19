@@ -6831,7 +6831,9 @@ def test_us_risk_series_collects_fred_and_vix3m(monkeypatch):
     monkeypatch.setattr(f, "log", lambda *a, **k: None)
     rows = f.us_risk_series()
     ids = sorted(r["series_id"] for r in rows)
-    assert ids == ["BAMLH0A0HYM2", "DGS10", "VIX3M"]          # 超出合理範圍的 999 被拒收
+    assert "VIX3M" in ids and ids.count("VIX3M") == 1          # 超出合理範圍的 999 被拒收（VIX3M 上限 100）
+    assert "BAMLH0A0HYM2" in ids and "DGS10" in ids
+    assert ids.count("SOX") == 1                                # 費城半導體：20.5 低於下限被拒，999 在範圍內
 
 
 def test_us_risk_series_yahoo_failure_keeps_fred(monkeypatch):

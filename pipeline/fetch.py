@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v128"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v129"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3786,18 +3786,18 @@ def us_risk_series(hist=False):
             log(f"us_risk:{sid}", "success", as_of=rows[-1]["as_of"], detail=f"{len(rows)} 筆（{rows[0]['as_of']} 到 {rows[-1]['as_of']}）")
         else:
             log(f"us_risk:{sid}", "no_new_data", detail="FRED 沒有回傳資料（沒設金鑰、連線失敗，或這個序列已不提供）")
-    ysym, sid, label, low, high = config.US_RISK_VIX3M
-    pts, why = _yahoo_history(urllib.parse.quote(ysym), "10y" if hist else "3mo")
-    if not pts:
-        log(f"us_risk:{sid}", "no_new_data", detail=_clip(f"Yahoo {ysym} 抓不到：{why}"))
-        return out
-    n = 0
-    for d_, v in pts:
-        ok, _w = validate_close_date(d_.isoformat())
-        if ok and low <= v <= high:
-            out.append({"series_id": sid, "label": label, "as_of": d_.isoformat(), "value": round(v, 4), "source": "Yahoo Finance（非官方）"})
-            n += 1
-    log(f"us_risk:{sid}", "success" if n else "no_new_data", as_of=pts[-1][0].isoformat(), detail=f"{n} 筆（{pts[0][0]} 到 {pts[-1][0]}）")
+    for ysym, sid, label, low, high in (config.US_RISK_VIX3M, config.US_RISK_SOX):
+        pts, why = _yahoo_history(urllib.parse.quote(ysym), "10y" if hist else "1y")
+        if not pts:
+            log(f"us_risk:{sid}", "no_new_data", detail=_clip(f"Yahoo {ysym} 抓不到：{why}"))
+            continue
+        n = 0
+        for d_, v in pts:
+            ok, _w = validate_close_date(d_.isoformat())
+            if ok and low <= v <= high:
+                out.append({"series_id": sid, "label": label, "as_of": d_.isoformat(), "value": round(v, 4), "source": "Yahoo Finance（非官方）"})
+                n += 1
+        log(f"us_risk:{sid}", "success" if n else "no_new_data", as_of=pts[-1][0].isoformat(), detail=f"{n} 筆（{pts[0][0]} 到 {pts[-1][0]}）")
     return out
 
 
