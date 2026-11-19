@@ -188,7 +188,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v127"
+PIPELINE_VERSION = "v128"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -285,4 +285,4 @@ US_RISK_DAYS_FULL = 60                     # 每天更新時往回抓幾天
 US_RISK_DAYS_HIST = 3700                   # 歷史回補（約 10 年；高收益債利差 FRED 只給 3 年，抓不到更早的會自然停在 3 年）
 
 # 資料表新增、但使用者可能還沒執行 sql 的欄位：寫入失敗時去掉這些欄位再試一次
-OPTIONAL_COLS = {"us_valuation": ("fwd_growth", "fwd_label")}
+OPTIONAL_COLS = {"us_valuation": ("fwd_growth", "fwd_label"), "stock_risk_stats": ("closes",)}

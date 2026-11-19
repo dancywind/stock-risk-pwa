@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v127"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v128"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -5036,10 +5036,12 @@ def stock_risk_stats(holdings, tw_codes=None):
             notes.append(f"SPY 歷史取不到（{why}），美股不算 Beta")
         for sym in us:
             is_etf = kinds.get(sym) in ("etf", "leveraged_etf")
-            row = {"market": "US", "code": sym, "beta": None, "beta_n": None, "short_shares": None, "short_pct": None, "days_to_cover": None, "short_as_of": None, "inst_pct": None, "source": "Nasdaq（歷史行情自算 Beta；放空餘額、機構持股為資料商公布）"}
+            row = {"market": "US", "code": sym, "beta": None, "beta_n": None, "short_shares": None, "short_pct": None, "days_to_cover": None, "short_as_of": None, "inst_pct": None, "source": "Nasdaq（歷史行情自算 Beta；放空餘額、機構持股為資料商公布）", "closes": None}
             rows_, w = _nasdaq_rows(sym, "etf" if is_etf else "stocks", 400)
             time.sleep(1)
             last_px = rows_[-1]["close"] if rows_ else None
+            if rows_:
+                row["closes"] = [[r["date"].isoformat(), round(float(r["close"]), 4)] for r in rows_[-100:]]       # 給網頁算均線（5/10/20/60 日…）的收盤價尾巴
             if rows_ and spy_c:
                 row["beta"], row["beta_n"] = calc_beta({r["date"].isoformat(): r["close"] for r in rows_}, spy_c)
             elif not rows_:
@@ -5096,7 +5098,7 @@ def stock_risk_stats(holdings, tw_codes=None):
             beta, n = calc_beta({str(r["as_of"]): float(r["close"]) for r in rows_ if str(r.get("market")) == str(rows_[-1].get("market"))}, mk_idx[mk])
             if beta is None:
                 notes.append(f"{code} Beta 不夠資料（{n} 筆報酬）")
-            out.append({"market": "TW", "code": code, "beta": beta, "beta_n": n if beta is not None else None, "short_shares": None, "short_pct": None, "days_to_cover": None, "short_as_of": None, "inst_pct": None,
+            out.append({"market": "TW", "code": code, "beta": beta, "beta_n": n if beta is not None else None, "closes": [[str(r["as_of"]), round(float(r["close"]), 4)] for r in rows_[-100:] if str(r.get("market")) == str(rows_[-1].get("market"))], "short_shares": None, "short_pct": None, "days_to_cover": None, "short_as_of": None, "inst_pct": None,
                         "source": "自建歷史行情對" + ("加權指數" if mk == "TWSE" else "櫃買指數") + "的近一年日報酬自算"})
     n_b, n_s, n_i = sum(1 for r in out if r["beta"] is not None), sum(1 for r in out if r["short_pct"] is not None), sum(1 for r in out if r["inst_pct"] is not None)
     log("stock_risk_stats", "success" if out else "no_new_data", detail=_clip(f"{len(out)} 檔：Beta {n_b}、放空占比 {n_s}、機構持股 {n_i}" + (f"；沒有：{'、'.join(notes[:10])}" if notes else "")))
