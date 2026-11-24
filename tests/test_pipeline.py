@@ -1147,7 +1147,7 @@ def test_nasdaq_prices_only_uses_closed_non_realtime():
         reset()
         with mock.patch.object(fetch, "fetch_raw", return_value=(200, "application/json", nas_body(status=status, real=real, ts=ts), "")):
             assert fetch.nasdaq_prices(US_HOLD) == []
-        assert fetch.LOG[-1]["status"] == "skipped" and "不使用" in fetch.LOG[-1]["detail"], status
+        assert fetch.LOG[-1]["status"] == "skipped" and "不是已收盤的價格" in fetch.LOG[-1]["detail"], status
 
 
 def test_nasdaq_prices_records_the_official_name_and_falls_back_to_the_pasted_one():
@@ -6928,3 +6928,15 @@ def test_tpex_industry_english_fields_and_persist_dedupes_conflict_keys():
     with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", side_effect=lambda t, ch, c: (got.append(ch) or (True, ""))):
         fetch.persist_extra(False, [("macro_series", [{"series_id": "SP500", "as_of": "2026-11-20", "value": 1}, {"series_id": "SP500", "as_of": "2026-11-20", "value": 2}, {"series_id": "SP500", "as_of": "2026-11-21", "value": 3}], "series_id,as_of")])
     assert len(got[0]) == 2 and got[0][0]["value"] == 2
+
+
+def test_nasdaq_prices_falls_back_to_closed_daily_bar_when_quote_is_not_closed():
+    reset()
+    ts = (TODAY - timedelta(days=1)).strftime("%b %d, %Y").replace(" 0", " ")
+    d1, d2 = TODAY - timedelta(days=3), TODAY - timedelta(days=2)
+    hist = hist_body([{"date": d2.strftime("%m/%d/%Y"), "close": "$150.00", "high": "$151", "low": "$149"}, {"date": d1.strftime("%m/%d/%Y"), "close": "$140.00", "high": "$141", "low": "$139"}])
+    quote = nas_body(status="Open", real=True, ts=ts)
+    raw = lambda url, **k: (200, "application/json", hist if "historical" in url else quote, "")
+    with mock.patch.object(fetch, "fetch_raw", side_effect=raw), mock.patch.object(fetch.time, "sleep"):
+        out = fetch.nasdaq_prices(US_HOLD)
+    assert len(out) == 1 and out[0]["close"] == 150.0 and out[0]["as_of"] == d2.isoformat() and out[0]["change"] == 10.0 and "日線" in out[0]["source"], out

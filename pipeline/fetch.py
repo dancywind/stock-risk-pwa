@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v134"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v135"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -2483,7 +2483,17 @@ def nasdaq_prices(hold):
         pd_ = got["primaryData"]
         ms = str(got.get("marketStatus"))
         if ms != "Closed" or pd_.get("isRealTime") is True:
-            log(f"nasdaq:price:{sym}", "skipped", detail=f"marketStatus={ms}、isRealTime={pd_.get('isRealTime')}，不是已收盤的價格，不使用")
+            now_et = _now_et()                                                                   # 報價不是「已收盤」（盤前盤後常標 Open）：改用 Nasdaq 日線裡已收盤的最後一天，不拿盤前盤後價冒充收盤
+            last_ok = now_et.date() if now_et.hour >= 17 else now_et.date() - timedelta(days=1)
+            hrows, hwhy = _nasdaq_rows(sym, ac, 20)
+            hrows = [r for r in (hrows or []) if r["date"] <= last_ok and r["close"] and 0 < r["close"] < config.PRICE_LIMIT]
+            if len(hrows) >= 2:
+                a_, b_ = hrows[-1], hrows[-2]
+                out.append(_price_row("US", sym, h.get("name"), a_["date"].isoformat(), a_["close"], round(a_["close"] - b_["close"], 4), "Nasdaq 歷史日線（已收盤；報價當時不是收盤狀態）", None, None, None))
+                log(f"nasdaq:price:{sym}", "success", as_of=a_["date"].isoformat(), detail=f"報價 marketStatus={ms}、isRealTime={pd_.get('isRealTime')}，改用日線收盤 {a_['close']}（資料日 {a_['date']}）；52 週區間這次沒有")
+                time.sleep(1)
+            else:
+                log(f"nasdaq:price:{sym}", "skipped", detail=_clip(f"marketStatus={ms}、isRealTime={pd_.get('isRealTime')}，不是已收盤的價格；日線也沒有可用的已收盤資料（{hwhy or len(hrows)}）"))
             continue
         iso = parse_us_date(pd_.get("lastTradeTimestamp"))
         ok, why = validate_close_date(iso)
