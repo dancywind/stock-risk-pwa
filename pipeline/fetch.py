@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v129"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v130"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3801,6 +3801,38 @@ def us_risk_series(hist=False):
     return out
 
 
+def us_econ_calendar():
+    """模組 M53：美國重要經濟數據公布日。來源 FRED 的 release/dates（含未來已排定的日期）；先用 release 名稱核對編號，對不上就跳過那一項。
+    只留「昨天到 US_ECON_DAYS_AHEAD 天後」。抓不到只記錄，不讓工作變紅。寫入用 release_id,event_date 當主鍵，重跑不會重複。"""
+    key = config.fred_key()
+    if not key:
+        log("us_econ_calendar", "skipped", detail="沒有 FRED 金鑰，不抓經濟數據日程")
+        return []
+    today = date.today()
+    lo, hi = (today - timedelta(days=1)).isoformat(), (today + timedelta(days=config.US_ECON_DAYS_AHEAD)).isoformat()
+    out = []
+    for rid, label, kw in config.US_ECON_RELEASES:
+        meta, err = fetch_json(f"https://api.stlouisfed.org/fred/release?release_id={rid}&api_key={key}&file_type=json")
+        rel = (meta or {}).get("releases") if isinstance(meta, dict) else None
+        name = str(rel[0].get("name", "")) if isinstance(rel, list) and rel and isinstance(rel[0], dict) else ""
+        if kw.lower() not in name.lower():
+            log(f"us_econ:{rid}", "failure" if not name else "no_new_data", detail=_clip(f"{label}：FRED 編號 {rid} 的名稱是『{name or '查不到'}』，和預期的『{kw}』對不上，不採用（{err or ''}）"))
+            continue
+        data, err = fetch_json(f"https://api.stlouisfed.org/fred/release/dates?release_id={rid}&api_key={key}&file_type=json&include_release_dates_with_no_data=true&sort_order=desc&limit=40")
+        rows = data.get("release_dates") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            log(f"us_econ:{rid}", "failure", detail=_clip(f"{label}：日程抓取失敗 {err or ''}"))
+            continue
+        n = 0
+        for r in rows:
+            d_ = str(r.get("date", ""))[:10]
+            if lo <= d_ <= hi:
+                out.append({"release_id": rid, "event_date": d_, "name": label, "source": "FRED release dates", "fetched_at": datetime.utcnow().isoformat() + "Z"})
+                n += 1
+        log(f"us_econ:{rid}", "success" if n else "no_new_data", detail=f"{label}（{name}）：未來 {config.US_ECON_DAYS_AHEAD} 天內 {n} 個公布日")
+    return out
+
+
 def tw_index_history():
     """模組 M05：加權指數近 13 個月的收盤與成交金額（證交所 FMTQIK 每月一次，間隔 3 秒），用來算從高點回落、下跌放量。"""
     today = date.today()
@@ -6967,6 +6999,7 @@ def run_job(job, dry_run=False):
             extra.append(("tw_pcr_official", _run_module("M23", "臺指選擇權 Put/Call 比（官方）", tw_pcr_official) or [], "as_of"))
             extra.append(("macro_series", _run_module("M27", "Yahoo 補 FRED 落後（標普、原油）", yahoo_fill) or [], "series_id,as_of"))
             extra.append(("macro_series", _run_module("M51", "美股風險序列（高收益債利差、10 年債、VIX3M）", us_risk_series) or [], "series_id,as_of"))
+            extra.append(("us_econ_events", _run_module("M53", "美國重要經濟數據公布日（FRED）", us_econ_calendar) or [], "release_id,event_date"))
             extra.append(("tw_keep_rate", _run_module("M38", "臺股儀表板：全市場擔保維持率（官方）", tw_keep_rate) or [], "as_of,source"))
             twd_hist = _run_module("M37", "美元兌台幣每日歷史（FRED）", twd_fred_history) or []
             extra.append(("twd_rates", twd_hist, "layer,source,as_of"))

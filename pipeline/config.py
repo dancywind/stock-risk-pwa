@@ -188,7 +188,7 @@ CFTC_TFF_BASE = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_MARKET = "S&P 500 Consolidated - CHICAGO MERCANTILE EXCHANGE"
 CBOE_DAILY_URL = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{ymd}_daily_options"
 # 程式版本：每次更新檔案時加一。每次執行都會把這個版本寫進紀錄，網站「詳細資料」也會顯示，方便確認 GitHub 上跑的是不是最新版。
-PIPELINE_VERSION = "v129"
+PIPELINE_VERSION = "v130"
 # 財報日探測（只讀）：Nasdaq 個股「下次財報日」、證交所與櫃買中心開放資料裡的法說會／財報相關端點
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/analyst/{symbol}/earnings-date"
 EARNINGS_KEYWORDS = ("法人說明會", "法說", "財務報告", "財報", "營業收入", "重大訊息")
@@ -281,6 +281,17 @@ FIN_PROBE_FINMIND = 6
 # 模組 M51：美股谷底計分卡新增的風險序列。FRED 的 ICE BofA 系列自 2026 年起只提供近 3 年；VIX3M 取自 Yahoo（非官方）
 US_RISK_FRED = ("BAMLH0A0HYM2", "DGS10")
 US_RISK_VIX3M = ("^VIX3M", "VIX3M", "VIX 3 個月波動率（Yahoo，非官方）", 5.0, 100.0)
+# 模組 M53：美國重要經濟數據公布日（FRED 的 release dates，官方資料來源的日程；含未來已排定的日期）。(release_id, 網站顯示名稱, 名稱必須包含的關鍵字——對不上就不採用，避免編號搞錯而貼錯標籤)
+US_ECON_RELEASES = (
+    (10, "美國 CPI 消費者物價", "Consumer Price"),
+    (50, "美國非農就業報告", "Employment Situation"),
+    (46, "美國 PPI 生產者物價", "Producer Price"),
+    (192, "美國 JOLTS 職缺數", "Job Openings"),
+    (53, "美國 GDP", "Gross Domestic Product"),
+    (54, "美國 PCE 個人所得與支出", "Personal Income"),
+    (9, "美國零售銷售", "Retail"),
+)
+US_ECON_DAYS_AHEAD = 120
 US_RISK_SOX = ("^SOX", "SOX", "費城半導體指數（Yahoo，非官方）", 100.0, 100000.0)
 US_RISK_DAYS_FULL = 60                     # 每天更新時往回抓幾天
 US_RISK_DAYS_HIST = 3700                   # 歷史回補（約 10 年；高收益債利差 FRED 只給 3 年，抓不到更早的會自然停在 3 年）

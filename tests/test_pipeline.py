@@ -1714,7 +1714,7 @@ def test_run_job_breadth_update_wiring():
 
 def test_workflow_has_nightly_backfill_and_serial_concurrency():
     y = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "workflows", "daily.yml"), encoding="utf-8").read()
-    assert '- cron: "0 20 * * *"' in y and '"0 20 * * *")  echo "job=tw_backfill"' in y
+    assert '- cron: "0 21 * * 0"' in y and '"0 21 * * 0")  echo "job=tw_backfill2"' in y     # 2026-11 為省 Actions 分鐘：每晚回補已刪，只留每週一次
     assert "concurrency:" in y and "cancel-in-progress: false" in y and "timeout-minutes: 60" in y
 
 
@@ -3171,7 +3171,7 @@ def test_workflow_schedules_evening_events_job_and_every_cron_maps_to_a_job():
     crons = re.findall(r'- cron: "([^"]+)"', y)
     mapped = dict(re.findall(r'"([0-9*/ ,\-]+)"\)\s+echo "job=(\w+)"', y))
     assert set(crons) == set(mapped), f"每個排程都要有對應的工作：{set(crons) ^ set(mapped)}"
-    assert mapped["30 12 * * *"] == "tw_events" and mapped["15 15 * * *"] == "tw_events" and mapped["45 12 * * 2-6"] == "us_options", "美股選擇權快照：週二到週六 20:45（台北時間）"
+    assert mapped["15 15 * * *"] == "tw_events" and mapped["45 12 * * 2-6"] == "us_options", "美股選擇權快照：週二到週六 20:45（台北時間）"
     assert "tw_events" in re.search(r"options: \[([^\]]+)\]", y).group(1)
     assert all(j in config.JOBS for j in mapped.values()) and len(crons) == len(set(crons))
 
@@ -6873,3 +6873,23 @@ def test_parse_forecast_growth_and_revenue_growth(monkeypatch):
     monkeypatch.setattr(f, "fetch_json", lambda url: (tw, None) if "twse" in url else (None, "HTTP 404"))
     rows = f.tw_revenue_growth([{"market": "TW", "code": "2330"}])
     assert len(rows) == 1 and rows[0]["code"] == "2330" and rows[0]["cum_yoy"] == 35.1 and rows[0]["month_yoy"] == 30.5
+
+
+def test_us_econ_calendar_checks_release_name_and_keeps_future_dates(monkeypatch):
+    from pipeline import fetch as f
+    from datetime import date as _d, timedelta as _t
+    monkeypatch.setattr(f.config, "fred_key", lambda: "k")
+    monkeypatch.setattr(f, "log", lambda *a, **k: None)
+    soon = (_d.today() + _t(days=5)).isoformat()
+    old = (_d.today() - _t(days=40)).isoformat()
+    def fake(url, *a, **k):
+        if "/release?release_id=10" in url:
+            return {"releases": [{"name": "Consumer Price Index"}]}, ""
+        if "/release?release_id=50" in url:
+            return {"releases": [{"name": "Something Else"}]}, ""        # 名稱對不上：不採用
+        if "/release/dates?release_id=10" in url:
+            return {"release_dates": [{"release_id": 10, "date": soon}, {"release_id": 10, "date": old}]}, ""
+        return None, "x"
+    monkeypatch.setattr(f, "fetch_json", fake)
+    rows = f.us_econ_calendar()
+    assert [(r["release_id"], r["event_date"]) for r in rows] == [(10, soon)]
