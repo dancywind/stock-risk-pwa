@@ -4320,7 +4320,14 @@ def urllib_unquote(s):
     return up.unquote(s)
 
 
-def test_yahoo_fill_adds_only_newer_days_after_cross_checking_against_fred():
+def _et_morning():
+    """固定成美東上午 10 點（今天還沒收盤）；yahoo_fill 的「今天的不收」測試不能隨執行時間漂移。"""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).replace(hour=10, minute=0)
+
+
+@mock.patch.object(fetch, "_now_et", side_effect=lambda: _et_morning())
+def test_yahoo_fill_adds_only_newer_days_after_cross_checking_against_fred(_m):
     today = fetch._now_et().date()
     dd = lambda n: (today - timedelta(days=n)).isoformat()
     fred = {"SP500": [{"as_of": dd(n), "value": 7000.0 + n} for n in (10, 9, 8, 7, 6)], "DCOILWTICO": [{"as_of": dd(n), "value": 60.0} for n in (10, 9, 8, 7, 6)], "DCOILBRENTEU": []}
@@ -4351,7 +4358,8 @@ def test_yahoo_fill_adds_only_newer_days_after_cross_checking_against_fred():
     assert rows == [] and "FRED 已經是最新" in fetch.LOG[-1]["detail"]
 
 
-def test_yahoo_fill_also_fills_vix_vxn_and_nasdaq_composite_when_fred_lags_and_rejects_mismatched_ones():
+@mock.patch.object(fetch, "_now_et", side_effect=lambda: _et_morning())
+def test_yahoo_fill_also_fills_vix_vxn_and_nasdaq_composite_when_fred_lags_and_rejects_mismatched_ones(_m):
     today = fetch._now_et().date()
     dd = lambda n: (today - timedelta(days=n)).isoformat()
     assert [x[:2] for x in config.YAHOO_FILL if x[1] in ("VIXCLS", "VXNCLS", "NASDAQCOM")] == [("^VIX", "VIXCLS"), ("^VXN", "VXNCLS"), ("^IXIC", "NASDAQCOM")], "設定裡有這三個"
@@ -6894,3 +6902,16 @@ def test_us_econ_calendar_checks_release_name_and_keeps_future_dates(monkeypatch
     monkeypatch.setattr(f, "fetch_json", fake)
     rows = f.us_econ_calendar()
     assert [(r["release_id"], r["event_date"]) for r in rows] == [(10, soon)]
+
+
+def test_yahoo_fill_takes_todays_bar_after_us_close():
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York")).replace(hour=18, minute=0)
+    today = now.date()
+    dd = lambda n: (today - timedelta(days=n)).isoformat()
+    fred = {"SP500": [{"as_of": dd(n), "value": 7000.0 + n} for n in (10, 9, 8, 7, 6)], "DCOILWTICO": [], "DCOILBRENTEU": []}
+    sp = [(dd(n), 7000.0 + n) for n in (10, 9, 8, 7, 6)] + [(dd(1), 7120.0), (today.isoformat(), 7130.0)]
+    reset()
+    with mock.patch.object(fetch, "_now_et", return_value=now):
+        rows = _with(_yh_env(fred, {"^GSPC": _yh_json(sp), "CL=F": _yh_json([]), "BZ=F": _yh_json([])}), lambda: REAL["yahoo_fill"]())
+    assert [r["as_of"] for r in rows if r["series_id"] == "SP500"] == [dd(1), today.isoformat()], "美東 17 點後，剛收盤那天也收"

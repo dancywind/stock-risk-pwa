@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v131"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v132"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -6169,7 +6169,8 @@ def yahoo_fill():
         if worst > tol:
             notes.append(f"{sym}（和 FRED 重疊的 {len(overlap)} 天最大差 {worst * 100:.2f}%，超過 {tol * 100:.1f}%，口徑不同，不用）")
             continue
-        today_et = _now_et().date()
+        now_et = _now_et()
+        today_et = now_et.date() + timedelta(days=1) if now_et.hour >= 17 else now_et.date()      # 美東 17 點後當天已收盤，當天那根日線可以收；之前一律排除（台北早上跑會漏掉剛收盤的那一天）
         got = [{"series_id": sid, "label": label, "as_of": d_, "value": round(v, 4), "source": "Yahoo Finance（非官方，補 FRED 落後的天數）"}
                for d_, v in pts if d_ > newest and d_ < today_et.isoformat() and low <= v <= high]
         if got:
