@@ -6171,11 +6171,12 @@ def test_tw_industry_collect_merges_listed_first_and_validates_codes():
     def fj(url, **k):
         if url.endswith("t187ap03_L"): return L_, ""
         if url.endswith("t187ap03_P"): return P_, ""
+        if url.endswith("t187ap03_O"): return [{"公司代號": "3105", "公司簡稱": "穩懋", "產業別": "24"}], ""
         raise AssertionError(url)
     with mock.patch.object(fetch, "fetch_json", side_effect=fj):
         rows = REAL["tw_industry_collect"]()
     by = {r["code"]: r for r in rows}
-    assert sorted(by) == ["1101", "2330", "6488", "8358"], sorted(by)
+    assert sorted(by) == ["1101", "2330", "3105", "6488", "8358"], sorted(by) and by["3105"]["source"].endswith("（O）")
     assert by["2330"]["industry"] == "24" and by["2330"]["name"] == "台積電", "上市的優先，公開發行的只補沒有的"
     assert by["8358"]["industry"] == "28" and by["8358"]["source"].endswith("（P）") and by["1101"]["source"].endswith("（L）")
     sts = {x["source"]: x for x in fetch.LOG}
@@ -6229,7 +6230,7 @@ def test_run_job_wires_exright_history_and_industry_modules_with_isolation():
         return got[0], {x["source"]: x["status"] for x in fetch.LOG}
     tables, st = go("tw_close", False)
     assert ("tw_exright_events", ex_hist, "market,code,event_date") in tables and st["module:M16"] == "success", "每天的工作要寫入歷史除權息"
-    assert not any(n == "tw_industry" for n, _, _ in tables), "產業別不在每天的工作裡"
+    assert any(n == "tw_industry" for n, _, _ in tables), "產業別現在每天完整更新時也跑（上櫃股才有分類）"
     reset(); tables, st = go("tw_close", True)
     assert "module:M16" not in st, "dry-run 不碰歷史回補"
     reset(); tables, st = go("tw_backfill", False)

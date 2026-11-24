@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v130"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v131"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -5717,8 +5717,9 @@ def tw_industry_collect():
     """模組 M17：上市公司基本資料（/opendata/t187ap03_L）與公開發行公司基本資料（/opendata/t187ap03_P，可能涵蓋上櫃）裡的「產業別」代碼。
     只收 4 位數代號的股票；產業別必須是 2 位數字。上市的優先，公開發行的只補上市沒有的代號。名稱對照在網頁（用證交所公布的產業別代碼表）。"""
     out, seen = [], set()
-    for tag, path in (("L", "/opendata/t187ap03_L"), ("P", "/opendata/t187ap03_P")):
-        rows, err = fetch_json(config.TWSE_OPENAPI_BASE + path)
+    for tag, base, path in (("L", config.TWSE_OPENAPI_BASE, "/opendata/t187ap03_L"), ("P", config.TWSE_OPENAPI_BASE, "/opendata/t187ap03_P"),
+                            ("O", config.TPEX_DEFAULT_BASE, "/mopsfin_t187ap03_O")):          # O＝櫃買中心上櫃公司基本資料（金居、環球晶這類上櫃股）
+        rows, err = fetch_json(base + path)
         if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
             log(f"tw_industry:{tag}", "failure", detail=_clip(f"{path} 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
             continue
@@ -5739,7 +5740,7 @@ def tw_industry_collect():
             if code in seen:
                 continue
             seen.add(code)
-            out.append({"code": code, "industry": ind, "name": (str(r.get(kn, "")).strip() if kn else "")[:40], "source": f"證交所 公司基本資料（{tag}）"})
+            out.append({"code": code, "industry": ind, "name": (str(r.get(kn, "")).strip() if kn else "")[:40], "source": (f"櫃買中心 公司基本資料（{tag}）" if tag == "O" else f"證交所 公司基本資料（{tag}）")})
             n_new += 1
         log(f"tw_industry:{tag}", "success" if n_new else "no_new_data", detail=f"{path}｜{len(rows)} 列；新收 {n_new} 家（略過產業別不是 2 位數字的 {bad} 列）")
     return out
@@ -6993,6 +6994,8 @@ def run_job(job, dry_run=False):
             extra.append(("tw_options_strikes", [row for r in twopt for row in r["strikes"]], "as_of,strike"))
             extra.append(("macro_series", _run_module("M31", "美元指數 DXY（Yahoo，非官方）", yahoo_dxy) or [], "series_id,as_of"))
             extra.append(("watch_snapshot", _run_module("M30", "候選股與持股估值（本益比、殖利率、股價淨值比）", lambda: watch_valuation(price_rows)) or [], "code"))
+            if not dry_run:
+                extra.append(("tw_industry", _run_module("M17", "台股產業別（上市＋上櫃）", tw_industry_collect) or [], "code"))
             extra.append(("tw_revenue_growth", _run_module("M52", "台股每月營收年增率（證交所、櫃買中心）", lambda: tw_revenue_growth(price_rows)) or [], "code"))
             extra.append(("tpex_margin_daily", _run_module("M29", "上櫃融資餘額（張數）", tpex_margin_daily) or [], "as_of"))
             extra.append(("tw_retail_ratio", _run_module("M28", "小台指散戶多空比", tw_retail_ratio) or [], "as_of"))
