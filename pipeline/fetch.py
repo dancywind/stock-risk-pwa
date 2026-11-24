@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v132"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v133"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -3906,6 +3906,9 @@ def persist_extra(dry_run, tables):
         if dry_run or not sb_ready():
             log(f"persist:{table}", "skipped", detail=f"{'--dry-run' if dry_run else '未設定 Supabase'}：{len(rows)} 筆不寫入")
             continue
+        ck = [c.strip() for c in str(conflict).split(",") if c.strip()]
+        if ck and all(isinstance(r, dict) for r in rows):                                  # 同一批裡衝突鍵重複會讓 Postgres 回 21000；同鍵只留最後一筆
+            rows = list({tuple(r.get(c) for c in ck): r for r in rows}.values())
         for chunk in _chunks(rows, 500):
             ok, msg = sb_upsert(table, chunk, conflict)
             opt = config.OPTIONAL_COLS.get(table)
@@ -5724,8 +5727,8 @@ def tw_industry_collect():
             log(f"tw_industry:{tag}", "failure", detail=_clip(f"{path} 抓取失敗或格式非預期: {err or str(rows)[:100]}"))
             continue
         keys = list(rows[0].keys())
-        kc, ki = _fin_key(keys, ("公司代號",)), _fin_key(keys, ("產業別",))
-        kn = _fin_key(keys, ("公司簡稱",)) or _fin_key(keys, ("公司名稱",))                  # 簡稱優先（欄位順序裡全名排在簡稱前面）
+        kc, ki = _fin_key(keys, ("公司代號", "SecuritiesCompanyCode")), _fin_key(keys, ("產業別", "SecuritiesIndustryCode"))
+        kn = _fin_key(keys, ("公司簡稱", "CompanyAbbreviation")) or _fin_key(keys, ("公司名稱", "CompanyName"))                  # 簡稱優先（欄位順序裡全名排在簡稱前面）
         if not kc or not ki:
             log(f"tw_industry:{tag}", "failure", detail=_clip(f"{path}：找不到公司代號或產業別欄（欄位 {keys[:14]}），不採用"))
             continue

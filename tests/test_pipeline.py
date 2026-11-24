@@ -2574,7 +2574,7 @@ def test_persist_extra_tables_are_independent_chunked_and_dry_run_safe():
     def up(table, rows, key):
         ups.append((table, len(rows), key))
         return (False, "boom") if table == "sector_rs" else (True, "ok")
-    big = [{"symbol": str(i), "as_of": "x"} for i in range(1100)]
+    big = [{"symbol": str(i), "series_id": str(i), "as_of": "x"} for i in range(1100)]
     with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", side_effect=up):
         fetch.persist_extra(False, [("us_quotes", [{"a": 1}], "symbol,as_of"), ("sector_rs", [{"a": 1}], "symbol,as_of"), ("tw_leaders", [{"a": 1}], "as_of,code"), ("macro_series", big, "series_id,as_of"), ("empty", [], "k")])
     assert [(u[0], u[1]) for u in ups] == [("us_quotes", 1), ("sector_rs", 1), ("tw_leaders", 1), ("macro_series", 500), ("macro_series", 500), ("macro_series", 100)]   # 一張失敗不影響後面的表；大表分批
@@ -6915,3 +6915,15 @@ def test_yahoo_fill_takes_todays_bar_after_us_close():
     with mock.patch.object(fetch, "_now_et", return_value=now):
         rows = _with(_yh_env(fred, {"^GSPC": _yh_json(sp), "CL=F": _yh_json([]), "BZ=F": _yh_json([])}), lambda: REAL["yahoo_fill"]())
     assert [r["as_of"] for r in rows if r["series_id"] == "SP500"] == [dd(1), today.isoformat()], "美東 17 點後，剛收盤那天也收"
+
+
+def test_tpex_industry_english_fields_and_persist_dedupes_conflict_keys():
+    reset()
+    O_ = [{"Date": "1151124", "SecuritiesCompanyCode": "8358", "CompanyAbbreviation": "金居", "SecuritiesIndustryCode": "28"}, {"SecuritiesCompanyCode": "6488", "CompanyAbbreviation": "環球晶", "SecuritiesIndustryCode": "24"}]
+    with mock.patch.object(fetch, "fetch_json", side_effect=lambda u, **k: (O_, "") if u.endswith("_O") else (None, "HTTP 404")):
+        rows = REAL["tw_industry_collect"]()
+    assert {r["code"]: r["industry"] for r in rows} == {"8358": "28", "6488": "24"}
+    got = []
+    with mock.patch.object(fetch, "sb_ready", return_value=True), mock.patch.object(fetch, "sb_upsert", side_effect=lambda t, ch, c: (got.append(ch) or (True, ""))):
+        fetch.persist_extra(False, [("macro_series", [{"series_id": "SP500", "as_of": "2026-11-20", "value": 1}, {"series_id": "SP500", "as_of": "2026-11-20", "value": 2}, {"series_id": "SP500", "as_of": "2026-11-21", "value": 3}], "series_id,as_of")])
+    assert len(got[0]) == 2 and got[0][0]["value"] == 2
