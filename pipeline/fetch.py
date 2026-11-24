@@ -45,7 +45,7 @@ def _scrub(text):
     return text
 
 
-FETCH_VERSION = "v133"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
+FETCH_VERSION = "v134"      # 每次發行跟 config.PIPELINE_VERSION 一起改；兩者不同就代表檔案沒有一起更新
 
 
 def log(source, status, as_of=None, detail=""):
@@ -6323,7 +6323,8 @@ def yahoo_dxy():
         pts = parse_yahoo_chart(json.loads(body.decode("utf-8-sig")))
     except (ValueError, UnicodeDecodeError):
         pts = None
-    today = _now_et().date().isoformat()
+    now_et = _now_et()
+    today = (now_et.date() + timedelta(days=1) if now_et.hour >= 17 else now_et.date()).isoformat()      # 美東 17 點後當天已收盤
     pts = [(d_, v) for d_, v in (pts or []) if d_ < today]
     if len(pts) < 100:
         log("yahoo_dxy", "no_new_data", detail=_clip(f"{sym} 只有 {len(pts)} 筆可用（至少 100），不用"))

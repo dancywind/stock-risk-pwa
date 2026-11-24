@@ -4815,7 +4815,8 @@ def _walk(n, seed=3):
     return out
 
 
-def test_yahoo_dxy_validates_and_cross_checks_against_the_fed_broad_index():
+@mock.patch.object(fetch, "_now_et", side_effect=lambda: _et_morning())
+def test_yahoo_dxy_validates_and_cross_checks_against_the_fed_broad_index(_m):
     vals = _walk(160)
     ps, pts = _dxy_env(vals)
     corr_fred = [{"as_of": d_, "value": round(v * 1.2 + 3, 3)} for d_, v in pts[-120:]]                                  # 和 DXY 同向的廣義指數
